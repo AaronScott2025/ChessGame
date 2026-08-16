@@ -28,12 +28,15 @@ export type SfxId = 'ui' | 'piece' | 'cardCast';
 
 const MUSIC_KEY = 'chesspansion-music-enabled';
 const SFX_KEY = 'chesspansion-sfx-enabled';
+const MUSIC_VOL_KEY = 'chesspansion-music-volume';
 
 const SFX_SRC: Record<SfxId, string> = {
   ui: AUDIO_FILES.sfxUi,
   piece: AUDIO_FILES.sfxPiece,
   cardCast: AUDIO_FILES.sfxCardCast,
 };
+
+const DEFAULT_MUSIC_VOLUME = 0.55;
 
 function readFlag(key: string, fallback = true): boolean {
   try {
@@ -52,6 +55,26 @@ function writeFlag(key: string, value: boolean) {
   }
 }
 
+function readVolume(key: string, fallback: number): number {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(1, Math.max(0, n));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeVolume(key: string, value: number) {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    /* ignore */
+  }
+}
+
 function usePersistedFlag(key: string, fallback = true) {
   const [enabled, setEnabled] = useState(() => readFlag(key, fallback));
   useEffect(() => {
@@ -63,6 +86,7 @@ function usePersistedFlag(key: string, fallback = true) {
 type AudioEngine = {
   musicEnabled: boolean;
   sfxEnabled: boolean;
+  musicVolume: number;
   scene: MusicScene;
   unlocked: boolean;
   menu: HTMLAudioElement | null;
@@ -72,31 +96,41 @@ type AudioEngine = {
 const engine: AudioEngine = {
   musicEnabled: readFlag(MUSIC_KEY, true),
   sfxEnabled: readFlag(SFX_KEY, true),
+  musicVolume: readVolume(MUSIC_VOL_KEY, DEFAULT_MUSIC_VOLUME),
   scene: 'none',
   unlocked: false,
   menu: null,
   game: null,
 };
 
+function applyMusicVolume() {
+  const vol = engine.musicEnabled ? engine.musicVolume : 0;
+  if (engine.menu) engine.menu.volume = vol;
+  if (engine.game) engine.game.volume = vol;
+}
+
 function ensureTracks() {
   if (!engine.menu) {
     engine.menu = new Audio(AUDIO_FILES.musicMenu);
     engine.menu.loop = true;
     engine.menu.preload = 'auto';
-    engine.menu.volume = 0.45;
   }
   if (!engine.game) {
     engine.game = new Audio(AUDIO_FILES.musicGame);
     engine.game.loop = true;
     engine.game.preload = 'auto';
-    engine.game.volume = 0.45;
   }
+  applyMusicVolume();
 }
 
 function safePlay(audio: HTMLAudioElement | null) {
   if (!audio) return;
   const p = audio.play();
-  if (p && typeof p.catch === 'function') p.catch(() => undefined);
+  if (p && typeof p.catch === 'function') {
+    p.catch(() => {
+      /* autoplay blocked or missing file — ignored until next gesture */
+    });
+  }
 }
 
 function pauseTrack(audio: HTMLAudioElement | null) {
@@ -106,7 +140,8 @@ function pauseTrack(audio: HTMLAudioElement | null) {
 
 function syncMusic() {
   ensureTracks();
-  if (!engine.musicEnabled || !engine.unlocked || engine.scene === 'none') {
+  applyMusicVolume();
+  if (!engine.musicEnabled || !engine.unlocked || engine.scene === 'none' || engine.musicVolume <= 0) {
     pauseTrack(engine.menu);
     pauseTrack(engine.game);
     return;
@@ -114,19 +149,15 @@ function syncMusic() {
   if (engine.scene === 'menu') {
     pauseTrack(engine.game);
     safePlay(engine.menu);
-  } else {
+  } else if (engine.scene === 'game') {
     pauseTrack(engine.menu);
     safePlay(engine.game);
   }
 }
 
-function unlockAudio() {
-  if (engine.unlocked) return;
+export function unlockAudio() {
   engine.unlocked = true;
   ensureTracks();
-  // Warm decode; ignore failures until files exist
-  void engine.menu?.load();
-  void engine.game?.load();
   syncMusic();
 }
 
@@ -141,11 +172,20 @@ function setSfxEnabled(enabled: boolean) {
   writeFlag(SFX_KEY, enabled);
 }
 
-export function setMusicScene(scene: MusicScene) {
-  if (engine.scene === scene) {
+function setMusicVolume(volume: number) {
+  engine.musicVolume = Math.min(1, Math.max(0, volume));
+  writeVolume(MUSIC_VOL_KEY, engine.musicVolume);
+  applyMusicVolume();
+  if (engine.musicVolume > 0 && engine.musicEnabled) {
+    unlockAudio();
     syncMusic();
-    return;
+  } else {
+    pauseTrack(engine.menu);
+    pauseTrack(engine.game);
   }
+}
+
+export function setMusicScene(scene: MusicScene) {
   engine.scene = scene;
   syncMusic();
 }
@@ -167,15 +207,13 @@ export const playCardCastSfx = () => playSfx('cardCast');
 export function useAudioScene(scene: MusicScene) {
   useEffect(() => {
     setMusicScene(scene);
-    return () => {
-      /* leave scene as-is; next mount sets the next one */
-    };
   }, [scene]);
 }
 
 export function useAudioSettings() {
   const [musicEnabled, setMusic] = usePersistedFlag(MUSIC_KEY, true);
   const [sfxEnabled, setSfx] = usePersistedFlag(SFX_KEY, true);
+  const [musicVolume, setMusicVol] = useState(() => readVolume(MUSIC_VOL_KEY, DEFAULT_MUSIC_VOLUME));
 
   useEffect(() => {
     setMusicEnabled(musicEnabled);
@@ -184,6 +222,10 @@ export function useAudioSettings() {
   useEffect(() => {
     setSfxEnabled(sfxEnabled);
   }, [sfxEnabled]);
+
+  useEffect(() => {
+    setMusicVolume(musicVolume);
+  }, [musicVolume]);
 
   useEffect(() => {
     const unlock = () => unlockAudio();
@@ -198,8 +240,10 @@ export function useAudioSettings() {
   return {
     musicEnabled,
     sfxEnabled,
+    musicVolume,
     setMusicEnabled: setMusic as Dispatch<SetStateAction<boolean>>,
     setSfxEnabled: setSfx as Dispatch<SetStateAction<boolean>>,
+    setMusicVolume: setMusicVol as Dispatch<SetStateAction<number>>,
   };
 }
 
@@ -217,7 +261,7 @@ export function useUiButtonSfx() {
       if (button.disabled) return;
       if (button.dataset.audio === 'off') return;
       if (button.closest('.board')) return;
-      if (button.closest('.fx-toggle, .knowledge-toggle, .audio-toggle')) return;
+      if (button.closest('.fx-toggle, .knowledge-toggle, .audio-toggle, .music-volume')) return;
       playUiSfx();
     };
     document.addEventListener('click', onClick, true);
@@ -228,20 +272,43 @@ export function useUiButtonSfx() {
 export function AudioToggles({
   musicEnabled,
   sfxEnabled,
+  musicVolume,
   onToggleMusic,
   onToggleSfx,
+  onMusicVolume,
 }: {
   musicEnabled: boolean;
   sfxEnabled: boolean;
+  musicVolume: number;
   onToggleMusic: () => void;
   onToggleSfx: () => void;
+  onMusicVolume: (volume: number) => void;
 }) {
+  const pct = Math.round(musicVolume * 100);
+
   return (
     <>
+      <label className="music-volume" title={`Music volume ${pct}%`}>
+        <span className="fx-toggle-label">Vol {pct}%</span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={pct}
+          data-audio="off"
+          aria-label="Music volume"
+          onPointerDown={() => unlockAudio()}
+          onChange={(e) => onMusicVolume(Number(e.target.value) / 100)}
+        />
+      </label>
       <button
         type="button"
         className={`audio-toggle music-toggle ${musicEnabled ? 'on' : 'off'}`}
-        onClick={onToggleMusic}
+        onClick={() => {
+          unlockAudio();
+          onToggleMusic();
+        }}
         title={musicEnabled ? 'Mute music' : 'Enable music'}
         aria-pressed={musicEnabled}
         data-audio="off"

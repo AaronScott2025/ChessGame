@@ -130,7 +130,8 @@ function chebyshev(a: Coord, b: Coord): number {
 export default function App() {
   const { fxEnabled, setFxEnabled } = useFxEnabled();
   const { knowledgeEnabled, setKnowledgeEnabled } = useKnowledgeEnabled();
-  const { musicEnabled, sfxEnabled, setMusicEnabled, setSfxEnabled } = useAudioSettings();
+  const { musicEnabled, sfxEnabled, musicVolume, setMusicEnabled, setSfxEnabled, setMusicVolume } =
+    useAudioSettings();
   useUiButtonSfx();
   const [rulesOpen, setRulesOpen] = useState(false);
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -167,6 +168,11 @@ export default function App() {
       s.disconnect();
     };
   }, []);
+
+  useEffect(() => {
+    if (state?.phase !== 'draft') return;
+    setInspectedId((id) => (id?.startsWith('draft:') ? null : id));
+  }, [state?.draft?.index, state?.draft?.pickingColor]);
 
   const send = (action: object) => {
     if (!socket || !roomCode) return;
@@ -469,8 +475,10 @@ export default function App() {
       <AudioToggles
         musicEnabled={musicEnabled}
         sfxEnabled={sfxEnabled}
-        onToggleMusic={() => setMusicEnabled((v) => !v)}
-        onToggleSfx={() => setSfxEnabled((v) => !v)}
+        musicVolume={musicVolume}
+        onToggleMusic={() => setMusicEnabled((v: boolean) => !v)}
+        onToggleSfx={() => setSfxEnabled((v: boolean) => !v)}
+        onMusicVolume={(v) => setMusicVolume(v)}
       />
       <FxToggle enabled={fxEnabled} onToggle={() => setFxEnabled((v) => !v)} />
     </div>
@@ -528,6 +536,24 @@ export default function App() {
   return (
     <div className="shell">
       <CosmicBackdrop enabled={fxEnabled} />
+      {(state.phase === 'playing' && state.turn !== you) ||
+      (state.phase === 'opening_draw' &&
+        state.pendingPrompt?.type === 'opening_mulligan' &&
+        state.pendingPrompt.color !== you) ||
+      (state.phase === 'draft' &&
+        state.draft &&
+        state.draft.blackChoseFirstPicker != null &&
+        state.draft.pickingColor !== you) ? (
+        <div className="waiting-opponent" role="status" aria-live="polite">
+          <span className="waiting-opponent-dot" aria-hidden />
+          Waiting for opponent
+          {state.phase === 'opening_draw' ? (
+            <span className="waiting-opponent-sub"> — opening hand</span>
+          ) : state.phase === 'draft' ? (
+            <span className="waiting-opponent-sub"> — draft</span>
+          ) : null}
+        </div>
+      ) : null}
       <div className="shell-content">
       <header className="top">
         <div>
@@ -559,22 +585,10 @@ export default function App() {
         </div>
       </header>
 
-      {state.phase === 'playing' && (
-        <div
-          className={`turn-banner ${state.turn === you ? 'turn-yours' : 'turn-theirs'}`}
-          role="status"
-        >
-          {state.turn === you ? (
-            <>
-              <strong>Your turn</strong>
-              <span> — cast a spell or move a piece ({state.turnPhase})</span>
-            </>
-          ) : (
-            <>
-              <strong>Opponent&apos;s turn</strong>
-              <span> — wait for them to finish</span>
-            </>
-          )}
+      {state.phase === 'playing' && state.turn === you && (
+        <div className="turn-banner turn-yours" role="status">
+          <strong>Your turn</strong>
+          <span> — cast a spell or move a piece ({state.turnPhase})</span>
         </div>
       )}
 
@@ -688,7 +702,7 @@ export default function App() {
           <h2>Army draft</h2>
           {state.draft.blackChoseFirstPicker == null ? (
             you === 'black' ? (
-              <div className="row">
+              <div className="row draft-center-actions">
                 <button
                   type="button"
                   className="primary"
@@ -705,35 +719,56 @@ export default function App() {
                 </button>
               </div>
             ) : (
-              <p>Waiting for Black to choose who drafts first…</p>
+              <p className="draft-status">Waiting for Black to choose who drafts first…</p>
             )
           ) : (
             <>
-              <p>
+              <p className="draft-status">
                 Picking <strong>{state.draft.order[state.draft.index]}</strong> —{' '}
                 {state.draft.pickingColor === you ? 'Your pick' : 'Opponent picking'}
               </p>
-              <div className="variant-grid">
+              <div className="variant-grid draft-grid">
                 {draftOptions.map((id) => {
                   const p = pieceMeta(catalog, id);
+                  const selected = draftInspectDefId === id;
                   return (
                     <button
                       key={id}
                       type="button"
-                      className={state.draft?.pickingColor !== you ? 'muted-pick' : ''}
-                      onClick={() => {
-                        setInspectedId(`draft:${id}`);
-                        if (state.draft?.pickingColor === you) send({ type: 'draft_pick', defId: id });
-                      }}
+                      className={[
+                        'draft-tile',
+                        selected ? 'selected' : '',
+                        state.draft?.pickingColor !== you ? 'muted-pick' : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                      onClick={() => setInspectedId(`draft:${id}`)}
                     >
                       <span className="sym">
                         <PieceIcon defId={id} color={you ?? 'white'} title={p?.name} />
                       </span>
-                      <span>{p?.name ?? id}</span>
+                      <span className="draft-tile-name">{p?.name ?? id}</span>
                     </button>
                   );
                 })}
               </div>
+              {draftInspectDefId && state.draft.pickingColor === you && (
+                <div className="draft-confirm-row">
+                  <button
+                    type="button"
+                    className="primary draft-confirm"
+                    onClick={() => {
+                      send({ type: 'draft_pick', defId: draftInspectDefId });
+                      setInspectedId(null);
+                    }}
+                  >
+                    Confirm {pieceMeta(catalog, draftInspectDefId)?.name ?? draftInspectDefId}
+                  </button>
+                </div>
+              )}
+              {draftInspectDefId && state.draft.pickingColor !== you && (
+                <p className="draft-status muted">Select a piece to preview — waiting for opponent to pick.</p>
+              )}
             </>
           )}
         </section>
@@ -928,7 +963,7 @@ export default function App() {
           onClose={() => setInspectedId(null)}
         />
       )}
-      {knowledgeEnabled && !inspectedPiece && draftInspectDefId && (
+      {draftInspectDefId && (
         <PieceInfoTile
           defId={draftInspectDefId}
           color={you ?? 'white'}
