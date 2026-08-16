@@ -1,0 +1,401 @@
+:root {
+  --ink: #1c1410;
+  --paper: #f3e6d4;
+  --wood: #6b3f24;
+  --wood-dark: #3b2416;
+  --accent: #c45c26;
+  --sea: #2f5d62;
+  --night: #1e2a44;
+  --day: #d9a441;
+  --light-sq: #e8d3b0;
+  --dark-sq: #a56b3c;
+  --move: rgba(47, 93, 98, 0.45);
+  --danger: #9b2c2c;
+  font-family: 'Segoe UI', 'Trebuchet MS', sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at top left, #f7ecdc, #d8c1a0 45%, #b08968);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.shell {
+  min-height: 100vh;
+  padding: 1rem 1.25rem 2rem;
+}
+
+.brand {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 1.6rem;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+.lobby {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 1.5rem;
+  align-items: stretch;
+  min-height: 100vh;
+  padding: 0;
+}
+
+.lobby-card {
+  padding: 3rem 2.5rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.85rem;
+  background: linear-gradient(160deg, rgba(243, 230, 212, 0.95), rgba(232, 211, 176, 0.9));
+}
+
+.lobby-card h1 {
+  font-family: Georgia, serif;
+  font-weight: 700;
+  font-size: clamp(1.8rem, 4vw, 3rem);
+  line-height: 1.1;
+  margin: 0;
+  max-width: 12ch;
+}
+
+.lede {
+  max-width: 36ch;
+  opacity: 0.85;
+}
+
+.lobby-art {
+  background:
+    linear-gradient(135deg, rgba(28, 20, 16, 0.35), rgba(28, 20, 16, 0.05)),
+    url('/cards/Back_Of_Card.png') center / cover;
+  min-height: 280px;
+}
+
+.lobby label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+}
+
+.lobby input,
+.top input {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #b89a78;
+  border-radius: 8px;
+  background: #fff8ee;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+button {
+  border: 1px solid var(--wood-dark);
+  background: #f8efe2;
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--accent);
+  color: #fff8ef;
+  border-color: #8a3b14;
+}
+
+button.danger {
+  background: var(--danger);
+  color: white;
+  border-color: #5c1515;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.top {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: end;
+  margin-bottom: 0.75rem;
+}
+
+.meta {
+  margin: 0.2rem 0 0;
+  opacity: 0.85;
+}
+
+.meta .day {
+  color: #8a5a12;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.meta .night {
+  color: var(--night);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.banner {
+  background: #fff6e8;
+  border: 1px solid #c9a67a;
+  padding: 0.6rem 0.8rem;
+  border-radius: 10px;
+  margin-bottom: 0.75rem;
+}
+
+.banner.error,
+.error {
+  color: var(--danger);
+}
+
+.prompt-actions {
+  display: inline-flex;
+  gap: 0.4rem;
+  margin-left: 0.6rem;
+}
+
+.panel {
+  background: rgba(255, 248, 238, 0.8);
+  border: 1px solid #c9a67a;
+  border-radius: 14px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.variant-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.5rem;
+}
+
+.variant-grid button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.8rem;
+}
+
+.variant-grid .sym {
+  font-size: 1.8rem;
+}
+
+.army-preview {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.play-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(320px, 560px) minmax(220px, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.side h2 {
+  font-size: 0.95rem;
+  margin: 0.6rem 0 0.35rem;
+}
+
+.log {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.8rem;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.log li {
+  padding: 0.25rem 0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  width: min(92vw, 560px);
+  aspect-ratio: 1;
+  border: 10px solid var(--wood-dark);
+  border-radius: 6px;
+  box-shadow: 0 18px 40px rgba(40, 20, 8, 0.35);
+  overflow: hidden;
+}
+
+.sq {
+  position: relative;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+.sq.light {
+  background: var(--light-sq);
+}
+
+.sq.dark {
+  background: var(--dark-sq);
+}
+
+.sq.selected {
+  outline: 3px solid #f0d36c inset;
+}
+
+.sq.move::after {
+  content: '';
+  width: 28%;
+  height: 28%;
+  border-radius: 50%;
+  background: var(--move);
+  position: absolute;
+}
+
+.piece {
+  font-size: clamp(1.1rem, 2.8vw, 1.85rem);
+  line-height: 1;
+  z-index: 1;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
+
+.piece.white {
+  color: #f7f1e4;
+  -webkit-text-stroke: 1px #2a1a10;
+}
+
+.piece.black {
+  color: #1a120c;
+}
+
+.piece .charge {
+  position: absolute;
+  right: 2px;
+  top: 2px;
+  font-size: 0.65rem;
+  font-style: normal;
+  background: #111;
+  color: #f5d76e;
+  border-radius: 999px;
+  padding: 0 0.25rem;
+}
+
+.token {
+  position: absolute;
+  inset: 18%;
+  border-radius: 4px;
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.token.barrier {
+  background: linear-gradient(145deg, #8d7355, #4d3a28);
+  box-shadow: inset 0 0 0 2px #2c2016;
+}
+
+.token.portal {
+  border-radius: 50%;
+  background: conic-gradient(from 20deg, #5bbcff, #ff6ad5, #5bbcff);
+  inset: 28%;
+}
+
+.token.blink {
+  border-radius: 50%;
+  background: #3ecfcf;
+  inset: 35%;
+}
+
+.hand {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 0.5rem;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.35rem;
+  background: #fffaf2;
+}
+
+.card img {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 4px;
+  background: #ddd;
+}
+
+.card.active {
+  outline: 2px solid var(--accent);
+}
+
+.card span {
+  font-size: 0.72rem;
+  text-align: center;
+}
+
+.card-details {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  background: rgba(255, 250, 242, 0.85);
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+}
+
+.hint {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.muted {
+  opacity: 0.6;
+  font-size: 0.85rem;
+}
+
+.grave {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  font-size: 1.1rem;
+}
+
+.winner {
+  color: var(--sea);
+  font-weight: 700;
+}
+
+@media (max-width: 960px) {
+  .lobby {
+    grid-template-columns: 1fr;
+  }
+
+  .play-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .board {
+    margin: 0 auto;
+  }
+}
