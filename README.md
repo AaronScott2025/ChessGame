@@ -1,11 +1,10 @@
-# Chess 2
+# Chesspansion
 
-Online 10×10 Chess 2 with army drafting, day/night, and a modular spell-card system.
+Online 10×10 chess expansion with army drafting, day/night, and a modular spell-card system.
 
 ## Play locally
 
 ```bash
-cd chess2
 npm install
 npm --prefix client install
 npm run dev
@@ -32,7 +31,7 @@ Deploy that process to any Node host (Railway, Render, Fly.io, a VPS). Set `PORT
 Examples:
 
 ### Railway / Render
-- Root directory: `chess2`
+- Root directory: repo root
 - Build: `npm install && npm --prefix client install && npm --prefix client run build`
 - Start: `npm start`
 
@@ -41,11 +40,10 @@ Share your public URL. Friend opens it, joins with your room code.
 ## Project layout
 
 ```
-chess2/
-  shared/src/          # game rules (pieces, cards, engine) — shared by server
-  server/src/          # Express + Socket.IO rooms
-  client/              # React UI
-  client/public/cards/ # card art
+shared/src/          # game rules (pieces, cards, engine) — shared by server
+server/src/          # Express + Socket.IO rooms
+client/              # React UI
+client/public/cards/ # card art
 ```
 
 ## Add a new card (no spaghetti)

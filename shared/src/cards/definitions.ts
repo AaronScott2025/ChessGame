@@ -620,7 +620,15 @@ registerCard({
 registerCard({
   id: 'gamblers_gambit',
   name: "Gambler's Gambit",
-  description: ['Roll 2 dice for a chaotic effect (2–12).'],
+  description: [
+    'Roll 2 dice (2–12) and resolve the matching effect:',
+    '2–4: Opponent chooses one of your non-king / non-queen pieces to remove.',
+    '5–6: Your next turn is skipped.',
+    '7–9: Choose a non-king class; immobilize all enemy pieces of that class for 2 turns.',
+    '10: Opponent revives one piece.',
+    '11: You revive one of your pieces.',
+    '12: Gain a Queen on an empty square near your frontline.',
+  ],
   image: '/cards/Gamblers_Gambit.png',
   targeting: 'none',
   play: (ctx) => {
@@ -642,7 +650,14 @@ registerCard({
 registerCard({
   id: 'gamblers_delight',
   name: "Gambler's Delight",
-  description: ['Roll 2 dice for a milder chaotic effect (2–12).'],
+  description: [
+    'Roll 2 dice (2–12) and resolve the matching effect:',
+    '2–4: Opponent chooses one of your pawns to remove (if any).',
+    '5–6: Nothing happens.',
+    '7–9: Choose a non-king class; all pieces of that class (both sides) cannot move for 3 turns.',
+    '10–11: Choose a class; both players revive one piece of that class if available.',
+    '12: Gain a Queen variant on an empty square near your frontline.',
+  ],
   image: '/cards/Gamblers_Delight.png',
   targeting: 'none',
   play: (ctx) => {

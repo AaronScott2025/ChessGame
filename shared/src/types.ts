@@ -49,6 +49,10 @@ export interface PieceState {
   ritualTargetDefId?: string;
   bloodlust?: boolean;
   coOccupantId?: string;
+  /** Gnome: gadget already deployed */
+  gadgetUsed?: boolean;
+  /** Wizard enchant cooldown (owner turns remaining) */
+  abilityCooldown?: number;
 }
 
 export interface TokenState {
@@ -123,6 +127,8 @@ export interface GameState {
     from: Coord;
     to: Coord;
     capturedId?: string;
+    defId?: string;
+    color?: Color;
   };
   pendingPrompt: PendingPrompt | null;
   rngSeed: number;
@@ -165,6 +171,34 @@ export type PendingPrompt =
       color: Color; // chooser
       forPlayer: Color;
       filter: string;
+      message: string;
+    }
+  | {
+      type: 'ability_target';
+      color: Color;
+      pieceId: string;
+      abilityId: string;
+      message: string;
+      selected?: unknown[];
+    }
+  | {
+      type: 'gadget_choice';
+      color: Color;
+      pieceId: string;
+      message: string;
+    }
+  | {
+      type: 'spring_bounce';
+      color: Color;
+      pieceId: string;
+      from: Coord;
+      message: string;
+    }
+  | {
+      type: 'gnome_hole_travel';
+      color: Color;
+      pieceId: string;
+      options: Coord[];
       message: string;
     };
 

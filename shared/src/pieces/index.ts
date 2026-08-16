@@ -1,5 +1,12 @@
-import type { GameState, PieceState } from '../types.js';
-import { hasEffect, inBounds, pieceAt, sameCoord } from '../utils.js';
+import type { GameState, PieceClass, PieceState } from '../types.js';
+import {
+  clearOrthogonalLOS,
+  hasEffect,
+  inBounds,
+  isAlliedTerritory,
+  pieceAt,
+  sameCoord,
+} from '../utils.js';
 import {
   areaMoves,
   emptyOrEnemy,
@@ -57,20 +64,25 @@ export const PIECES: Record<string, PieceDefinition> = {
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
+      // Move 1 square up (non-capture)
       const up = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col }, p.color);
       if (up && !up.capture) moves.push(up);
+      // Move 1 square diagonally down (left or right, non-capture)
       for (const dc of [-1, 1]) {
         const down = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col + dc }, p.color);
         if (down && !down.capture) moves.push(down);
       }
+      // First move: up to 2 tiles diagonally upwards (non-capture)
       if (!p.hasMoved) {
         for (const dc of [-1, 1]) {
-          const to = { row: p.pos.row + dir * 2, col: p.pos.col + dc * 2 };
+          const one = { row: p.pos.row + dir, col: p.pos.col + dc };
+          if (inBounds(one) && !pieceAt(s, one)) moves.push({ to: one });
+          const two = { row: p.pos.row + dir * 2, col: p.pos.col + dc * 2 };
           const mid = { row: p.pos.row + dir, col: p.pos.col + dc };
-          if (inBounds(to) && !pieceAt(s, mid) && !pieceAt(s, to)) moves.push({ to });
+          if (inBounds(two) && !pieceAt(s, mid) && !pieceAt(s, two)) moves.push({ to: two });
         }
       }
-      // captures
+      // Captures: diagonally up, diagonally down, or vertically down
       for (const dc of [-1, 1]) {
         const capUp = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col + dc }, p.color);
         if (capUp?.capture) moves.push(capUp);
@@ -135,7 +147,22 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Stoneman',
     class: 'rook',
     symbol: '♜',
-    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ORTH, 3)),
+    getMoves: (p, s) => {
+      const moves = filterLegal(p, s, rayMoves(p, s, ORTH, 3));
+      // Ancient Shuffle: swap with allied piece while in allied territory with clear orth. LOS
+      if (isAlliedTerritory(p.color, p.pos)) {
+        for (const ally of s.pieces.filter((x) => x.color === p.color && x.id !== p.id)) {
+          if (!isAlliedTerritory(p.color, ally.pos)) continue;
+          if (!clearOrthogonalLOS(s, p.pos, ally.pos)) continue;
+          moves.push({
+            to: { ...ally.pos },
+            special: 'ancient_shuffle',
+            meta: { withId: ally.id },
+          });
+        }
+      }
+      return moves;
+    },
   },
   gnome: {
     id: 'gnome',
@@ -159,6 +186,12 @@ export const PIECES: Record<string, PieceDefinition> = {
     getMoves: (p, s) => {
       const jump = Boolean(p.bloodlust);
       const moves = knightMoves(p, s, 3, 1, jump);
+      // Bloodlust: +1/-1 on either leg of the L
+      if (p.bloodlust) {
+        moves.push(...knightMoves(p, s, 4, 1, true));
+        moves.push(...knightMoves(p, s, 2, 1, true));
+        moves.push(...knightMoves(p, s, 3, 2, true));
+      }
       return filterLegal(p, s, moves);
     },
     onCapture: (attacker) => {
@@ -173,7 +206,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     canAct: dayOnly,
     getMoves: (p, s) => {
       const moves = knightMoves(p, s, 2, 1, false);
-      // best buddy: share tile with allied non-king
+      // Best Buddy: share tile with allied non-king
       for (const ally of s.pieces.filter((x) => x.color === p.color && x.class !== 'king' && x.id !== p.id)) {
         moves.push({ to: ally.pos, special: 'best_buddy', meta: { withId: ally.id } });
       }
@@ -230,12 +263,10 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'queen',
     symbol: '♛',
     getMoves: (p, s) => {
-      // locked until first night
-      if (!hasEffect(p, 'ghost_unlocked') && s.dayNight === 'day' && s.cycleCount < 5) {
-        // unlock after first night begins; until then locked
-        if (s.cycleCount === 0 && s.dayNight === 'day') return [];
-      }
-      if (s.cycleCount === 0 && s.dayNight === 'day') return [];
+      // Locked until the first night of the game
+      const unlocked =
+        hasEffect(p, 'ghost_unlocked') || s.dayNight === 'night' || s.cycleCount >= 5;
+      if (!unlocked) return [];
       return filterLegal(p, s, areaMoves(p, s, 2));
     },
   },
@@ -245,13 +276,21 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'queen',
     symbol: '♛',
     getMoves: (p, s) => {
-      const moves = filterLegal(p, s, areaMoves(p, s, 1));
       const charges = p.charges ?? 0;
-      if (charges >= 2) {
-        moves.push(...filterLegal(p, s, areaMoves(p, s, 2)));
+      const radius = charges >= 2 ? 2 : 1;
+      const moves = filterLegal(p, s, areaMoves(p, s, radius));
+      // Swap of Fates (1+ charges): swap with any allied piece
+      if (charges >= 1) {
+        for (const ally of s.pieces.filter((x) => x.color === p.color && x.id !== p.id)) {
+          moves.push({
+            to: { ...ally.pos },
+            special: 'swap_of_fates',
+            meta: { withId: ally.id },
+          });
+        }
       }
+      // Death Stare (4+ charges): capture in area without moving
       if (charges >= 4) {
-        // death stare capture without moving
         for (const m of areaMoves(p, s, 2)) {
           if (m.capture) moves.push({ ...m, special: 'death_stare' });
         }
@@ -297,16 +336,19 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♟',
     getMoves: (p, s) => {
       const last = s.lastMove;
-      if (!last) return filterLegal(p, s, areaMoves(p, s, 1));
-      const copied = s.pieces.find((x) => x.id === last.pieceId) ?? null;
-      // use last moved piece's def even if captured: look at history via meta
-      const defId = (last as { defId?: string }).defId;
-      const id = copied?.defId ?? defId;
+      // Copy opponent's last played piece movement only
+      if (!last || last.color === p.color) {
+        return filterLegal(p, s, areaMoves(p, s, 1));
+      }
+      let id = last.defId;
+      if (id === 'mimic') {
+        id = (last as { copiedDefId?: string }).copiedDefId;
+      }
       if (!id || id === 'mimic') return filterLegal(p, s, areaMoves(p, s, 1));
       const def = PIECES[id];
       if (!def) return filterLegal(p, s, areaMoves(p, s, 1));
-      // temporary: ignore day/night via timeless energy
-      return def.getMoves(p, s);
+      // Timeless Energy: ignore day/night by calling getMoves directly (skip canAct)
+      return filterLegal(p, s, def.getMoves(p, s));
     },
   },
   king: {
@@ -337,7 +379,7 @@ export const VARIANTS_BY_CLASS: Record<string, string[]> = {
   king: ['king'],
 };
 
-export const DRAFT_ORDER: Array<keyof typeof VARIANTS_BY_CLASS> = [
+export const DRAFT_ORDER: PieceClass[] = [
   'pawn',
   'rook',
   'knight',

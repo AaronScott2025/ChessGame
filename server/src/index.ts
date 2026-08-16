@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import cors from 'cors';
 import {
   applyMove,
+  availableAbilities,
   chooseFirstPicker,
   createLobbyState,
   draftPick,
@@ -18,6 +19,7 @@ import {
   resolvePrompt,
   skipSpell,
   startDraft,
+  useAbility,
   type ClientAction,
   type Color,
   type GameState,
@@ -186,7 +188,11 @@ io.on('connection', (socket) => {
       if (!color) throw new Error('Spectating');
       const piece = room.state.pieces.find((p) => p.id === payload.pieceId);
       if (!piece || piece.color !== color) throw new Error('Not your piece');
-      ack?.({ ok: true, moves: listMoves(room.state, payload.pieceId) });
+      ack?.({
+        ok: true,
+        moves: listMoves(room.state, payload.pieceId),
+        abilities: availableAbilities(room.state, payload.pieceId),
+      });
     } catch (e) {
       ack?.({ ok: false, error: (e as Error).message });
     }
@@ -227,6 +233,8 @@ function reduce(state: GameState, color: Color, action: ClientAction): GameState
       return resolvePrompt(state, color, action.payload);
     case 'move':
       return applyMove(state, color, action.pieceId, action.to, action.meta);
+    case 'use_ability':
+      return useAbility(state, color, action.pieceId, action.abilityId, action.targets);
     case 'resign':
       state.phase = 'ended';
       state.winner = color === 'white' ? 'black' : 'white';
@@ -239,5 +247,5 @@ function reduce(state: GameState, color: Color, action: ClientAction): GameState
 
 const PORT = Number(process.env.PORT || 3001);
 httpServer.listen(PORT, () => {
-  console.log(`Chess 2 server on http://localhost:${PORT}`);
+  console.log(`Chesspansion server on http://localhost:${PORT}`);
 });

@@ -1,5 +1,17 @@
 import { useEffect, useMemo, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
+import {
+  AudioToggles,
+  playCardCastSfx,
+  playPieceSfx,
+  useAudioScene,
+  useAudioSettings,
+  useUiButtonSfx,
+} from './AudioControl';
+import { PieceIcon } from './PieceIcon';
+import { getPieceInfo } from './pieceInfo';
+import { RulesModal } from './RulesModal';
 import './App.css';
 
 type Color = 'white' | 'black';
@@ -13,6 +25,18 @@ interface Piece {
   pos: Coord;
   effects: Array<{ kind: string; turnsRemaining?: number }>;
   charges?: number;
+  gadgetUsed?: boolean;
+  abilityCooldown?: number;
+  ritualTurns?: number;
+  reviveCount?: number;
+  bloodlust?: boolean;
+}
+
+interface AbilityInfo {
+  id: string;
+  name: string;
+  ready: boolean;
+  hint?: string;
 }
 
 interface CardInstance {
@@ -50,12 +74,14 @@ interface GameState {
     type: string;
     color?: Color;
     message?: string;
-    options?: string[];
+    options?: string[] | Coord[];
     pieceId?: string;
     cardDefId?: string;
     roll?: number;
     selected?: unknown[];
     cardInstanceId?: string;
+    abilityId?: string;
+    from?: Coord;
   };
   draft: null | {
     pickingColor: Color;
@@ -93,7 +119,20 @@ function cardMeta(catalog: Catalog | null, defId: string) {
   return catalog?.cards.find((c) => c.id === defId);
 }
 
+function isAlliedTerritory(color: Color, pos: Coord): boolean {
+  return color === 'white' ? pos.row >= 5 : pos.row < 5;
+}
+
+function chebyshev(a: Coord, b: Coord): number {
+  return Math.max(Math.abs(a.row - b.row), Math.abs(a.col - b.col));
+}
+
 export default function App() {
+  const { fxEnabled, setFxEnabled } = useFxEnabled();
+  const { knowledgeEnabled, setKnowledgeEnabled } = useKnowledgeEnabled();
+  const { musicEnabled, sfxEnabled, setMusicEnabled, setSfxEnabled } = useAudioSettings();
+  useUiButtonSfx();
+  const [rulesOpen, setRulesOpen] = useState(false);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [name, setName] = useState('');
   const [joinCode, setJoinCode] = useState('');
@@ -103,7 +142,10 @@ export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [draftOptions, setDraftOptions] = useState<string[]>([]);
   const [selectedPiece, setSelectedPiece] = useState<string | null>(null);
+  const [inspectedId, setInspectedId] = useState<string | null>(null);
   const [moves, setMoves] = useState<MoveOption[]>([]);
+  const [abilities, setAbilities] = useState<AbilityInfo[]>([]);
+  const [gadgetKind, setGadgetKind] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<string | null>(null);
   const [pendingTargets, setPendingTargets] = useState<unknown[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -138,13 +180,15 @@ export default function App() {
     socket.emit(
       'get_moves',
       { code: roomCode, pieceId },
-      (res: { ok: boolean; moves?: MoveOption[]; error?: string }) => {
+      (res: { ok: boolean; moves?: MoveOption[]; abilities?: AbilityInfo[]; error?: string }) => {
         if (!res?.ok) {
           setError(res?.error ?? 'Could not get moves');
           setMoves([]);
+          setAbilities([]);
           return;
         }
         setMoves(res.moves ?? []);
+        setAbilities(res.abilities ?? []);
       },
     );
   };
@@ -185,10 +229,46 @@ export default function App() {
     return card ? cardMeta(catalog, card.defId) ?? null : null;
   }, [state, you, selectedCard, catalog]);
 
+  const barrierShiftHighlights = useMemo(() => {
+    const barriers = new Set<string>();
+    const destinations = new Set<string>();
+    let fromKey: string | null = null;
+    if (!state || !you) return { barriers, destinations, fromKey };
+    const prompt = state.pendingPrompt;
+    if (prompt?.type !== 'ability_target' || prompt.abilityId !== 'barrier_shift' || prompt.color !== you) {
+      return { barriers, destinations, fromKey };
+    }
+    const selected = prompt.selected ?? [];
+    if (selected.length === 0) {
+      for (const t of state.tokens) {
+        if (t.kind === 'barrier' && t.owner === you) barriers.add(`${t.pos.row},${t.pos.col}`);
+      }
+      return { barriers, destinations, fromKey };
+    }
+    const from = selected[0] as Coord;
+    fromKey = `${from.row},${from.col}`;
+    const otherBarriers = state.tokens.filter(
+      (t) => t.kind === 'barrier' && t.owner === you && !(t.pos.row === from.row && t.pos.col === from.col),
+    );
+    for (let r = 0; r < 10; r++) {
+      for (let c = 0; c < 10; c++) {
+        const pos = { row: r, col: c };
+        if (r === from.row && c === from.col) continue;
+        if (!isAlliedTerritory(you, pos)) continue;
+        if (state.pieces.some((p) => p.pos.row === r && p.pos.col === c)) continue;
+        if (state.tokens.some((t) => t.pos.row === r && t.pos.col === c)) continue;
+        if (otherBarriers.some((t) => chebyshev(t.pos, pos) === 1)) continue;
+        destinations.add(`${r},${c}`);
+      }
+    }
+    return { barriers, destinations, fromKey };
+  }, [state, you]);
+
   const targetNeeded = activeCardDef?.targeting && activeCardDef.targeting !== 'none';
 
   const finishCard = (targets: unknown[]) => {
     if (!selectedCard) return;
+    playCardCastSfx();
     send({ type: 'play_card', instanceId: selectedCard, targets });
     setSelectedCard(null);
     setPendingTargets([]);
@@ -197,6 +277,65 @@ export default function App() {
 
   const onSquareClick = (row: number, col: number) => {
     if (!state || !you) return;
+    playPieceSfx();
+
+    const prompt = state.pendingPrompt;
+    if (prompt && prompt.color === you) {
+      if (prompt.type === 'gadget_choice' && gadgetKind) {
+        send({
+          type: 'resolve_prompt',
+          payload: { kind: gadgetKind, pos: { row, col } },
+        });
+        setGadgetKind(null);
+        return;
+      }
+      if (prompt.type === 'spring_bounce') {
+        send({ type: 'resolve_prompt', payload: { row, col } });
+        return;
+      }
+      if (prompt.type === 'gnome_hole_travel') {
+        send({ type: 'resolve_prompt', payload: { row, col } });
+        return;
+      }
+      if (prompt.type === 'ability_target') {
+        if (prompt.abilityId === 'enchant') {
+          const piece = board[row][col];
+          if (piece) send({ type: 'resolve_prompt', payload: piece.id });
+          return;
+        }
+        if (prompt.abilityId === 'barrier_shift') {
+          send({ type: 'resolve_prompt', payload: { row, col } });
+          return;
+        }
+      }
+    }
+
+    // Click your barrier on your turn to start Barrier Shift (Enchanted Pawn)
+    const barrierHere = state.tokens.find(
+      (t) => t.kind === 'barrier' && t.owner === you && t.pos.row === row && t.pos.col === col,
+    );
+    if (
+      barrierHere &&
+      state.turn === you &&
+      state.phase === 'playing' &&
+      !state.pendingPrompt &&
+      state.players[you].army.pawn === 'enchanted_pawn'
+    ) {
+      const ep = state.pieces.find((p) => p.color === you && p.defId === 'enchanted_pawn');
+      if (ep) {
+        send({
+          type: 'use_ability',
+          pieceId: ep.id,
+          abilityId: 'barrier_shift',
+          targets: { from: { row, col } },
+        });
+        setSelectedPiece(ep.id);
+        setMoves([]);
+        setAbilities([]);
+        setStatus('Barrier Shift: click an empty square in allied territory');
+        return;
+      }
+    }
 
     if (selectedCard && targetNeeded) {
       const mode = activeCardDef!.targeting;
@@ -272,11 +411,19 @@ export default function App() {
     }
 
     if (piece && piece.color === you) {
+      setInspectedId(piece.id);
       setSelectedPiece(piece.id);
       requestMoves(piece.id);
+    } else if (piece) {
+      setInspectedId(piece.id);
+      setSelectedPiece(null);
+      setMoves([]);
+      setAbilities([]);
     } else {
       setSelectedPiece(null);
       setMoves([]);
+      setAbilities([]);
+      setInspectedId(null);
     }
   };
 
@@ -301,36 +448,77 @@ export default function App() {
     setStatus(`Select target for ${activeCardDef.name} (${activeCardDef.targeting})`);
   };
 
+  const inspectedPiece = useMemo(() => {
+    if (!state || !inspectedId) return null;
+    if (inspectedId.startsWith('draft:')) return null;
+    return state.pieces.find((p) => p.id === inspectedId) ?? null;
+  }, [state, inspectedId]);
+
+  const draftInspectDefId = inspectedId?.startsWith('draft:') ? inspectedId.slice(6) : null;
+
+  const musicScene =
+    !roomCode || !state
+      ? 'menu'
+      : state.phase === 'playing' || state.phase === 'opening_draw' || state.phase === 'ended'
+        ? 'game'
+        : 'menu';
+  useAudioScene(musicScene);
+
+  const audioFxStack = (
+    <div className="corner-toggles-right">
+      <AudioToggles
+        musicEnabled={musicEnabled}
+        sfxEnabled={sfxEnabled}
+        onToggleMusic={() => setMusicEnabled((v) => !v)}
+        onToggleSfx={() => setSfxEnabled((v) => !v)}
+      />
+      <FxToggle enabled={fxEnabled} onToggle={() => setFxEnabled((v) => !v)} />
+    </div>
+  );
+
   if (!roomCode || !state) {
     return (
-      <div className="shell lobby">
-        <div className="lobby-card">
-          <p className="brand">Chess 2</p>
-          <h1>Build an army. Cast spells. Ruin openings.</h1>
-          <p className="lede">
-            10×10 board, wildcards, and a modular spell deck — create a room and share the code to play someone.
+      <div className="shell lobby-shell home">
+        <CosmicBackdrop enabled={fxEnabled} />
+        <main className="home-hero">
+          <p className="brand home-brand">Chesspansion</p>
+          <p className="home-tagline">
+            Draft strange armies, weave spell cards, and fight across a 10×10 realm of day and night.
           </p>
-          <label>
-            Display name
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Player" />
-          </label>
-          <div className="row">
-            <button type="button" className="primary" onClick={createRoom}>
-              Create room
-            </button>
-            <input
-              value={joinCode}
-              onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-              placeholder="ROOM"
-              maxLength={5}
-            />
-            <button type="button" onClick={joinRoom}>
-              Join
-            </button>
+          <div className="home-panel">
+            <label className="home-label">
+              Display name
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Player" />
+            </label>
+            <div className="home-actions">
+              <button type="button" className="primary home-cta" onClick={createRoom}>
+                Create room
+              </button>
+              <div className="home-join">
+                <input
+                  value={joinCode}
+                  onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                  placeholder="ROOM"
+                  maxLength={5}
+                  aria-label="Room code"
+                />
+                <button type="button" onClick={joinRoom}>
+                  Join
+                </button>
+              </div>
+            </div>
+            {error && <p className="error">{error}</p>}
           </div>
-          {error && <p className="error">{error}</p>}
-        </div>
-        <div className="lobby-art" aria-hidden />
+          <button type="button" className="home-rules" onClick={() => setRulesOpen(true)}>
+            Rules
+          </button>
+        </main>
+        <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
+        <KnowledgeToggle
+          enabled={knowledgeEnabled}
+          onToggle={() => setKnowledgeEnabled((v) => !v)}
+        />
+        {audioFxStack}
       </div>
     );
   }
@@ -339,9 +527,11 @@ export default function App() {
 
   return (
     <div className="shell">
+      <CosmicBackdrop enabled={fxEnabled} />
+      <div className="shell-content">
       <header className="top">
         <div>
-          <p className="brand">Chess 2</p>
+          <p className="brand">Chesspansion</p>
           <p className="meta">
             Room <strong>{roomCode}</strong> · You are <strong>{you}</strong> ·{' '}
             <span className={state.dayNight}>{state.dayNight}</span> · cycle {state.cycleCount}
@@ -385,14 +575,77 @@ export default function App() {
         <div className="banner">
           Promote to:
           <span className="prompt-actions">
-            {state.pendingPrompt.options?.map((opt) => (
+            {(state.pendingPrompt.options as string[] | undefined)?.map((opt) => (
               <button key={opt} type="button" onClick={() => send({ type: 'resolve_prompt', payload: opt })}>
+                <PieceIcon defId={opt} color={you ?? 'white'} className="sm" />{' '}
                 {pieceMeta(catalog, opt)?.name ?? opt}
               </button>
             ))}
           </span>
         </div>
       )}
+
+      {state.pendingPrompt?.type === 'gadget_choice' && state.pendingPrompt.color === you && (
+        <div className="banner">
+          Deploy a gadget on an adjacent empty square:
+          <span className="prompt-actions">
+            {(['ice_floor', 'spring_board', 'gnome_hole'] as const).map((kind) => (
+              <button
+                key={kind}
+                type="button"
+                className={gadgetKind === kind ? 'primary' : ''}
+                onClick={() => {
+                  setGadgetKind(kind);
+                  setStatus(`Selected ${kind} — click an adjacent empty square`);
+                }}
+              >
+                {kind.replace('_', ' ')}
+              </button>
+            ))}
+          </span>
+        </div>
+      )}
+
+      {state.pendingPrompt?.type === 'ability_target' &&
+        state.pendingPrompt.color === you &&
+        state.pendingPrompt.abilityId === 'revive' && (
+          <div className="banner">
+            Revive from graveyard:
+            <span className="prompt-actions">
+              {state.players[you].graveyard
+                .filter((g) => g.defId !== 'angel')
+                .map((g, i) => (
+                  <button
+                    key={`${g.defId}-${i}`}
+                    type="button"
+                    onClick={() => send({ type: 'resolve_prompt', payload: g.defId })}
+                  >
+                    <PieceIcon defId={g.defId} color={you} className="sm" /> {pieceMeta(catalog, g.defId)?.name}
+                  </button>
+                ))}
+            </span>
+          </div>
+        )}
+
+      {state.pendingPrompt?.type === 'ability_target' &&
+        state.pendingPrompt.color === you &&
+        state.pendingPrompt.abilityId !== 'revive' && (
+          <div className="banner">{state.pendingPrompt.message}</div>
+        )}
+
+      {(state.pendingPrompt?.type === 'spring_bounce' || state.pendingPrompt?.type === 'gnome_hole_travel') &&
+        state.pendingPrompt.color === you && (
+          <div className="banner">
+            {state.pendingPrompt.message}
+            {state.pendingPrompt.type === 'gnome_hole_travel' && (
+              <span className="prompt-actions">
+                <button type="button" onClick={() => send({ type: 'resolve_prompt', payload: 'skip' })}>
+                  Stay here
+                </button>
+              </span>
+            )}
+          </div>
+        )}
 
       {state.pendingPrompt?.type === 'gambler_choice' && (
         <GamblerPrompt
@@ -441,10 +694,15 @@ export default function App() {
                     <button
                       key={id}
                       type="button"
-                      disabled={state.draft?.pickingColor !== you}
-                      onClick={() => send({ type: 'draft_pick', defId: id })}
+                      className={state.draft?.pickingColor !== you ? 'muted-pick' : ''}
+                      onClick={() => {
+                        setInspectedId(`draft:${id}`);
+                        if (state.draft?.pickingColor === you) send({ type: 'draft_pick', defId: id });
+                      }}
                     >
-                      <span className="sym">{p?.symbol}</span>
+                      <span className="sym">
+                        <PieceIcon defId={id} color={you ?? 'white'} title={p?.name} />
+                      </span>
                       <span>{p?.name ?? id}</span>
                     </button>
                   );
@@ -459,9 +717,9 @@ export default function App() {
         <div className="play-layout">
           <aside className="side">
             <h2>{state.players.white.name} (white)</h2>
-            <Graveyard items={state.players.white.graveyard} catalog={catalog} />
+            <Graveyard items={state.players.white.graveyard} catalog={catalog} color="white" />
             <h2>{state.players.black.name} (black)</h2>
-            <Graveyard items={state.players.black.graveyard} catalog={catalog} />
+            <Graveyard items={state.players.black.graveyard} catalog={catalog} color="black" />
             <h2>Log</h2>
             <ul className="log">
               {state.history.slice(0, 14).map((h, i) => (
@@ -470,7 +728,7 @@ export default function App() {
             </ul>
           </aside>
 
-          <main>
+          <main className="board-wrap">
             <div className={`board ${flip ? 'flipped' : ''}`}>
               {Array.from({ length: 10 }, (_, visualRow) =>
                 Array.from({ length: 10 }, (_, visualCol) => {
@@ -480,23 +738,37 @@ export default function App() {
                   const dark = (row + col) % 2 === 1;
                   const selected = piece && piece.id === selectedPiece;
                   const moveHere = moves.some((m) => m.to.row === row && m.to.col === col);
+                  const key = `${row},${col}`;
+                  const barrierPick = barrierShiftHighlights.barriers.has(key);
+                  const barrierFrom = barrierShiftHighlights.fromKey === key;
+                  const barrierDest = barrierShiftHighlights.destinations.has(key);
                   const toks = state.tokens.filter((t) => t.pos.row === row && t.pos.col === col);
+                  const meta = piece ? pieceMeta(catalog, piece.defId) : null;
                   return (
                     <button
                       key={`${row}-${col}`}
                       type="button"
-                      className={['sq', dark ? 'dark' : 'light', selected ? 'selected' : '', moveHere ? 'move' : ''].join(
-                        ' ',
-                      )}
+                      className={[
+                        'sq',
+                        dark ? 'dark' : 'light',
+                        selected ? 'selected' : '',
+                        piece && piece.id === inspectedId ? 'inspected' : '',
+                        moveHere ? 'move' : '',
+                        barrierPick || barrierFrom ? 'barrier-source' : '',
+                        barrierDest ? 'barrier-target' : '',
+                      ].join(' ')}
                       onClick={() => onSquareClick(row, col)}
                     >
                       {toks.map((t) => (
                         <span key={t.id} className={`token ${t.kind}`} title={t.kind} />
                       ))}
                       {piece && (
-                        <span className={`piece ${piece.color}`} title={piece.defId}>
-                          {pieceMeta(catalog, piece.defId)?.symbol ?? '?'}
+                        <span className="piece" title={meta?.name ?? piece.defId}>
+                          <PieceIcon defId={piece.defId} color={piece.color} title={meta?.name ?? piece.defId} />
                           {piece.charges != null && piece.charges > 0 && <i className="charge">{piece.charges}</i>}
+                          {piece.ritualTurns != null && piece.ritualTurns > 0 && (
+                            <i className="ritual" title="Revive ritual">{piece.ritualTurns}</i>
+                          )}
                         </span>
                       )}
                     </button>
@@ -504,6 +776,39 @@ export default function App() {
                 }),
               )}
             </div>
+
+            {selectedPiece && abilities.length > 0 && state.turn === you && (
+              <div className="ability-bar">
+                {abilities.map((a) => (
+                  <button
+                    key={a.id}
+                    type="button"
+                    className="primary"
+                    disabled={!a.ready}
+                    title={a.hint}
+                    onClick={() => {
+                      send({ type: 'use_ability', pieceId: selectedPiece, abilityId: a.id });
+                      setStatus(a.hint ?? a.name);
+                      setMoves([]);
+                    }}
+                  >
+                    <strong>{a.name}</strong>
+                    {a.ready ? '' : ' (unavailable)'}
+                  </button>
+                ))}
+              </div>
+            )}
+            {you &&
+              state.turn === you &&
+              state.phase === 'playing' &&
+              state.players[you].army.pawn === 'enchanted_pawn' &&
+              state.tokens.some((t) => t.kind === 'barrier' && t.owner === you) &&
+              !state.pendingPrompt && (
+                <p className="hint barrier-hint">
+                  Tip: click a barrier to move it (<strong>Barrier Shift</strong>), or select an Enchanted Pawn and use
+                  the ability button.
+                </p>
+              )}
           </main>
 
           <aside className="side hand-side">
@@ -524,6 +829,7 @@ export default function App() {
                     >
                       <img src={meta?.image ?? '/cards/Back_Of_Card.png'} alt={meta?.name ?? c.defId} />
                       <span>{meta?.name ?? c.defId}</span>
+                      {meta?.description?.[0] && <small className="card-blurb">{meta.description[0]}</small>}
                     </button>
                   );
                 })}
@@ -542,9 +848,6 @@ export default function App() {
                     Skip spell
                   </button>
                 )}
-                <button type="button" className="danger" onClick={() => send({ type: 'resign' })}>
-                  Resign
-                </button>
               </div>
             )}
 
@@ -557,6 +860,7 @@ export default function App() {
                   })
                   .map((p) => (
                     <button key={p.id} type="button" onClick={() => finishCard([pendingTargets[0], p.id])}>
+                      <PieceIcon defId={p.id} color={you ?? 'white'} className="sm" />
                       {p.name}
                     </button>
                   ))}
@@ -581,22 +885,180 @@ export default function App() {
           </aside>
         </div>
       )}
+
+      {knowledgeEnabled && inspectedPiece && (
+        <PieceInfoTile
+          defId={inspectedPiece.defId}
+          color={inspectedPiece.color}
+          live={{
+            charges: inspectedPiece.charges,
+            ritualTurns: inspectedPiece.ritualTurns,
+            gadgetUsed: inspectedPiece.gadgetUsed,
+            abilityCooldown: inspectedPiece.abilityCooldown,
+            bloodlust: inspectedPiece.bloodlust,
+          }}
+          onClose={() => setInspectedId(null)}
+        />
+      )}
+      {knowledgeEnabled && !inspectedPiece && draftInspectDefId && (
+        <PieceInfoTile
+          defId={draftInspectDefId}
+          color={you ?? 'white'}
+          onClose={() => setInspectedId(null)}
+        />
+      )}
+      </div>
+      <KnowledgeToggle
+        enabled={knowledgeEnabled}
+        onToggle={() => setKnowledgeEnabled((v) => !v)}
+      />
+      {audioFxStack}
     </div>
+  );
+}
+
+function formatNamedLine(line: string) {
+  const chargeNamed = line.match(/^(\d\+:\s*.+?)\s+[—–-]\s+(.+)$/);
+  if (chargeNamed) {
+    return (
+      <>
+        <strong>{chargeNamed[1]}</strong> — {chargeNamed[2]}
+      </>
+    );
+  }
+  const colon = line.indexOf(': ');
+  if (colon > 0) {
+    return (
+      <>
+        <strong>{line.slice(0, colon)}</strong>
+        {line.slice(colon)}
+      </>
+    );
+  }
+  return line;
+}
+
+function PieceInfoTile({
+  defId,
+  color,
+  live,
+  onClose,
+}: {
+  defId: string;
+  color: Color;
+  live?: {
+    charges?: number;
+    ritualTurns?: number;
+    gadgetUsed?: boolean;
+    abilityCooldown?: number;
+    bloodlust?: boolean;
+  };
+  onClose: () => void;
+}) {
+  const info = getPieceInfo(defId);
+  const [previewColor, setPreviewColor] = useState<Color>(color);
+
+  useEffect(() => {
+    setPreviewColor(color);
+  }, [color, defId]);
+
+  return (
+    <aside className={`piece-info-tile ${previewColor}`} aria-live="polite">
+      <button type="button" className="piece-info-close" onClick={onClose} aria-label="Close piece info">
+        ×
+      </button>
+      <div className="piece-info-head">
+        <div className="piece-info-icon-wrap">
+          <PieceIcon defId={defId} color={previewColor} title={info.name} />
+        </div>
+        <div>
+          <p className="piece-info-class">{info.classLabel}</p>
+          <h2>{info.name}</h2>
+          <div className="piece-info-color-toggle" role="group" aria-label="Preview piece color">
+            <button
+              type="button"
+              className={previewColor === 'white' ? 'active' : ''}
+              onClick={() => setPreviewColor('white')}
+            >
+              White
+            </button>
+            <button
+              type="button"
+              className={previewColor === 'black' ? 'active' : ''}
+              onClick={() => setPreviewColor('black')}
+            >
+              Black
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <section>
+        <h3>Movement</h3>
+        <ul>
+          {info.movement.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      </section>
+
+      {info.abilities.length > 0 && (
+        <section>
+          <h3>Abilities</h3>
+          <ul>
+            {info.abilities.map((line) => (
+              <li key={line}>{formatNamedLine(line)}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {info.misc && info.misc.length > 0 && (
+        <section>
+          <h3>Notes</h3>
+          <ul>
+            {info.misc.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {live && (
+        <div className="piece-info-live">
+          {live.charges != null && <span>Charges: {live.charges}</span>}
+          {live.ritualTurns != null && live.ritualTurns > 0 && <span>Ritual: {live.ritualTurns}</span>}
+          {live.gadgetUsed && <span>Gadget used</span>}
+          {live.abilityCooldown != null && live.abilityCooldown > 0 && (
+            <span>Cooldown: {live.abilityCooldown}</span>
+          )}
+          {live.bloodlust && <span>Bloodlust</span>}
+        </div>
+      )}
+    </aside>
   );
 }
 
 function Graveyard({
   items,
   catalog,
+  color,
 }: {
   items: Array<{ defId: string; class: string }>;
   catalog: Catalog | null;
+  color: 'white' | 'black';
 }) {
   if (!items.length) return <p className="muted">None</p>;
   return (
     <div className="grave">
       {items.map((g, i) => (
-        <span key={`${g.defId}-${i}`}>{pieceMeta(catalog, g.defId)?.symbol ?? g.defId}</span>
+        <PieceIcon
+          key={`${g.defId}-${i}`}
+          defId={g.defId}
+          color={color}
+          className="sm"
+          title={pieceMeta(catalog, g.defId)?.name ?? g.defId}
+        />
       ))}
     </div>
   );
@@ -627,6 +1089,7 @@ function GamblerPrompt({
         <span className="prompt-actions">
           {choices.map((p) => (
             <button key={p.id} type="button" onClick={() => onResolve(p.id)}>
+              <PieceIcon defId={p.defId} color={p.color} className="sm" />{' '}
               {pieceMeta(catalog, p.defId)?.name}
             </button>
           ))}
