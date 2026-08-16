@@ -1004,11 +1004,11 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
 
   const isOppTurn = next.turn !== color;
   if (isOppTurn && !def.playOnOpponentTurn) throw new Error('Cannot play that on opponent turn');
-  if (!isOppTurn && next.turnPhase !== 'spell' && !def.playOnOpponentTurn) {
+  if (!isOppTurn && next.turnPhase !== 'spell') {
     throw new Error('Spell phase only');
   }
-  if (player.spellsThisTurn >= player.maxSpellsThisTurn && !def.playOnOpponentTurn) {
-    throw new Error('Already cast max spells this turn');
+  if (!isOppTurn && player.spellsThisTurn >= player.maxSpellsThisTurn) {
+    throw new Error('Already cast a spell this turn');
   }
 
   // Cannot cast abilities on enemy king — enforced per-card
@@ -1040,6 +1040,11 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
   player.spellsThisTurn += 1;
   player.lastPlayedCardDefId = def.id;
   log(next, `${color} played ${def.name}`);
+
+  // One spell per turn (unless an effect raised the cap): leave spell phase when spent
+  if (!isOppTurn && player.spellsThisTurn >= player.maxSpellsThisTurn) {
+    next.turnPhase = 'move';
+  }
 
   if (isInCheck(next, opposite(color))) {
     next.check = opposite(color);
@@ -1089,6 +1094,12 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
       const idx = next.players[prompt.color].hand.findIndex((c) => c.instanceId === inst);
       if (idx >= 0) next.discardPile.push(...next.players[prompt.color].hand.splice(idx, 1));
       next.players[prompt.color].spellsThisTurn += 1;
+      if (
+        next.turn === prompt.color &&
+        next.players[prompt.color].spellsThisTurn >= next.players[prompt.color].maxSpellsThisTurn
+      ) {
+        next.turnPhase = 'move';
+      }
     }
     return next;
   }
@@ -1339,14 +1350,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
 
   next.turn = nextColor;
   next.turnPhase = 'spell';
-
-  const nk = getKing(next, nextColor);
-  if (nk) {
-    if (hasEffect(nk, 'doublecast_ready')) {
-      next.players[nextColor].maxSpellsThisTurn = 2;
-      removeEffects(nk, 'doublecast_ready');
-    }
-  }
+  next.players[nextColor].maxSpellsThisTurn = 1;
 
   pushSnapshot(next);
 

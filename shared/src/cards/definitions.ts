@@ -192,7 +192,9 @@ registerCard({
 registerCard({
   id: 'doublecast',
   name: 'Doublecast',
-  description: ['The turn after you cast this, you may use two abilities in one turn for one turn.'],
+  description: [
+    'The turn after you cast this, you may use two piece abilities in one turn (still one spell).',
+  ],
   image: '/cards/Doublecast.png',
   targeting: 'none',
   play: (ctx) => {

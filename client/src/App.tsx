@@ -539,10 +539,17 @@ export default function App() {
         </div>
         <div className="meta right">
           {state.phase === 'playing' && (
-            <span>
-              {state.turn === you ? 'Your turn' : 'Opponent turn'} · {state.turnPhase}
-              {state.check ? ` · ${state.check} in check` : ''}
-            </span>
+            <div
+              className={`turn-pill ${state.turn === you ? 'turn-yours' : 'turn-theirs'}`}
+              role="status"
+              aria-live="polite"
+            >
+              <span className="turn-pill-label">
+                {state.turn === you ? 'Your turn' : "Opponent's turn"}
+              </span>
+              <span className="turn-pill-phase">{state.turnPhase}</span>
+              {state.check ? <span className="turn-pill-check">{state.check} in check</span> : null}
+            </div>
           )}
           {state.phase === 'ended' && (
             <span className="winner">
@@ -551,6 +558,25 @@ export default function App() {
           )}
         </div>
       </header>
+
+      {state.phase === 'playing' && (
+        <div
+          className={`turn-banner ${state.turn === you ? 'turn-yours' : 'turn-theirs'}`}
+          role="status"
+        >
+          {state.turn === you ? (
+            <>
+              <strong>Your turn</strong>
+              <span> — cast a spell or move a piece ({state.turnPhase})</span>
+            </>
+          ) : (
+            <>
+              <strong>Opponent&apos;s turn</strong>
+              <span> — wait for them to finish</span>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="banner">{status}</div>
       {error && <div className="banner error">{error}</div>}
@@ -729,7 +755,7 @@ export default function App() {
           </aside>
 
           <main className="board-wrap">
-            <div className={`board ${flip ? 'flipped' : ''}`}>
+            <div className={`board ${flip ? 'flipped' : ''} ${state.phase === 'playing' ? (state.turn === you ? 'board-your-turn' : 'board-their-turn') : ''}`}>
               {Array.from({ length: 10 }, (_, visualRow) =>
                 Array.from({ length: 10 }, (_, visualCol) => {
                   const row = flip ? 9 - visualRow : visualRow;
@@ -837,12 +863,14 @@ export default function App() {
 
             {state.phase === 'playing' && (
               <div className="row">
-                {(state.turn === you && state.turnPhase === 'spell') ||
-                (selectedCard && activeCardDef?.playOnOpponentTurn) ? (
+                {((state.turn === you &&
+                  state.turnPhase === 'spell' &&
+                  state.players[you].spellsThisTurn < state.players[you].maxSpellsThisTurn) ||
+                  (selectedCard && activeCardDef?.playOnOpponentTurn && state.turn !== you)) && (
                   <button type="button" className="primary" onClick={castCard} disabled={!selectedCard}>
                     Cast selected
                   </button>
-                ) : null}
+                )}
                 {state.turn === you && state.turnPhase === 'spell' && (
                   <button type="button" onClick={() => send({ type: 'skip_spell' })}>
                     Skip spell
