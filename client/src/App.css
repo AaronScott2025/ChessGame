@@ -974,8 +974,9 @@ html.fx-off .turn-pill.turn-yours {
 
 .board-wrap {
   display: flex;
-  justify-content: center;
-  align-items: flex-start;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
   width: max-content;
   max-width: 100%;
   overflow: visible;
@@ -1108,6 +1109,25 @@ html.fx-off .turn-pill.turn-yours {
   border-radius: 50%;
   background: var(--move);
   position: absolute;
+  z-index: 0;
+  pointer-events: none;
+}
+
+/* Occupied targets (captures / swaps) — ring so the marker isn't hidden under the piece */
+.sq.move.move-capture::after,
+.sq.move.move-special::after {
+  width: 78%;
+  height: 78%;
+  border-radius: 10px;
+  background: transparent;
+  border: 3px solid rgba(125, 211, 199, 0.95);
+  box-shadow: inset 0 0 0 999px rgba(125, 211, 199, 0.14);
+  z-index: 2;
+}
+
+.sq.move.move-special::after {
+  border-color: rgba(240, 199, 94, 0.95);
+  box-shadow: inset 0 0 0 999px rgba(240, 199, 94, 0.16);
 }
 
 .sq.confirm-pending {
@@ -1194,6 +1214,32 @@ html.fx-off .turn-pill.turn-yours {
   top: -2px;
   background: #3b82f6;
   color: #fff;
+}
+
+.piece .pig-buddy {
+  position: absolute;
+  right: -4px;
+  bottom: -2px;
+  z-index: 3;
+  width: 1.15rem;
+  height: 1.15rem;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background: rgba(12, 10, 20, 0.88);
+  border: 1px solid rgba(240, 199, 94, 0.65);
+  box-shadow: 0 0 8px rgba(240, 199, 94, 0.35);
+  font-style: normal;
+  padding: 1px;
+}
+
+.piece .pig-buddy .piece-icon {
+  width: 100%;
+  height: 100%;
+}
+
+.sq.pig-buddy-sq {
+  outline: 2px solid rgba(240, 199, 94, 0.45) inset;
 }
 
 .piece.has-debuff .piece-icon.white {
@@ -1355,8 +1401,16 @@ html.fx-off .turn-pill.turn-yours {
   flex-wrap: wrap;
   gap: 0.5rem;
   justify-content: center;
-  margin-top: 0.75rem;
+  align-items: center;
+  margin-top: 0.85rem;
+  width: 100%;
+  min-height: 2.6rem;
   max-width: calc(var(--sq, 68px) * 10 + 20px);
+}
+
+.ability-bar button.active {
+  outline: 2px solid var(--day);
+  box-shadow: 0 0 14px rgba(240, 199, 94, 0.35);
 }
 
 .ability-bar button strong {

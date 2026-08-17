@@ -180,12 +180,14 @@ export type PendingPrompt =
       abilityId: string;
       message: string;
       selected?: unknown[];
+      resumeTurnPhase?: TurnPhase;
     }
   | {
       type: 'gadget_choice';
       color: Color;
       pieceId: string;
       message: string;
+      resumeTurnPhase?: TurnPhase;
     }
   | {
       type: 'spring_bounce';

@@ -16,6 +16,7 @@ import {
   openingRedraw,
   playCard,
   publicState,
+  cancelPrompt,
   resolvePrompt,
   skipSpell,
   startDraft,
@@ -235,13 +236,15 @@ function reduce(state: GameState, color: Color, action: ClientAction): GameState
       return applyMove(state, color, action.pieceId, action.to, action.meta);
     case 'use_ability':
       return useAbility(state, color, action.pieceId, action.abilityId, action.targets);
+    case 'cancel_prompt':
+      return cancelPrompt(state, color);
     case 'resign':
       state.phase = 'ended';
       state.winner = color === 'white' ? 'black' : 'white';
       state.winReason = `${color} resigned`;
       return state;
     default:
-      throw new Error('Unknown action');
+      throw new Error(`Unknown action: ${(action as { type?: string })?.type ?? 'undefined'}`);
   }
 }
 

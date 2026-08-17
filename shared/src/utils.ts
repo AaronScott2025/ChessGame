@@ -17,6 +17,24 @@ export function sameCoord(a: Coord, b: Coord): boolean {
   return a.row === b.row && a.col === b.col;
 }
 
+/** Break Best Buddy: pig stays on the vacated square; host/pig no longer share a tile. */
+export function endBestBuddy(state: GameState, mover: PieceState, vacated: Coord): boolean {
+  let ended = false;
+  if (mover.coOccupantId) {
+    mover.coOccupantId = undefined;
+    ended = true;
+  }
+  for (const p of state.pieces) {
+    if (p.id === mover.id) continue;
+    if (p.coOccupantId === mover.id) {
+      p.coOccupantId = undefined;
+      p.pos = { row: vacated.row, col: vacated.col };
+      ended = true;
+    }
+  }
+  return ended;
+}
+
 export function pawnDirection(color: Color): number {
   return color === 'white' ? -1 : 1;
 }

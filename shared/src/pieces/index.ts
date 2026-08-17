@@ -4,6 +4,7 @@ import {
   hasEffect,
   inBounds,
   isAlliedTerritory,
+  movementBonus,
   pieceAt,
   sameCoord,
 } from '../utils.js';
@@ -12,6 +13,8 @@ import {
   emptyOrEnemy,
   filterLegal,
   knightMoves,
+  knightTargetCoords,
+  isPigLShape,
   type PieceDefinition,
   rayMoves,
   standardPawnMoves,
@@ -148,7 +151,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'rook',
     symbol: '♜',
     getMoves: (p, s) => {
-      const moves = filterLegal(p, s, rayMoves(p, s, ORTH, 3));
+      const moves = rayMoves(p, s, ORTH, 3);
       // Ancient Shuffle: swap with allied piece while in allied territory with clear orth. LOS
       if (isAlliedTerritory(p.color, p.pos)) {
         for (const ally of s.pieces.filter((x) => x.color === p.color && x.id !== p.id)) {
@@ -161,7 +164,7 @@ export const PIECES: Record<string, PieceDefinition> = {
           });
         }
       }
-      return moves;
+      return filterLegal(p, s, moves);
     },
   },
   gnome: {
@@ -206,9 +209,12 @@ export const PIECES: Record<string, PieceDefinition> = {
     canAct: dayOnly,
     getMoves: (p, s) => {
       const moves = knightMoves(p, s, 2, 1, false);
-      // Best Buddy: share tile with allied non-king
-      for (const ally of s.pieces.filter((x) => x.color === p.color && x.class !== 'king' && x.id !== p.id)) {
-        moves.push({ to: ally.pos, special: 'best_buddy', meta: { withId: ally.id } });
+      // Best Buddy: only allies on the Pig’s normal L landings (same path rules as movement)
+      for (const to of knightTargetCoords(p, s, 2, 1, false)) {
+        const ally = pieceAt(s, to);
+        if (!ally || ally.color !== p.color || ally.id === p.id || ally.class === 'king') continue;
+        if (!isPigLShape(p.pos, to, movementBonus(p))) continue;
+        moves.push({ to: { ...to }, special: 'best_buddy', meta: { withId: ally.id } });
       }
       return filterLegal(p, s, moves);
     },
@@ -278,7 +284,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     getMoves: (p, s) => {
       const charges = p.charges ?? 0;
       const radius = charges >= 2 ? 2 : 1;
-      const moves = filterLegal(p, s, areaMoves(p, s, radius));
+      const moves = areaMoves(p, s, radius);
       // Swap of Fates (1+ charges): swap with any allied piece
       if (charges >= 1) {
         for (const ally of s.pieces.filter((x) => x.color === p.color && x.id !== p.id)) {
@@ -295,7 +301,7 @@ export const PIECES: Record<string, PieceDefinition> = {
           if (m.capture) moves.push({ ...m, special: 'death_stare' });
         }
       }
-      return moves;
+      return filterLegal(p, s, moves);
     },
   },
   prince_princess: {
@@ -347,8 +353,10 @@ export const PIECES: Record<string, PieceDefinition> = {
       if (!id || id === 'mimic') return filterLegal(p, s, areaMoves(p, s, 1));
       const def = PIECES[id];
       if (!def) return filterLegal(p, s, areaMoves(p, s, 1));
-      // Timeless Energy: ignore day/night by calling getMoves directly (skip canAct)
-      return filterLegal(p, s, def.getMoves(p, s));
+      // Timeless Energy: ignore day/night by calling getMoves directly (skip canAct).
+      // Strip specials so abilities (Best Buddy, swaps, Death Stare, castle, …) are never copied.
+      const copied = def.getMoves(p, s).filter((m) => !m.special);
+      return filterLegal(p, s, copied);
     },
   },
   king: {

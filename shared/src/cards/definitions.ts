@@ -3,6 +3,7 @@ import {
   addEffect,
   barriersAdjacent,
   clearOrthogonalLOS,
+  endBestBuddy,
   inBounds,
   isAlliedTerritory,
   log,
@@ -268,6 +269,12 @@ registerCard({
       if (used.has(key)) throw new Error('Duplicate destination');
       used.add(key);
     }
+    for (const p of pieces) {
+      const dest = assignment[p.id];
+      if (!sameCoord(p.pos, dest)) {
+        if (endBestBuddy(ctx.state, p, p.pos)) log(ctx.state, 'Best Buddy ended');
+      }
+    }
     for (const p of pieces) p.pos = assignment[p.id];
     return { state: ctx.state, done: true };
   },
@@ -397,6 +404,7 @@ registerCard({
       throw new Error('Must move exactly two spaces in a direction');
     }
     if (pieceAt(ctx.state, to)) throw new Error('Cannot capture');
+    if (endBestBuddy(ctx.state, piece, piece.pos)) log(ctx.state, 'Best Buddy ended');
     piece.pos = to;
     return { state: ctx.state, done: true };
   },
@@ -488,6 +496,7 @@ registerCard({
     if (def.class !== piece.class) throw new Error('Must be same class');
     if (def.id === piece.defId) throw new Error('Must be different variant');
     piece.defId = def.id;
+    if (endBestBuddy(ctx.state, piece, piece.pos)) log(ctx.state, 'Best Buddy ended');
     piece.pos = nearestEmptyAround(ctx.state, piece.startPos) ?? piece.startPos;
     // clear start occupancy conflict already handled
     return { state: ctx.state, done: true };
@@ -536,6 +545,7 @@ registerCard({
     const piece = requirePiece(ctx.state, targets[0] as string);
     const dest = nearestEmptyAround(ctx.state, piece.startPos);
     if (!dest) throw new Error('No space at start');
+    if (endBestBuddy(ctx.state, piece, piece.pos)) log(ctx.state, 'Best Buddy ended');
     piece.pos = dest;
     return { state: ctx.state, done: true };
   },
@@ -609,6 +619,7 @@ registerCard({
     const king = ctx.state.pieces.find((p) => p.color === ctx.player && p.class === 'king');
     const other = requirePiece(ctx.state, targets[0] as string);
     if (!king || other.color !== ctx.player || other.id === king.id) throw new Error('Invalid target');
+    if (endBestBuddy(ctx.state, other, other.pos)) log(ctx.state, 'Best Buddy ended');
     const tmp = { ...king.pos };
     king.pos = { ...other.pos };
     other.pos = tmp;

@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { listMoves as engineListMoves, availableAbilities as engineAbilities } from '@shared/engine/game.ts';
+import { isPigLShape } from '@shared/pieces/helpers.ts';
 import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
 import {
   AudioToggles,
@@ -36,6 +38,7 @@ interface Piece {
   ritualTurns?: number;
   reviveCount?: number;
   bloodlust?: boolean;
+  coOccupantId?: string;
 }
 
 interface AbilityInfo {
@@ -43,6 +46,8 @@ interface AbilityInfo {
   name: string;
   ready: boolean;
   hint?: string;
+  /** Informational only — explains a move-based ability */
+  passive?: boolean;
 }
 
 interface CardInstance {
@@ -70,6 +75,7 @@ interface GameState {
   >;
   turn: Color;
   turnPhase: string;
+  turnCount?: number;
   dayNight: string;
   cycleCount: number;
   check: Color | null;
@@ -121,6 +127,7 @@ interface MoveOption {
   to: Coord;
   capture?: boolean;
   special?: string;
+  meta?: Record<string, unknown>;
 }
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? '';
@@ -139,6 +146,12 @@ function isAlliedTerritory(color: Color, pos: Coord): boolean {
 
 function chebyshev(a: Coord, b: Coord): number {
   return Math.max(Math.abs(a.row - b.row), Math.abs(a.col - b.col));
+}
+
+/** Drop Best Buddy teleports that aren't a real Pig L (2×1). */
+function sanitizeMoves(piece: Piece | undefined, opts: MoveOption[]): MoveOption[] {
+  if (!piece || piece.defId !== 'pig') return opts;
+  return opts.filter((m) => m.special !== 'best_buddy' || isPigLShape(piece.pos, m.to));
 }
 
 export default function App() {
@@ -161,18 +174,22 @@ export default function App() {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [moves, setMoves] = useState<MoveOption[]>([]);
   const [abilities, setAbilities] = useState<AbilityInfo[]>([]);
+  const movesReqRef = useRef<string | null>(null);
   const [gadgetKind, setGadgetKind] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<string | null>(null);
   const [pendingTargets, setPendingTargets] = useState<unknown[]>([]);
   const [confirmKey, setConfirmKey] = useState<string | null>(null);
   const [spellConfirm, setSpellConfirm] = useState<{
     summary: string;
-    mode: 'card' | 'resolve_prompt';
+    mode: 'card' | 'resolve_prompt' | 'move';
     targets?: unknown[];
     payload?: unknown;
+    move?: { pieceId: string; to: Coord; meta?: Record<string, unknown> };
   } | null>(null);
+  const [focusSpecial, setFocusSpecial] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState('Connect and create or join a room.');
+  const prevTurnRef = useRef<string | null>(null);
 
   useEffect(() => {
     const s = io(SOCKET_URL || undefined, { transports: ['websocket', 'polling'] });
@@ -183,8 +200,16 @@ export default function App() {
       setDraftOptions(payload.draftOptions ?? []);
       setCatalog(payload.catalog);
       setError(null);
-      setConfirmKey(null);
-      setSpellConfirm(null);
+      const turnKey = `${payload.state.turn}:${payload.state.phase}`;
+      if (prevTurnRef.current && prevTurnRef.current !== turnKey) {
+        setConfirmKey(null);
+        setSpellConfirm(null);
+        setFocusSpecial(null);
+        setSelectedPiece(null);
+        setMoves([]);
+        setAbilities([]);
+      }
+      prevTurnRef.current = turnKey;
       if (payload.state.pendingPrompt?.message) setStatus(payload.state.pendingPrompt.message);
     });
     s.on('error_message', (msg: string) => setError(msg));
@@ -205,20 +230,53 @@ export default function App() {
     });
   };
 
+  const refreshMoves = (pieceId: string, game: GameState = state!) => {
+    if (!game) return;
+    try {
+      const piece = game.pieces.find((p) => p.id === pieceId);
+      const nextMoves = sanitizeMoves(
+        piece,
+        engineListMoves(game as never, pieceId) as MoveOption[],
+      );
+      const nextAbilities = engineAbilities(game as never, pieceId) as AbilityInfo[];
+      setMoves(nextMoves);
+      setAbilities(nextAbilities);
+      movesReqRef.current = pieceId;
+      const specials = new Set(nextMoves.map((m) => m.special).filter(Boolean));
+      if (specials.has('swap_of_fates')) {
+        setStatus('Swap of Fates ready — click an allied piece, then Confirm');
+      } else if (specials.has('ancient_shuffle')) {
+        setStatus('Ancient Shuffle ready — click an allied piece in range, then Confirm');
+      } else if (specials.has('best_buddy')) {
+        setStatus('Best Buddy ready — click an allied non-king on an L square, then Confirm');
+      } else if (specials.has('death_stare')) {
+        setStatus('Death Stare ready — click an enemy in range, then Confirm');
+      }
+    } catch (e) {
+      setError((e as Error).message);
+      setMoves([]);
+      setAbilities([]);
+    }
+  };
+
   const requestMoves = (pieceId: string) => {
+    if (!state) return;
+    setFocusSpecial(null);
+    refreshMoves(pieceId, state);
+    // Also ask server (authoritative); merge if still selecting this piece
     if (!socket || !roomCode) return;
     socket.emit(
       'get_moves',
       { code: roomCode, pieceId },
       (res: { ok: boolean; moves?: MoveOption[]; abilities?: AbilityInfo[]; error?: string }) => {
-        if (!res?.ok) {
-          setError(res?.error ?? 'Could not get moves');
-          setMoves([]);
-          setAbilities([]);
-          return;
-        }
-        setMoves(res.moves ?? []);
-        setAbilities(res.abilities ?? []);
+        if (movesReqRef.current !== pieceId) return;
+        if (!res?.ok) return;
+        const piece = state.pieces.find((p) => p.id === pieceId);
+        const serverMoves = sanitizeMoves(piece, res.moves ?? []);
+        // Prefer locally computed moves/abilities so the bar doesn't flash away
+        // if the socket reply is empty or stale.
+        setMoves((local) => (local.length ? local : serverMoves));
+        setAbilities((local) => (local.length ? local : (res.abilities ?? [])));
       },
     );
   };
@@ -248,9 +306,24 @@ export default function App() {
     const grid: Array<Array<Piece | null>> = Array.from({ length: 10 }, () => Array(10).fill(null));
     if (!state) return grid;
     for (const p of state.pieces) {
-      if (!grid[p.pos.row][p.pos.col]) grid[p.pos.row][p.pos.col] = p;
+      const existing = grid[p.pos.row][p.pos.col];
+      if (!existing) {
+        grid[p.pos.row][p.pos.col] = p;
+      } else if (existing.defId === 'pig' && p.defId !== 'pig') {
+        // Prefer showing the host piece when a Pig is Best-Buddy sharing the tile
+        grid[p.pos.row][p.pos.col] = p;
+      }
     }
     return grid;
+  }, [state]);
+
+  const pigHostIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!state) return ids;
+    for (const p of state.pieces) {
+      if (p.defId === 'pig' && p.coOccupantId) ids.add(p.coOccupantId);
+    }
+    return ids;
   }, [state]);
 
   const activeCardDef = useMemo(() => {
@@ -298,6 +371,18 @@ export default function App() {
 
   const clearBoardConfirm = () => {
     setConfirmKey(null);
+  };
+
+  const cancelAbility = () => {
+    const promptType = state?.pendingPrompt?.type;
+    if (promptType === 'gadget_choice' || promptType === 'ability_target') {
+      send({ type: 'cancel_prompt' });
+    }
+    setGadgetKind(null);
+    setSpellConfirm(null);
+    setFocusSpecial(null);
+    clearBoardConfirm();
+    setStatus('Ability canceled.');
   };
 
   /** First click aims; second click on the same target confirms (double-click). */
@@ -357,6 +442,37 @@ export default function App() {
       finishCard(spellConfirm.targets ?? []);
       return;
     }
+    if (spellConfirm.mode === 'move' && spellConfirm.move) {
+      playPieceSfx();
+      // Barrier Shift: first step is ability target select, not a board move
+      if (spellConfirm.move.meta?.special === 'barrier_shift_select') {
+        const from = (spellConfirm.move.meta.from as Coord | undefined) ?? spellConfirm.move.to;
+        send({
+          type: 'use_ability',
+          pieceId: spellConfirm.move.pieceId,
+          abilityId: 'barrier_shift',
+          targets: { from },
+        });
+        setSpellConfirm(null);
+        clearBoardConfirm();
+        setStatus('Barrier Shift: click an empty square in allied territory, then Confirm');
+        return;
+      }
+      send({
+        type: 'move',
+        pieceId: spellConfirm.move.pieceId,
+        to: spellConfirm.move.to,
+        meta: spellConfirm.move.meta,
+      });
+      setSelectedPiece(null);
+      setMoves([]);
+      setAbilities([]);
+      setFocusSpecial(null);
+      setSpellConfirm(null);
+      clearBoardConfirm();
+      movesReqRef.current = null;
+      return;
+    }
     send({ type: 'resolve_prompt', payload: spellConfirm.payload });
     setSpellConfirm(null);
     clearBoardConfirm();
@@ -404,9 +520,30 @@ export default function App() {
           return;
         }
         if (prompt.abilityId === 'barrier_shift') {
-          armOrConfirm(squareKey, 'Barrier Shift here', () => {
-            send({ type: 'resolve_prompt', payload: { row, col } });
+          const selected = prompt.selected ?? [];
+          const from = selected[0] as Coord | undefined;
+          if (!from) {
+            const isBarrier = state.tokens.some(
+              (t) => t.kind === 'barrier' && t.owner === you && t.pos.row === row && t.pos.col === col,
+            );
+            if (!isBarrier) {
+              setStatus('Barrier Shift: click one of your barriers');
+              return;
+            }
+          } else if (!barrierShiftHighlights.destinations.has(squareKey)) {
+            setStatus('Barrier Shift: pick a highlighted empty allied square');
+            return;
+          }
+          const summary = from
+            ? `Move barrier to file ${col + 1}, rank ${10 - row}?`
+            : `Select barrier at file ${col + 1}, rank ${10 - row}?`;
+          setSpellConfirm({
+            summary,
+            mode: 'resolve_prompt',
+            payload: { row, col },
           });
+          setStatus(summary);
+          clearBoardConfirm();
           return;
         }
       }
@@ -425,18 +562,21 @@ export default function App() {
     ) {
       const ep = state.pieces.find((p) => p.color === you && p.defId === 'enchanted_pawn');
       if (ep) {
-        armOrConfirm(squareKey, 'Select this barrier', () => {
-          send({
-            type: 'use_ability',
+        const summary = `Shift barrier at file ${col + 1}, rank ${10 - row}?`;
+        setSpellConfirm({
+          summary,
+          mode: 'move',
+          move: {
             pieceId: ep.id,
-            abilityId: 'barrier_shift',
-            targets: { from: { row, col } },
-          });
-          setSelectedPiece(ep.id);
-          setMoves([]);
-          setAbilities([]);
-          setStatus('Barrier Shift: click an empty square in allied territory (click again to confirm)');
+            to: { row, col },
+            meta: { special: 'barrier_shift_select', from: { row, col } },
+          },
         });
+        setSelectedPiece(ep.id);
+        setMoves([]);
+        setAbilities([]);
+        setStatus(summary);
+        clearBoardConfirm();
         return;
       }
     }
@@ -502,18 +642,66 @@ export default function App() {
     }
 
     if (selectedPiece && moves.some((m) => m.to.row === row && m.to.col === col)) {
-      const move = moves.find((m) => m.to.row === row && m.to.col === col)!;
-      armOrConfirm(squareKey, 'Move here', () => {
-        send({
-          type: 'move',
-          pieceId: selectedPiece,
-          to: { row, col },
-          meta: move.special ? { special: move.special } : undefined,
+      const pool = focusSpecial ? moves.filter((m) => m.special === focusSpecial) : moves;
+      const candidates = pool.filter((m) => m.to.row === row && m.to.col === col);
+      if (!candidates.length) {
+        if (focusSpecial) {
+          setStatus(`That square is not a valid ${focusSpecial.replace(/_/g, ' ')} target`);
+          return;
+        }
+      } else {
+        const move = candidates.find((m) => m.special) ?? candidates[0]!;
+        if (move.special === 'best_buddy') {
+          const pig = state.pieces.find((p) => p.id === selectedPiece);
+          if (!pig || !isPigLShape(pig.pos, { row, col })) {
+            setStatus('Best Buddy only shares a tile in the Pig’s L-move range (2×1).');
+            return;
+          }
+        }
+        const hint =
+          move.special === 'swap_of_fates'
+            ? 'Swap of Fates'
+            : move.special === 'ancient_shuffle'
+              ? 'Ancient Shuffle'
+              : move.special === 'best_buddy'
+                ? 'Best Buddy'
+                : move.special === 'death_stare'
+                  ? 'Death Stare'
+                  : move.special === 'castle_swap'
+                    ? 'Castle'
+                    : move.capture
+                      ? 'Capture'
+                      : 'Move';
+        const meta = move.special
+          ? { special: move.special, ...(move.meta ?? {}) }
+          : undefined;
+        // Special abilities use the Confirm panel (more reliable than double-click on occupied tiles)
+        if (move.special) {
+          setPendingTargets([]);
+          clearBoardConfirm();
+          setSpellConfirm({
+            summary: `${hint} here?`,
+            mode: 'move',
+            move: { pieceId: selectedPiece, to: { row, col }, meta },
+          });
+          setStatus(`${hint} — press Confirm`);
+          return;
+        }
+        armOrConfirm(squareKey, `${hint} here`, () => {
+          send({
+            type: 'move',
+            pieceId: selectedPiece,
+            to: { row, col },
+            meta,
+          });
+          setSelectedPiece(null);
+          setMoves([]);
+          setAbilities([]);
+          setFocusSpecial(null);
+          movesReqRef.current = null;
         });
-        setSelectedPiece(null);
-        setMoves([]);
-      });
-      return;
+        return;
+      }
     }
 
     const piece = board[row][col];
@@ -566,6 +754,19 @@ export default function App() {
     // Selection clicks — not confirms
     clearBoardConfirm();
     if (piece && piece.color === you) {
+      const selected = selectedPiece ? state.pieces.find((p) => p.id === selectedPiece) : null;
+      if (
+        selected?.defId === 'pig' &&
+        piece.id !== selectedPiece &&
+        piece.class !== 'king' &&
+        (focusSpecial === 'best_buddy' ||
+          moves.some((m) => m.special === 'best_buddy' && m.to.row === row && m.to.col === col))
+      ) {
+        if (!isPigLShape(selected.pos, piece.pos)) {
+          setStatus('Best Buddy only shares a tile in the Pig’s L-move range (2×1).');
+          return;
+        }
+      }
       setInspectedId(piece.id);
       setSelectedPiece(piece.id);
       requestMoves(piece.id);
@@ -817,6 +1018,9 @@ export default function App() {
                 {kind.replace('_', ' ')}
               </button>
             ))}
+            <button type="button" onClick={cancelAbility}>
+              Cancel
+            </button>
           </span>
         </div>
       )}
@@ -838,6 +1042,9 @@ export default function App() {
                     <PieceIcon defId={g.defId} color={you} className="sm" /> {pieceMeta(catalog, g.defId)?.name}
                   </button>
                 ))}
+              <button type="button" onClick={cancelAbility}>
+                Cancel
+              </button>
             </span>
           </div>
         )}
@@ -845,7 +1052,14 @@ export default function App() {
       {state.pendingPrompt?.type === 'ability_target' &&
         state.pendingPrompt.color === you &&
         state.pendingPrompt.abilityId !== 'revive' && (
-          <div className="banner">{state.pendingPrompt.message}</div>
+          <div className="banner">
+            {state.pendingPrompt.message}
+            <span className="prompt-actions">
+              <button type="button" onClick={cancelAbility}>
+                Cancel
+              </button>
+            </span>
+          </div>
         )}
 
       {(state.pendingPrompt?.type === 'spring_bounce' || state.pendingPrompt?.type === 'gnome_hole_travel') &&
@@ -985,13 +1199,27 @@ export default function App() {
                   const piece = board[row][col];
                   const dark = (row + col) % 2 === 1;
                   const selected = piece && piece.id === selectedPiece;
-                  const moveHere = moves.some((m) => m.to.row === row && m.to.col === col);
+                  const moveOpts = (focusSpecial
+                    ? moves.filter((m) => m.special === focusSpecial)
+                    : moves
+                  ).filter((m) => m.to.row === row && m.to.col === col);
+                  const moveHere = moveOpts.length > 0;
+                  const specialHere = moveOpts.some((m) => Boolean(m.special));
+                  const captureHere = moveOpts.some((m) => m.capture || Boolean(m.special));
                   const key = `${row},${col}`;
                   const barrierPick = barrierShiftHighlights.barriers.has(key);
                   const barrierFrom = barrierShiftHighlights.fromKey === key;
                   const barrierDest = barrierShiftHighlights.destinations.has(key);
                   const toks = state.tokens.filter((t) => t.pos.row === row && t.pos.col === col);
                   const meta = piece ? pieceMeta(catalog, piece.defId) : null;
+                  const pigOnSquare = state.pieces.find(
+                    (p) =>
+                      p.defId === 'pig' &&
+                      p.coOccupantId &&
+                      p.pos.row === row &&
+                      p.pos.col === col,
+                  );
+                  const hasPigBuddy = Boolean(pigOnSquare) || Boolean(piece && pigHostIds.has(piece.id));
                   const lastFrom =
                     !!state.lastMove &&
                     state.lastMove.from.row === row &&
@@ -1016,7 +1244,10 @@ export default function App() {
                         piece && !infoLocked && piece.id === hoveredId ? 'info-hover' : '',
                         lastFrom ? 'last-from' : '',
                         lastTo || lastPiece ? 'last-to' : '',
+                        hasPigBuddy ? 'pig-buddy-sq' : '',
                         moveHere ? 'move' : '',
+                        moveHere && captureHere ? 'move-capture' : '',
+                        moveHere && specialHere ? 'move-special' : '',
                         confirmKey === key || confirmKey === (piece ? `piece:${piece.id}` : '')
                           ? 'confirm-pending'
                           : '',
@@ -1056,18 +1287,27 @@ export default function App() {
                           }`}
                           title={[
                             meta?.name ?? piece.defId,
+                            hasPigBuddy ? 'Pig Best Buddy sharing this tile' : null,
                             ...visibleBoardEffects(piece.effects ?? []).map(formatEffectTitle),
                           ]
                             .filter(Boolean)
                             .join(' · ')}
                         >
                           <PieceIcon defId={piece.defId} color={piece.color} title={meta?.name ?? piece.defId} />
+                          {hasPigBuddy && (
+                            <i className="pig-buddy" title="Pig is Best Buddy on this piece">
+                              <PieceIcon defId="pig" color={piece.color} className="sm" title="Pig buddy" />
+                            </i>
+                          )}
                           {piece.charges != null && piece.charges > 0 && <i className="charge">{piece.charges}</i>}
                           {piece.ritualTurns != null && piece.ritualTurns > 0 && (
                             <i className="ritual" title="Revive ritual">{piece.ritualTurns}</i>
                           )}
                           {(() => {
                             const statuses = visibleBoardEffects(piece.effects ?? []);
+                            if (piece.bloodlust) {
+                              statuses.unshift({ id: 'bloodlust', kind: 'bloodlust' });
+                            }
                             if (!statuses.length) return null;
                             const shown = statuses.slice(0, 3);
                             const extra = statuses.length - shown.length;
@@ -1104,27 +1344,44 @@ export default function App() {
               )}
             </div>
 
-            {selectedPiece && abilities.length > 0 && state.turn === you && (
-              <div className="ability-bar">
-                {abilities.map((a) => (
-                  <button
-                    key={a.id}
-                    type="button"
-                    className="primary"
-                    disabled={!a.ready}
-                    title={a.hint}
-                    onClick={() => {
-                      send({ type: 'use_ability', pieceId: selectedPiece, abilityId: a.id });
-                      setStatus(a.hint ?? a.name);
-                      setMoves([]);
-                    }}
-                  >
-                    <strong>{a.name}</strong>
-                    {a.ready ? '' : ' (unavailable)'}
-                  </button>
-                ))}
-              </div>
-            )}
+            <div className="ability-bar" aria-live="polite">
+              {selectedPiece && abilities.length > 0 && state.turn === you
+                ? abilities.map((a) => (
+                    <button
+                      key={a.id}
+                      type="button"
+                      className={`${a.passive ? '' : 'primary'} ${focusSpecial === a.id ? 'active' : ''}`}
+                      disabled={!a.ready && !a.passive}
+                      title={a.hint}
+                      onClick={() => {
+                        if (a.passive) {
+                          if (a.id === 'bloodlust') {
+                            setFocusSpecial(null);
+                            setStatus(a.hint ?? a.name);
+                            return;
+                          }
+                          setFocusSpecial(a.id);
+                          setSpellConfirm(null);
+                          clearBoardConfirm();
+                          setStatus(a.hint ?? `Select a target for ${a.name}, then Confirm`);
+                          return;
+                        }
+                        send({ type: 'use_ability', pieceId: selectedPiece, abilityId: a.id });
+                        setStatus(a.hint ?? a.name);
+                        setFocusSpecial(null);
+                      }}
+                    >
+                      <strong>{a.name}</strong>
+                      {a.passive ? (focusSpecial === a.id ? ' · targeting' : '') : a.ready ? '' : ' (unavailable)'}
+                    </button>
+                  ))
+                : null}
+              {selectedPiece && focusSpecial && state.turn === you ? (
+                <button type="button" onClick={cancelAbility}>
+                  Cancel
+                </button>
+              ) : null}
+            </div>
             {you &&
               state.turn === you &&
               state.phase === 'playing' &&
@@ -1132,8 +1389,8 @@ export default function App() {
               state.tokens.some((t) => t.kind === 'barrier' && t.owner === you) &&
               !state.pendingPrompt && (
                 <p className="hint barrier-hint">
-                  Tip: click a barrier to move it (<strong>Barrier Shift</strong>), then click again to confirm.
-                  Or select an Enchanted Pawn and use the ability button.
+                  Tip: click a barrier, press <strong>Confirm</strong>, then click a highlighted square and Confirm again
+                  (<strong>Barrier Shift</strong>). Or select an Enchanted Pawn and use the ability button.
                 </p>
               )}
           </main>
@@ -1185,8 +1442,15 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => {
+                      const promptType = state.pendingPrompt?.type;
+                      if (promptType === 'gadget_choice' || promptType === 'ability_target') {
+                        cancelAbility();
+                        return;
+                      }
                       setSpellConfirm(null);
-                      setStatus('Spell canceled — pick targets again if needed.');
+                      setFocusSpecial(null);
+                      clearBoardConfirm();
+                      setStatus('Canceled.');
                     }}
                   >
                     Cancel
@@ -1338,6 +1602,8 @@ export default function App() {
             gadgetUsed: inspectedPiece.gadgetUsed,
             abilityCooldown: inspectedPiece.abilityCooldown,
             bloodlust: inspectedPiece.bloodlust,
+            coOccupantId: inspectedPiece.coOccupantId,
+            hasPigBuddy: pigHostIds.has(inspectedPiece.id),
             effects: inspectedPiece.effects,
           }}
           onClose={() => {
@@ -1403,7 +1669,9 @@ function PieceInfoTile({
     gadgetUsed?: boolean;
     abilityCooldown?: number;
     bloodlust?: boolean;
-    effects?: Array<{ id: string; kind: string; turnsRemaining?: number }>;
+    coOccupantId?: string;
+    hasPigBuddy?: boolean;
+    effects?: Array<{ id?: string; kind: string; turnsRemaining?: number }>;
   };
   locked?: boolean;
   onClose: () => void;
@@ -1494,6 +1762,8 @@ function PieceInfoTile({
             <span>Cooldown: {live.abilityCooldown}</span>
           )}
           {live.bloodlust && <span>Bloodlust</span>}
+          {live.coOccupantId && <span className="live-effect tone-buff">Pig Best Buddy</span>}
+          {live.hasPigBuddy && <span className="live-effect tone-buff">Pig riding</span>}
           {live.effects?.map((e) => (
             <span key={e.id} className={`live-effect tone-${effectTone(e.kind)}`}>
               {formatEffectTitle(e)}

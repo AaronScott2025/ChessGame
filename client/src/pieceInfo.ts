@@ -102,7 +102,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Knight',
     movement: ['Moves in an L shape (2 then 1). Cannot jump over pieces.'],
     abilities: [
-      'Best Buddy: may share a tile with an allied non-king piece.',
+      'Best Buddy: may share a tile with an allied non-king piece that sits on a normal L (2–1) landing (same path rules as movement — not a teleport).',
       'If that shared tile is captured, both pieces fall and you gain up to 3 bonus turns.',
     ],
     misc: ['Can only act during the day.'],
@@ -206,9 +206,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'mimic',
     name: 'Mimic',
     classLabel: 'Wildcard',
-    movement: ["Copies the opponent’s last played piece’s movement (not abilities)."],
+    movement: ["Copies the opponent’s last played piece’s movement pattern only (not abilities)."],
     abilities: [
       'Timeless Energy: ignores day/night restrictions of the copied piece.',
+      'Does not copy special abilities (Best Buddy, Ancient Shuffle, Swap of Fates, Death Stare, castling, etc.).',
     ],
     misc: ['If the opponent’s last piece was a Mimic, copy what that Mimic copied.'],
   },

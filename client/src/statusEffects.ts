@@ -8,6 +8,7 @@ export interface EffectMeta {
 
 /** Short board badges + full names for tooltips / info panel. */
 export const EFFECT_META: Record<string, EffectMeta> = {
+  bloodlust: { label: 'Bld', name: 'Bloodlust', tone: 'buff' },
   blink: { label: 'Blk', name: 'Blink', tone: 'buff' },
   enchant_ritual: { label: 'Enc', name: 'Enchant ritual', tone: 'ritual' },
   kingsstead: { label: 'Kng', name: 'Kingstead', tone: 'buff' },

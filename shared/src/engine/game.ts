@@ -2,6 +2,7 @@ import type { Color, Coord, GameState, PieceState, PlayerState } from '../types.
 import { BOARD_SIZE } from '../types.js';
 import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS } from '../pieces/index.js';
 import type { MoveOption } from '../pieces/helpers.js';
+import { isKnightLanding, isPigLShape } from '../pieces/helpers.js';
 import { buildDeck, drawCard, getCardDef } from '../cards/index.js';
 import {
   addEffect,
@@ -9,6 +10,7 @@ import {
   barriersAdjacent,
   chebyshev,
   cloneState,
+  endBestBuddy,
   frontRow,
   getKing,
   hasEffect,
@@ -23,6 +25,7 @@ import {
   removeEffects,
   sameCoord,
   shuffleInPlace,
+  movementBonus,
 } from '../utils.js';
 
 function emptyPlayer(color: Color, name: string): PlayerState {
@@ -304,40 +307,62 @@ export function listMoves(state: GameState, pieceId: string): MoveOption[] {
 
   // Portal travel as extra destinations when standing on portal — handled after move in applyMove
 
+  // Never allow Best Buddy outside the Pig’s L range (guards stale / buggy piece lists)
+  moves = moves.filter((m) => {
+    if (m.special !== 'best_buddy') return true;
+    if (piece.defId !== 'pig') return false;
+    return (
+      isPigLShape(piece.pos, m.to, movementBonus(piece)) &&
+      isKnightLanding(piece, state, m.to, 2, 1, false)
+    );
+  });
+
   // Filter moves that leave own king in check
   return moves.filter((m) => {
-    const trial = cloneState(state);
-    const tp = trial.pieces.find((p) => p.id === pieceId)!;
-    const occ = pieceAt(trial, m.to);
-    if (occ && occ.color !== tp.color) {
-      trial.pieces = trial.pieces.filter((p) => p.id !== occ.id);
+    try {
+      const trial = cloneState(state);
+      const tp = trial.pieces.find((p) => p.id === pieceId)!;
+      const occ = pieceAt(trial, m.to);
+      if (occ && occ.color !== tp.color) {
+        trial.pieces = trial.pieces.filter((p) => p.id !== occ.id);
+      }
+      if (m.special === 'castle_swap' && m.meta?.withId) {
+        const other = trial.pieces.find((p) => p.id === m.meta!.withId);
+        if (!other) return false;
+        const tmp = { ...tp.pos };
+        tp.pos = { ...other.pos };
+        other.pos = tmp;
+      } else if (
+        (m.special === 'ancient_shuffle' || m.special === 'swap_of_fates') &&
+        m.meta?.withId
+      ) {
+        const other = trial.pieces.find((p) => p.id === m.meta!.withId);
+        if (!other) return false;
+        const tmp = { ...tp.pos };
+        tp.pos = { ...other.pos };
+        other.pos = tmp;
+      } else if (m.special === 'best_buddy') {
+        tp.pos = { ...m.to };
+        tp.coOccupantId = m.meta?.withId as string;
+      } else if (m.special === 'death_stare') {
+        trial.pieces = trial.pieces.filter((p) => !(sameCoord(p.pos, m.to) && p.color !== tp.color));
+      } else if (m.special === 'ancient_shuffle' || m.special === 'swap_of_fates' || m.special === 'castle_swap') {
+        // special without meta — illegal
+        return false;
+      } else {
+        tp.pos = { ...m.to };
+      }
+      return !isInCheck(trial, piece.color);
+    } catch {
+      return false;
     }
-    if (m.special === 'castle_swap' && m.meta?.withId) {
-      const other = trial.pieces.find((p) => p.id === m.meta!.withId)!;
-      const tmp = { ...tp.pos };
-      tp.pos = { ...other.pos };
-      other.pos = tmp;
-    } else if (m.special === 'ancient_shuffle' || m.special === 'swap_of_fates') {
-      const other = trial.pieces.find((p) => p.id === m.meta!.withId)!;
-      const tmp = { ...tp.pos };
-      tp.pos = { ...other.pos };
-      other.pos = tmp;
-    } else if (m.special === 'best_buddy') {
-      tp.pos = { ...m.to };
-      tp.coOccupantId = m.meta?.withId as string;
-    } else if (m.special === 'death_stare') {
-      trial.pieces = trial.pieces.filter((p) => !(sameCoord(p.pos, m.to) && p.color !== tp.color));
-    } else {
-      tp.pos = { ...m.to };
-    }
-    return !isInCheck(trial, piece.color);
   });
 }
 
-export function availableAbilities(state: GameState, pieceId: string): Array<{ id: string; name: string; ready: boolean; hint?: string }> {
+export function availableAbilities(state: GameState, pieceId: string): Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> {
   const piece = state.pieces.find((p) => p.id === pieceId);
   if (!piece) return [];
-  const out: Array<{ id: string; name: string; ready: boolean; hint?: string }> = [];
+  const out: Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> = [];
 
   if (piece.defId === 'gnome') {
     out.push({
@@ -377,6 +402,56 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       hint: 'Move one of your barriers to an empty allied-territory square (uses turn)',
     });
   }
+  if (piece.defId === 'reaper') {
+    const charges = piece.charges ?? 0;
+    if (charges >= 1) {
+      out.push({
+        id: 'swap_of_fates',
+        name: 'Swap of Fates',
+        ready: true,
+        passive: true,
+        hint: 'Click an allied piece to swap places (click again to confirm). Requires 1+ charges.',
+      });
+    }
+    if (charges >= 4) {
+      out.push({
+        id: 'death_stare',
+        name: 'Death Stare',
+        ready: true,
+        passive: true,
+        hint: 'Click an enemy within 2 tiles to capture without moving (click again to confirm).',
+      });
+    }
+  }
+  if (piece.defId === 'stoneman') {
+    out.push({
+      id: 'ancient_shuffle',
+      name: 'Ancient Shuffle',
+      ready: true,
+      passive: true,
+      hint: 'From allied territory with clear orthogonal line: click an allied piece to swap.',
+    });
+  }
+  if (piece.defId === 'snake') {
+    out.push({
+      id: 'bloodlust',
+      name: piece.bloodlust ? 'Bloodlust active' : 'Bloodlust',
+      ready: Boolean(piece.bloodlust),
+      passive: true,
+      hint: piece.bloodlust
+        ? 'Bloodlust is active: this move can jump and use ±1 L-leg variants.'
+        : 'Capture an enemy to gain Bloodlust on your next Snake move.',
+    });
+  }
+  if (piece.defId === 'pig') {
+    out.push({
+      id: 'best_buddy',
+      name: 'Best Buddy',
+      ready: true,
+      passive: true,
+      hint: 'Click an allied non-king on a highlighted L (2–1) square — same range as Pig movement.',
+    });
+  }
   return out;
 }
 
@@ -389,10 +464,22 @@ export function useAbility(
 ): GameState {
   if (state.phase !== 'playing') throw new Error('Not playing');
   if (state.turn !== color) throw new Error('Not your turn');
-  if (state.pendingPrompt) throw new Error('Resolve pending prompt first');
+  if (state.pendingPrompt) {
+    const finishingBarrier =
+      abilityId === 'barrier_shift' &&
+      state.pendingPrompt.type === 'ability_target' &&
+      state.pendingPrompt.abilityId === 'barrier_shift' &&
+      Boolean(targets && typeof targets === 'object' && 'from' in (targets as object) && 'to' in (targets as object));
+    if (!finishingBarrier) throw new Error('Resolve pending prompt first');
+  }
 
   const next = cloneState(state);
+  const resumeTurnPhase = next.turnPhase;
   if (next.turnPhase === 'spell') next.turnPhase = 'move';
+  // Completing a barrier shift clears any in-progress prompt
+  if (next.pendingPrompt?.type === 'ability_target' && next.pendingPrompt.abilityId === 'barrier_shift') {
+    next.pendingPrompt = null;
+  }
 
   const piece = next.pieces.find((p) => p.id === pieceId);
   if (!piece || piece.color !== color) throw new Error('Invalid piece');
@@ -408,6 +495,7 @@ export function useAbility(
         color,
         pieceId,
         message: 'Choose a gadget: ice_floor, spring_board, or gnome_hole',
+        resumeTurnPhase,
       };
       return next;
     }
@@ -424,6 +512,7 @@ export function useAbility(
         pieceId,
         abilityId: 'enchant',
         message: 'Enchant: click an adjacent allied or enemy piece (not a king)',
+        resumeTurnPhase,
       };
       return next;
     }
@@ -439,6 +528,7 @@ export function useAbility(
         pieceId,
         abilityId: 'revive',
         message: 'Revive: choose a piece from your graveyard',
+        resumeTurnPhase,
       };
       return next;
     }
@@ -462,6 +552,7 @@ export function useAbility(
         abilityId: 'barrier_shift',
         message: 'Barrier Shift: click an empty square in allied territory',
         selected: [payload.from],
+        resumeTurnPhase,
       };
       return next;
     }
@@ -472,6 +563,7 @@ export function useAbility(
       abilityId: 'barrier_shift',
       message: 'Barrier Shift: click one of your barriers, then an empty allied square',
       selected: [],
+      resumeTurnPhase,
     };
     return next;
   }
@@ -658,6 +750,7 @@ function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, 
         if (occ.color === piece.color) continue;
         removePiece(state, occ, color);
       }
+      if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
       piece.pos = slide;
       log(state, `${piece.defId} slid on ice`);
     }
@@ -713,8 +806,15 @@ export function applyMove(
   const piece = next.pieces.find((p) => p.id === pieceId);
   if (!piece || piece.color !== color) throw new Error('Invalid piece');
   const legal = listMoves(next, pieceId);
-  const move = legal.find((m) => sameCoord(m.to, to) && (!meta?.special || m.special === meta.special));
+  let move = legal.find((m) => sameCoord(m.to, to) && (!meta?.special || m.special === meta.special));
+  if (!move && meta?.special) {
+    move = legal.find((m) => sameCoord(m.to, to) && m.special === meta.special);
+  }
   if (!move) throw new Error('Illegal move');
+  // Prefer authoritative legal meta, but allow client-provided withId as fallback
+  if (move.special && !move.meta?.withId && typeof meta?.withId === 'string') {
+    move = { ...move, meta: { ...(move.meta ?? {}), withId: meta.withId } };
+  }
 
   const from = { ...piece.pos };
 
@@ -742,6 +842,9 @@ export function applyMove(
 
   if (move.special === 'castle_swap' && move.meta?.withId) {
     const other = next.pieces.find((p) => p.id === move.meta!.withId)!;
+    const otherFrom = { ...other.pos };
+    if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
+    if (endBestBuddy(next, other, otherFrom)) log(next, 'Best Buddy ended');
     const tmp = { ...piece.pos };
     piece.pos = { ...other.pos };
     other.pos = tmp;
@@ -750,18 +853,34 @@ export function applyMove(
     move.meta?.withId
   ) {
     const other = next.pieces.find((p) => p.id === move.meta!.withId)!;
+    const otherFrom = { ...other.pos };
+    if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
+    if (endBestBuddy(next, other, otherFrom)) log(next, 'Best Buddy ended');
     const tmp = { ...piece.pos };
     piece.pos = { ...other.pos };
     other.pos = tmp;
     if (move.special === 'ancient_shuffle') log(next, 'Ancient Shuffle!');
     if (move.special === 'swap_of_fates') log(next, 'Swap of Fates!');
   } else if (move.special === 'best_buddy') {
-    // clear previous buddy links involving this pig
+    if (piece.defId !== 'pig') throw new Error('Only the Pig can use Best Buddy');
+    const allyId = move.meta?.withId as string | undefined;
+    const ally = allyId ? next.pieces.find((p) => p.id === allyId) : pieceAt(next, to);
+    if (!ally || ally.color !== color || ally.id === piece.id || ally.class === 'king') {
+      throw new Error('Best Buddy requires an allied non-king');
+    }
+    if (
+      !sameCoord(ally.pos, to) ||
+      !isPigLShape(piece.pos, to, movementBonus(piece)) ||
+      !isKnightLanding(piece, next, to, 2, 1, false)
+    ) {
+      throw new Error('Best Buddy only works on a piece in the Pig’s L-move range (2×1)');
+    }
     for (const p of next.pieces) {
       if (p.coOccupantId === piece.id) p.coOccupantId = undefined;
     }
-    piece.pos = { ...to };
-    piece.coOccupantId = move.meta?.withId as string;
+    piece.pos = { ...ally.pos };
+    piece.coOccupantId = ally.id;
+    log(next, `Pig Best Buddy with ${ally.defId}`);
   } else if (move.special === 'death_stare') {
     captured = pieceAt(next, to);
   } else {
@@ -777,11 +896,7 @@ export function applyMove(
           ((next.players[color] as PlayerState & { bonusTurns?: number }).bonusTurns ?? 0) + 3;
       }
     }
-    // leaving a shared tile clears buddy
-    if (piece.coOccupantId) piece.coOccupantId = undefined;
-    for (const p of next.pieces) {
-      if (p.coOccupantId === piece.id) p.coOccupantId = undefined;
-    }
+    if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     piece.pos = { ...to };
   }
 
@@ -862,10 +977,14 @@ export function applyMove(
       }
     }
 
-    const hadBloodlust = Boolean(piece.bloodlust);
     if (piece.defId === 'snake') {
-      if (hadBloodlust) piece.bloodlust = false;
       piece.bloodlust = true;
+      log(next, 'Snake Bloodlust!');
+    }
+
+    const def = getPieceDef(piece.defId);
+    if (def.onCapture && captured) {
+      def.onCapture(piece, captured, next);
     }
   } else if (piece.defId === 'snake' && piece.bloodlust) {
     piece.bloodlust = false;
@@ -957,12 +1076,14 @@ function addEchoOption(state: GameState, piece: PieceState, from: Coord, to: Coo
     return;
   }
   // auto-apply echo non-capture
+  if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
   piece.pos = echoTo;
   removeEffects(piece, 'echo_armed');
   log(state, `Echo repeated move for ${piece.defId}`);
 }
 
 function removePiece(state: GameState, piece: PieceState, byColor: Color): void {
+  endBestBuddy(state, piece, piece.pos);
   // enchant fails if ally taken
   for (const p of state.pieces) {
     const ench = hasEffect(p, 'enchant_ritual');
@@ -1057,6 +1178,21 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
     return endTurn(out, out.turn, true);
   }
   return out;
+}
+
+export function cancelPrompt(state: GameState, color: Color): GameState {
+  const prompt = state.pendingPrompt;
+  if (!prompt) throw new Error('Nothing to cancel');
+  if (prompt.color !== color) throw new Error('Not your prompt');
+  if (prompt.type !== 'gadget_choice' && prompt.type !== 'ability_target') {
+    throw new Error('This choice cannot be canceled');
+  }
+  const next = cloneState(state);
+  const resume = prompt.resumeTurnPhase;
+  next.pendingPrompt = null;
+  if (resume === 'spell' || resume === 'move') next.turnPhase = resume;
+  log(next, `${color} canceled their ability`);
+  return next;
 }
 
 export function resolvePrompt(state: GameState, color: Color, payload: unknown): GameState {
@@ -1170,6 +1306,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (!inBounds(dest)) throw new Error('Out of bounds');
     const occ = pieceAt(next, dest);
     if (occ) removePiece(next, occ, color);
+    if (endBestBuddy(next, piece, piece.pos)) log(next, 'Best Buddy ended');
     piece.pos = { ...dest };
     next.pendingPrompt = null;
     log(next, 'Spring Board bounce!');
@@ -1189,6 +1326,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     const piece = next.pieces.find((p) => p.id === prompt.pieceId);
     if (!piece) throw new Error('Piece gone');
     if (pieceAt(next, dest)) throw new Error('Occupied');
+    if (endBestBuddy(next, piece, piece.pos)) log(next, 'Best Buddy ended');
     piece.pos = { ...dest };
     next.pendingPrompt = null;
     log(next, 'Traveled through Gnome Hole');

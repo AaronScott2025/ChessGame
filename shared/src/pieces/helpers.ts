@@ -104,6 +104,22 @@ export function knightMoves(
   canJump = true,
 ): MoveOption[] {
   const moves: MoveOption[] = [];
+  for (const to of knightTargetCoords(piece, state, long, short, canJump)) {
+    const opt = emptyOrEnemy(state, to, piece.color);
+    if (opt) moves.push(opt);
+  }
+  return moves;
+}
+
+/** L-destination coords reachable with the same path rules as knightMoves. */
+export function knightTargetCoords(
+  piece: PieceState,
+  state: GameState,
+  long = 2,
+  short = 1,
+  canJump = true,
+): Coord[] {
+  const targets: Coord[] = [];
   const bonus = movementBonus(piece);
   const longs = [long, long + (bonus ? 1 : 0)].filter((v, i, a) => a.indexOf(v) === i);
   for (const L of longs) {
@@ -120,8 +136,6 @@ export function knightMoves(
     for (const [dr, dc] of deltas) {
       const to = { row: piece.pos.row + dr, col: piece.pos.col + dc };
       if (!inBounds(to)) continue;
-      // Path check along the long leg first (simplified L path).
-      // Barriers always block; pieces block unless canJump (Horse / Snake bloodlust).
       const stepR = Math.sign(dr);
       const stepC = Math.sign(dc);
       let blocked = false;
@@ -146,11 +160,29 @@ export function knightMoves(
         }
       }
       if (blocked) continue;
-      const opt = emptyOrEnemy(state, to, piece.color);
-      if (opt) moves.push(opt);
+      targets.push(to);
     }
   }
-  return moves;
+  return targets;
+}
+
+export function isKnightLanding(
+  piece: PieceState,
+  state: GameState,
+  to: Coord,
+  long = 2,
+  short = 1,
+  canJump = false,
+): boolean {
+  return knightTargetCoords(piece, state, long, short, canJump).some((c) => sameCoord(c, to));
+}
+
+/** True only for a Pig L (2×1, plus movement-bonus extra long). Does not allow teleports. */
+export function isPigLShape(from: Coord, to: Coord, extraLong = 0): boolean {
+  const dr = Math.abs(from.row - to.row);
+  const dc = Math.abs(from.col - to.col);
+  const longs = extraLong > 0 ? [2, 2 + extraLong] : [2];
+  return longs.some((L) => (dr === L && dc === 1) || (dr === 1 && dc === L));
 }
 
 export function filterLegal(piece: PieceState, state: GameState, moves: MoveOption[]): MoveOption[] {
