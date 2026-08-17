@@ -136,7 +136,12 @@ registerCard({
 registerCard({
   id: 'mathematical',
   name: 'Mathematical',
-  description: ['Apply to any piece.', 'Adds +1 to their movement.', 'Does not persist through death.'],
+  description: [
+    'Apply to any piece.',
+    'Adds +1 to their movement for 2 turns.',
+    'Does not persist through death.',
+    'On a king, the boost waits 4 turns before applying (still lasts 2 turns once active).',
+  ],
   image: '/cards/Mathematical.png',
   targeting: 'piece',
   play: (ctx, targets) => {
@@ -147,11 +152,16 @@ registerCard({
         id: uid('math_pending'),
         kind: 'movement_plus_pending',
         turnsRemaining: 4,
-        data: { amount: 1 },
+        data: { amount: 1, duration: 2 },
         sourceCardId: 'mathematical',
       });
     } else {
-      addEffect(piece, { id: uid('math'), kind: 'mathematical', sourceCardId: 'mathematical' });
+      addEffect(piece, {
+        id: uid('math'),
+        kind: 'mathematical',
+        turnsRemaining: 2,
+        sourceCardId: 'mathematical',
+      });
     }
     return { state: ctx.state, done: true };
   },
@@ -419,24 +429,40 @@ registerCard({
 registerCard({
   id: 'rewind',
   name: 'Rewind',
-  description: ['Undo the last turn cycle.'],
+  description: [
+    'Undo the opponent\'s last turn (board and hands as of the start of that turn).',
+    'You keep the current turn; this counts as your spell.',
+    'Cannot be used on the first turn of the game.',
+  ],
   image: '/cards/Rewind.png',
   targeting: 'none',
   play: (ctx) => {
-    if (ctx.state.snapshots.length < 1) throw new Error('Nothing to rewind');
-    const snap = ctx.state.snapshots[0];
-    const restored = JSON.parse(snap) as typeof ctx.state;
-    restored.snapshots = ctx.state.snapshots.slice(1);
-    log(restored, `${ctx.player} used Rewind`);
-    // still need to consume card from current - apply on restored
+    // snapshots[0] = start of the current turn; snapshots[1] = start of the previous turn
+    if (ctx.state.snapshots.length < 2) throw new Error('Nothing to rewind yet');
+    const restored = JSON.parse(ctx.state.snapshots[1]) as typeof ctx.state;
+    restored.snapshots = ctx.state.snapshots.slice(2);
+
+    // Consume Rewind on the restored timeline
     const hand = restored.players[ctx.player].hand;
     const idx = hand.findIndex((c) => c.instanceId === ctx.card.instanceId);
     if (idx >= 0) {
       const [card] = hand.splice(idx, 1);
       restored.discardPile.push(card);
+    } else {
+      restored.discardPile.push({ instanceId: ctx.card.instanceId, defId: ctx.card.defId });
     }
-    restored.players[ctx.player].spellsThisTurn += 1;
+
+    restored.turn = ctx.player;
+    restored.turnPhase = 'move';
+    restored.phase = 'playing';
     restored.pendingPrompt = null;
+    restored.check = null;
+    restored.players[ctx.player].spellsThisTurn = Math.max(
+      restored.players[ctx.player].spellsThisTurn,
+      restored.players[ctx.player].maxSpellsThisTurn || 1,
+    );
+    restored.players[ctx.player].lastPlayedCardDefId = 'rewind';
+    log(restored, `${ctx.player} used Rewind — previous turn undone`);
     return { state: restored, done: true };
   },
 });
@@ -518,27 +544,48 @@ registerCard({
 registerCard({
   id: 'pawn_summon',
   name: 'Pawn Summon',
-  description: ['Revive two pawns anywhere in allied territory.'],
+  description: [
+    'Revive up to two pawns anywhere in allied territory.',
+    'For each revive, choose which pawn variant to place (Pawn, nwaP, Rogue, or Enchanted Pawn).',
+  ],
   image: '/cards/Pawn_Summon.png',
   targeting: 'empty_allied',
   targetCount: 2,
   play: (ctx, targets) => {
-    const pawns = ctx.state.players[ctx.player].graveyard
-      .map((g, i) => ({ g, i }))
-      .filter((x) => x.g.class === 'pawn');
-    if (pawns.length < 1) throw new Error('Need fallen pawns');
-    if (targets.length < Math.min(2, pawns.length)) {
-      return { state: ctx.state, done: false, message: 'Pick empty allied squares for pawn revive(s)' };
+    const gy = ctx.state.players[ctx.player].graveyard;
+    const pawnSlots = gy.filter((g) => g.class === 'pawn').length;
+    if (pawnSlots < 1) throw new Error('Need fallen pawns');
+    const need = Math.min(2, pawnSlots);
+    // targets: [defId, Coord, defId, Coord, ...]
+    if (targets.length < need * 2) {
+      const chosen = Math.floor(targets.length / 2);
+      if (targets.length % 2 === 1) {
+        const defId = targets[targets.length - 1] as string;
+        const name = getPieceDef(defId).name;
+        return {
+          state: ctx.state,
+          done: false,
+          message: `Pick an empty allied square for ${name} (${chosen + 1}/${need})`,
+        };
+      }
+      return {
+        state: ctx.state,
+        done: false,
+        message: `Choose pawn variant ${chosen + 1} of ${need}`,
+      };
     }
-    const count = Math.min(2, pawns.length, targets.length);
-    for (let n = 0; n < count; n++) {
-      const pos = targets[n] as Coord;
+    for (let n = 0; n < need; n++) {
+      const defId = targets[n * 2] as string;
+      const pos = targets[n * 2 + 1] as Coord;
+      const def = getPieceDef(defId);
+      if (def.class !== 'pawn') throw new Error('Must be a pawn variant');
       if (!isAlliedTerritory(ctx.player, pos) || pieceAt(ctx.state, pos)) throw new Error('Invalid square');
-      const entry = pawns[n];
-      const fallen = ctx.state.players[ctx.player].graveyard.splice(entry.i - n, 1)[0];
+      const idx = gy.findIndex((g) => g.class === 'pawn');
+      if (idx < 0) throw new Error('Need fallen pawns');
+      gy.splice(idx, 1);
       ctx.state.pieces.push({
         id: uid('pawn'),
-        defId: fallen.defId,
+        defId: def.id,
         class: 'pawn',
         color: ctx.player,
         pos,

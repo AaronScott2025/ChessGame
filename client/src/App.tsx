@@ -12,6 +12,12 @@ import {
 import { PieceIcon } from './PieceIcon';
 import { getPieceInfo } from './pieceInfo';
 import { RulesModal } from './RulesModal';
+import {
+  effectLabel,
+  effectTone,
+  formatEffectTitle,
+  visibleBoardEffects,
+} from './statusEffects';
 import './App.css';
 
 type Color = 'white' | 'black';
@@ -23,7 +29,7 @@ interface Piece {
   class: string;
   color: Color;
   pos: Coord;
-  effects: Array<{ kind: string; turnsRemaining?: number }>;
+  effects: Array<{ id?: string; kind: string; turnsRemaining?: number }>;
   charges?: number;
   gadgetUsed?: boolean;
   abilityCooldown?: number;
@@ -70,6 +76,14 @@ interface GameState {
   winner: Color | null;
   winReason?: string;
   history: string[];
+  lastMove?: {
+    pieceId: string;
+    from: Coord;
+    to: Coord;
+    capturedId?: string;
+    defId?: string;
+    color?: Color;
+  };
   pendingPrompt: null | {
     type: string;
     color?: Color;
@@ -144,11 +158,19 @@ export default function App() {
   const [draftOptions, setDraftOptions] = useState<string[]>([]);
   const [selectedPiece, setSelectedPiece] = useState<string | null>(null);
   const [inspectedId, setInspectedId] = useState<string | null>(null);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [moves, setMoves] = useState<MoveOption[]>([]);
   const [abilities, setAbilities] = useState<AbilityInfo[]>([]);
   const [gadgetKind, setGadgetKind] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<string | null>(null);
   const [pendingTargets, setPendingTargets] = useState<unknown[]>([]);
+  const [confirmKey, setConfirmKey] = useState<string | null>(null);
+  const [spellConfirm, setSpellConfirm] = useState<{
+    summary: string;
+    mode: 'card' | 'resolve_prompt';
+    targets?: unknown[];
+    payload?: unknown;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState('Connect and create or join a room.');
 
@@ -161,6 +183,8 @@ export default function App() {
       setDraftOptions(payload.draftOptions ?? []);
       setCatalog(payload.catalog);
       setError(null);
+      setConfirmKey(null);
+      setSpellConfirm(null);
       if (payload.state.pendingPrompt?.message) setStatus(payload.state.pendingPrompt.message);
     });
     s.on('error_message', (msg: string) => setError(msg));
@@ -272,45 +296,117 @@ export default function App() {
 
   const targetNeeded = activeCardDef?.targeting && activeCardDef.targeting !== 'none';
 
+  const clearBoardConfirm = () => {
+    setConfirmKey(null);
+  };
+
+  /** First click aims; second click on the same target confirms (double-click). */
+  const armOrConfirm = (key: string, hint: string, execute: () => void) => {
+    if (confirmKey === key) {
+      clearBoardConfirm();
+      execute();
+      return;
+    }
+    setConfirmKey(key);
+    setStatus(`${hint} — click again to confirm`);
+  };
+
   const finishCard = (targets: unknown[]) => {
     if (!selectedCard) return;
     playCardCastSfx();
     send({ type: 'play_card', instanceId: selectedCard, targets });
     setSelectedCard(null);
     setPendingTargets([]);
+    setSpellConfirm(null);
+    clearBoardConfirm();
     setStatus('Card played.');
+  };
+
+  const describeSpellTargets = (cardName: string, targets: unknown[]): string => {
+    if (!targets.length) return `Cast ${cardName}?`;
+    const parts: string[] = [];
+    for (const t of targets) {
+      if (t && typeof t === 'object' && 'row' in (t as object) && 'col' in (t as object)) {
+        const c = t as Coord;
+        parts.push(`file ${c.col + 1}, rank ${10 - c.row}`);
+      } else if (typeof t === 'string' && state) {
+        const piece = state.pieces.find((p) => p.id === t);
+        if (piece) parts.push(pieceMeta(catalog, piece.defId)?.name ?? piece.defId);
+        else parts.push(pieceMeta(catalog, t)?.name ?? t);
+      } else if (typeof t === 'number') {
+        parts.push(`graveyard #${t + 1}`);
+      }
+    }
+    if (!parts.length) return `Cast ${cardName}?`;
+    if (parts.length === 1) return `Cast ${cardName} on ${parts[0]}?`;
+    return `Cast ${cardName} on ${parts.join(' & ')}?`;
+  };
+
+  const offerSpellConfirm = (targets: unknown[]) => {
+    if (!activeCardDef) return;
+    setPendingTargets(targets);
+    clearBoardConfirm();
+    const summary = describeSpellTargets(activeCardDef.name, targets);
+    setSpellConfirm({ summary, mode: 'card', targets });
+    setStatus(summary);
+  };
+
+  const confirmSpell = () => {
+    if (!spellConfirm) return;
+    if (spellConfirm.mode === 'card') {
+      finishCard(spellConfirm.targets ?? []);
+      return;
+    }
+    send({ type: 'resolve_prompt', payload: spellConfirm.payload });
+    setSpellConfirm(null);
+    clearBoardConfirm();
   };
 
   const onSquareClick = (row: number, col: number) => {
     if (!state || !you) return;
     playPieceSfx();
+    const squareKey = `${row},${col}`;
 
     const prompt = state.pendingPrompt;
     if (prompt && prompt.color === you) {
       if (prompt.type === 'gadget_choice' && gadgetKind) {
-        send({
-          type: 'resolve_prompt',
-          payload: { kind: gadgetKind, pos: { row, col } },
+        armOrConfirm(squareKey, 'Place gadget here', () => {
+          send({
+            type: 'resolve_prompt',
+            payload: { kind: gadgetKind, pos: { row, col } },
+          });
+          setGadgetKind(null);
         });
-        setGadgetKind(null);
         return;
       }
       if (prompt.type === 'spring_bounce') {
-        send({ type: 'resolve_prompt', payload: { row, col } });
+        armOrConfirm(squareKey, 'Bounce here', () => {
+          send({ type: 'resolve_prompt', payload: { row, col } });
+        });
         return;
       }
       if (prompt.type === 'gnome_hole_travel') {
-        send({ type: 'resolve_prompt', payload: { row, col } });
+        armOrConfirm(squareKey, 'Travel here', () => {
+          send({ type: 'resolve_prompt', payload: { row, col } });
+        });
         return;
       }
       if (prompt.type === 'ability_target') {
         if (prompt.abilityId === 'enchant') {
           const piece = board[row][col];
-          if (piece) send({ type: 'resolve_prompt', payload: piece.id });
+          if (piece) {
+            const name = pieceMeta(catalog, piece.defId)?.name ?? piece.defId;
+            const summary = `Cast Enchant on ${name}?`;
+            setSpellConfirm({ summary, mode: 'resolve_prompt', payload: piece.id });
+            setStatus(summary);
+            clearBoardConfirm();
+          }
           return;
         }
         if (prompt.abilityId === 'barrier_shift') {
-          send({ type: 'resolve_prompt', payload: { row, col } });
+          armOrConfirm(squareKey, 'Barrier Shift here', () => {
+            send({ type: 'resolve_prompt', payload: { row, col } });
+          });
           return;
         }
       }
@@ -329,49 +425,94 @@ export default function App() {
     ) {
       const ep = state.pieces.find((p) => p.color === you && p.defId === 'enchanted_pawn');
       if (ep) {
-        send({
-          type: 'use_ability',
-          pieceId: ep.id,
-          abilityId: 'barrier_shift',
-          targets: { from: { row, col } },
+        armOrConfirm(squareKey, 'Select this barrier', () => {
+          send({
+            type: 'use_ability',
+            pieceId: ep.id,
+            abilityId: 'barrier_shift',
+            targets: { from: { row, col } },
+          });
+          setSelectedPiece(ep.id);
+          setMoves([]);
+          setAbilities([]);
+          setStatus('Barrier Shift: click an empty square in allied territory (click again to confirm)');
         });
-        setSelectedPiece(ep.id);
-        setMoves([]);
-        setAbilities([]);
-        setStatus('Barrier Shift: click an empty square in allied territory');
         return;
       }
     }
 
     if (selectedCard && targetNeeded) {
       const mode = activeCardDef!.targeting;
+
+      // Revive: after choosing a graveyard index, pick spawn square
+      if (mode === 'graveyard' && pendingTargets.length === 1 && typeof pendingTargets[0] === 'number') {
+        offerSpellConfirm([...pendingTargets, { row, col }]);
+        return;
+      }
+
       if (mode === 'empty_allied' || mode === 'empty_any' || mode === 'square') {
-        const next = [...pendingTargets, { row, col }];
-        const need = activeCardDef!.id === 'portal' || activeCardDef!.id === 'pawn_summon' ? 2 : 1;
-        if (activeCardDef!.id === 'teleport') {
-          // teleport needs piece then square — piece first
-          setPendingTargets(next);
-          setStatus('Teleport: pick destination (exactly 2 steps).');
-          if (next.length >= 2) finishCard(next);
+        // Pawn Summon: [defId, pos, defId, pos, ...] — square only after a variant is chosen
+        if (activeCardDef!.id === 'pawn_summon') {
+          const gyPawns = you
+            ? state.players[you].graveyard.filter((g) => g.class === 'pawn').length
+            : 0;
+          const need = Math.min(2, gyPawns);
+          if (need < 1 || pendingTargets.length % 2 !== 1) {
+            setStatus(
+              need < 1
+                ? 'Need fallen pawns'
+                : `Choose pawn variant ${Math.floor(pendingTargets.length / 2) + 1} of ${need} first`,
+            );
+            return;
+          }
+          const next = [...pendingTargets, { row, col }];
+          if (next.length >= need * 2) {
+            offerSpellConfirm(next);
+          } else {
+            setPendingTargets(next);
+            clearBoardConfirm();
+            setSpellConfirm(null);
+            setStatus(`Choose pawn variant ${Math.floor(next.length / 2) + 1} of ${need}`);
+          }
           return;
         }
-        setPendingTargets(next);
-        if (next.length >= need) finishCard(next);
-        else setStatus(`Pick ${need - next.length} more square(s)`);
+        const next = [...pendingTargets, { row, col }];
+        const need = activeCardDef!.id === 'portal' ? 2 : 1;
+        if (activeCardDef!.id === 'teleport') {
+          if (next.length >= 2) {
+            offerSpellConfirm(next);
+          } else {
+            setPendingTargets(next);
+            clearBoardConfirm();
+            setSpellConfirm(null);
+            setStatus('Teleport: pick destination (exactly 2 steps).');
+          }
+          return;
+        }
+        if (next.length >= need) {
+          offerSpellConfirm(next);
+        } else {
+          setPendingTargets(next);
+          clearBoardConfirm();
+          setSpellConfirm(null);
+          setStatus(`Pick ${need - next.length} more square(s)`);
+        }
         return;
       }
     }
 
     if (selectedPiece && moves.some((m) => m.to.row === row && m.to.col === col)) {
       const move = moves.find((m) => m.to.row === row && m.to.col === col)!;
-      send({
-        type: 'move',
-        pieceId: selectedPiece,
-        to: { row, col },
-        meta: move.special ? { special: move.special } : undefined,
+      armOrConfirm(squareKey, 'Move here', () => {
+        send({
+          type: 'move',
+          pieceId: selectedPiece,
+          to: { row, col },
+          meta: move.special ? { special: move.special } : undefined,
+        });
+        setSelectedPiece(null);
+        setMoves([]);
       });
-      setSelectedPiece(null);
-      setMoves([]);
       return;
     }
 
@@ -385,37 +526,45 @@ export default function App() {
         if (mode === 'multi_allied') {
           if (piece.color !== you) return;
           const next = [...pendingTargets, piece.id];
-          setPendingTargets(next);
           if (next.length >= 4) {
-            setStatus('Rearrange: click squares to assign order, or use default rotation');
-            // default cyclic shift of positions
             const selectedPieces = next.map((id) => state.pieces.find((p) => p.id === id)!);
             const assignment: Record<string, Coord> = {};
             for (let i = 0; i < 4; i++) {
               assignment[selectedPieces[i].id] = selectedPieces[(i + 1) % 4].pos;
             }
-            finishCard([...next, assignment]);
-          } else setStatus(`Rearrange: pick ${4 - next.length} more allied piece(s)`);
+            offerSpellConfirm([...next, assignment]);
+          } else {
+            setPendingTargets(next);
+            clearBoardConfirm();
+            setSpellConfirm(null);
+            setStatus(`Rearrange: pick ${4 - next.length} more allied piece(s)`);
+          }
           return;
         }
         if (activeCardDef!.id === 'teleport') {
           setPendingTargets([piece.id]);
+          clearBoardConfirm();
+          setSpellConfirm(null);
           setStatus('Teleport: now pick a destination 2 spaces away');
           return;
         }
         if (activeCardDef!.id === 'swap') {
           const next = [...pendingTargets, piece.id];
           setPendingTargets(next);
+          clearBoardConfirm();
+          setSpellConfirm(null);
           if (next.length === 1) {
             setStatus('Swap: pick a different variant id from the buttons below');
             return;
           }
         }
-        finishCard([piece.id]);
+        offerSpellConfirm([piece.id]);
         return;
       }
     }
 
+    // Selection clicks — not confirms
+    clearBoardConfirm();
     if (piece && piece.color === you) {
       setInspectedId(piece.id);
       setSelectedPiece(piece.id);
@@ -430,13 +579,14 @@ export default function App() {
       setMoves([]);
       setAbilities([]);
       setInspectedId(null);
+      setHoveredId(null);
     }
   };
 
   const castCard = () => {
     if (!selectedCard || !activeCardDef) return;
     if (activeCardDef.targeting === 'none') {
-      finishCard([]);
+      offerSpellConfirm([]);
       return;
     }
     if (activeCardDef.targeting === 'graveyard') {
@@ -445,22 +595,43 @@ export default function App() {
         setError('No fallen pieces');
         return;
       }
-      setStatus('Revive: click an empty spawn square after choosing index 0 by default');
-      // simplified: revive first graveyard piece onto clicked square — handled via pending
-      setPendingTargets([0]);
+      setPendingTargets([]);
+      setSpellConfirm(null);
+      setStatus('Revive: pick a fallen piece, then an empty spawn square');
+      return;
+    }
+    if (activeCardDef.id === 'pawn_summon') {
+      const gyPawns = you ? state?.players[you].graveyard.filter((g) => g.class === 'pawn').length ?? 0 : 0;
+      if (gyPawns < 1) {
+        setError('Need fallen pawns');
+        return;
+      }
+      setPendingTargets([]);
+      setSpellConfirm(null);
+      setStatus(`Pawn Summon: choose variant 1 of ${Math.min(2, gyPawns)}`);
       return;
     }
     setPendingTargets([]);
+    setSpellConfirm(null);
     setStatus(`Select target for ${activeCardDef.name} (${activeCardDef.targeting})`);
   };
 
   const inspectedPiece = useMemo(() => {
-    if (!state || !inspectedId) return null;
-    if (inspectedId.startsWith('draft:')) return null;
-    return state.pieces.find((p) => p.id === inspectedId) ?? null;
-  }, [state, inspectedId]);
+    if (!state) return null;
+    const id = inspectedId && !inspectedId.startsWith('draft:') ? inspectedId : null;
+    const hover = hoveredId && !hoveredId.startsWith('draft:') ? hoveredId : null;
+    const active = id ?? hover;
+    if (!active) return null;
+    return state.pieces.find((p) => p.id === active) ?? null;
+  }, [state, inspectedId, hoveredId]);
 
-  const draftInspectDefId = inspectedId?.startsWith('draft:') ? inspectedId.slice(6) : null;
+  const infoLocked = Boolean(inspectedId && !inspectedId.startsWith('draft:'));
+
+  const draftInspectDefId = inspectedId?.startsWith('draft:')
+    ? inspectedId.slice(6)
+    : hoveredId?.startsWith('draft:')
+      ? hoveredId.slice(6)
+      : null;
 
   const musicScene =
     !roomCode || !state
@@ -487,9 +658,11 @@ export default function App() {
   if (!roomCode || !state) {
     return (
       <div className="shell lobby-shell home">
-        <CosmicBackdrop enabled={fxEnabled} />
+        <CosmicBackdrop enabled={fxEnabled} dayNight="day" />
         <main className="home-hero">
-          <p className="brand home-brand">Chesspansion</p>
+          <p className="brand home-brand">
+            Chesspansion <span className="beta-tag" aria-label="Beta">Beta</span>
+          </p>
           <p className="home-tagline">
             Draft strange armies, weave spell cards, and fight across a 10×10 realm of day and night.
           </p>
@@ -535,7 +708,7 @@ export default function App() {
 
   return (
     <div className="shell">
-      <CosmicBackdrop enabled={fxEnabled} />
+      <CosmicBackdrop enabled={fxEnabled} dayNight={state.dayNight} />
       {(state.phase === 'playing' && state.turn !== you) ||
       (state.phase === 'opening_draw' &&
         state.pendingPrompt?.type === 'opening_mulligan' &&
@@ -557,7 +730,9 @@ export default function App() {
       <div className="shell-content">
       <header className="top">
         <div>
-          <p className="brand">Chesspansion</p>
+          <p className="brand">
+            Chesspansion <span className="beta-tag" aria-label="Beta">Beta</span>
+          </p>
           <p className="meta">
             Room <strong>{roomCode}</strong> · You are <strong>{you}</strong> ·{' '}
             <span className={state.dayNight}>{state.dayNight}</span> · cycle {state.cycleCount}
@@ -743,6 +918,10 @@ export default function App() {
                         .filter(Boolean)
                         .join(' ')}
                       onClick={() => setInspectedId(`draft:${id}`)}
+                      onMouseEnter={() => setHoveredId(`draft:${id}`)}
+                      onMouseLeave={() =>
+                        setHoveredId((h) => (h === `draft:${id}` ? null : h))
+                      }
                     >
                       <span className="sym">
                         <PieceIcon defId={id} color={you ?? 'white'} title={p?.name} />
@@ -783,9 +962,17 @@ export default function App() {
             <Graveyard items={state.players.black.graveyard} catalog={catalog} color="black" />
             <h2>Log</h2>
             <ul className="log">
-              {state.history.slice(0, 14).map((h, i) => (
-                <li key={`${h}-${i}`}>{h}</li>
-              ))}
+              {state.history.slice(0, 14).map((h, i) => {
+                const match = h.match(/^\[([^\]]+)\]\s*(.*)$/);
+                const time = match?.[1];
+                const text = match?.[2] ?? h;
+                return (
+                  <li key={`${h}-${i}`}>
+                    {time ? <span className="log-time">{time}</span> : null}
+                    <span className="log-text">{text}</span>
+                  </li>
+                );
+              })}
             </ul>
           </aside>
 
@@ -805,6 +992,18 @@ export default function App() {
                   const barrierDest = barrierShiftHighlights.destinations.has(key);
                   const toks = state.tokens.filter((t) => t.pos.row === row && t.pos.col === col);
                   const meta = piece ? pieceMeta(catalog, piece.defId) : null;
+                  const lastFrom =
+                    !!state.lastMove &&
+                    state.lastMove.from.row === row &&
+                    state.lastMove.from.col === col;
+                  const lastTo =
+                    !!state.lastMove &&
+                    state.lastMove.to.row === row &&
+                    state.lastMove.to.col === col;
+                  const lastPiece = !!(piece && state.lastMove?.pieceId === piece.id);
+                  const showingInfo =
+                    (piece && piece.id === inspectedId) ||
+                    (piece && !infoLocked && piece.id === hoveredId);
                   return (
                     <button
                       key={`${row}-${col}`}
@@ -814,22 +1013,89 @@ export default function App() {
                         dark ? 'dark' : 'light',
                         selected ? 'selected' : '',
                         piece && piece.id === inspectedId ? 'inspected' : '',
+                        piece && !infoLocked && piece.id === hoveredId ? 'info-hover' : '',
+                        lastFrom ? 'last-from' : '',
+                        lastTo || lastPiece ? 'last-to' : '',
                         moveHere ? 'move' : '',
+                        confirmKey === key || confirmKey === (piece ? `piece:${piece.id}` : '')
+                          ? 'confirm-pending'
+                          : '',
                         barrierPick || barrierFrom ? 'barrier-source' : '',
                         barrierDest ? 'barrier-target' : '',
                       ].join(' ')}
                       onClick={() => onSquareClick(row, col)}
+                      onMouseEnter={() => {
+                        if (piece) setHoveredId(piece.id);
+                      }}
+                      onMouseLeave={() => {
+                        setHoveredId((h) => (piece && h === piece.id ? null : h));
+                      }}
+                      title={
+                        confirmKey === key || confirmKey === (piece ? `piece:${piece.id}` : '')
+                          ? 'Click again to confirm'
+                          : showingInfo && infoLocked
+                            ? 'Info locked — click empty square or × to unlock'
+                            : lastPiece
+                              ? 'Last move'
+                              : piece
+                                ? 'Hover for info · click to lock'
+                                : undefined
+                      }
                     >
                       {toks.map((t) => (
                         <span key={t.id} className={`token ${t.kind}`} title={t.kind} />
                       ))}
                       {piece && (
-                        <span className="piece" title={meta?.name ?? piece.defId}>
+                        <span
+                          className={`piece ${lastPiece ? 'last-moved' : ''}${
+                            (piece.effects ?? []).some((e) => effectTone(e.kind) === 'debuff')
+                              ? ' has-debuff'
+                              : (piece.effects ?? []).length
+                                ? ' has-buff'
+                                : ''
+                          }`}
+                          title={[
+                            meta?.name ?? piece.defId,
+                            ...visibleBoardEffects(piece.effects ?? []).map(formatEffectTitle),
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        >
                           <PieceIcon defId={piece.defId} color={piece.color} title={meta?.name ?? piece.defId} />
                           {piece.charges != null && piece.charges > 0 && <i className="charge">{piece.charges}</i>}
                           {piece.ritualTurns != null && piece.ritualTurns > 0 && (
                             <i className="ritual" title="Revive ritual">{piece.ritualTurns}</i>
                           )}
+                          {(() => {
+                            const statuses = visibleBoardEffects(piece.effects ?? []);
+                            if (!statuses.length) return null;
+                            const shown = statuses.slice(0, 3);
+                            const extra = statuses.length - shown.length;
+                            return (
+                              <span className="piece-status" aria-hidden>
+                                {shown.map((e) => (
+                                  <i
+                                    key={e.id}
+                                    className={`piece-status-badge tone-${effectTone(e.kind)}`}
+                                    title={formatEffectTitle(e)}
+                                  >
+                                    {effectLabel(e.kind)}
+                                    {e.turnsRemaining != null ? (
+                                      <em className="piece-status-turns">{e.turnsRemaining}</em>
+                                    ) : null}
+                                  </i>
+                                ))}
+                                {extra > 0 ? (
+                                  <i
+                                    className="piece-status-badge tone-neutral"
+                                    title={statuses.slice(3).map(formatEffectTitle).join(', ')}
+                                  >
+                                    +{extra}
+                                  </i>
+                                ) : null}
+                              </span>
+                            );
+                          })()}
                         </span>
                       )}
                     </button>
@@ -866,26 +1132,39 @@ export default function App() {
               state.tokens.some((t) => t.kind === 'barrier' && t.owner === you) &&
               !state.pendingPrompt && (
                 <p className="hint barrier-hint">
-                  Tip: click a barrier to move it (<strong>Barrier Shift</strong>), or select an Enchanted Pawn and use
-                  the ability button.
+                  Tip: click a barrier to move it (<strong>Barrier Shift</strong>), then click again to confirm.
+                  Or select an Enchanted Pawn and use the ability button.
                 </p>
               )}
           </main>
 
           <aside className="side hand-side">
             <h2>Your hand</h2>
-            <div className="hand">
+            <div
+              className={`hand ${
+                state.phase === 'playing' && state.turn === you && state.turnPhase === 'move'
+                  ? 'hand-spell-locked'
+                  : ''
+              }`}
+            >
               {you &&
                 state.players[you].hand.map((c) => {
                   const meta = cardMeta(catalog, c.defId);
+                  const spellLocked =
+                    state.phase === 'playing' && state.turn === you && state.turnPhase === 'move';
                   return (
                     <button
                       key={c.instanceId}
                       type="button"
-                      className={`card ${selectedCard === c.instanceId ? 'active' : ''}`}
+                      className={`card ${selectedCard === c.instanceId ? 'active' : ''} ${spellLocked ? 'card-dimmed' : ''}`}
+                      disabled={spellLocked}
+                      title={spellLocked ? 'Spell phase skipped — cards available next turn' : undefined}
                       onClick={() => {
+                        if (spellLocked) return;
                         setSelectedCard(c.instanceId);
                         setPendingTargets([]);
+                        setSpellConfirm(null);
+                        clearBoardConfirm();
                       }}
                     >
                       <img src={meta?.image ?? '/cards/Back_Of_Card.png'} alt={meta?.name ?? c.defId} />
@@ -896,18 +1175,53 @@ export default function App() {
                 })}
             </div>
 
+            {spellConfirm && (
+              <div className="spell-confirm" role="dialog" aria-label="Confirm spell">
+                <p className="spell-confirm-summary">{spellConfirm.summary}</p>
+                <div className="spell-confirm-actions">
+                  <button type="button" className="primary" onClick={confirmSpell}>
+                    Confirm
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSpellConfirm(null);
+                      setStatus('Spell canceled — pick targets again if needed.');
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
             {state.phase === 'playing' && (
               <div className="row">
                 {((state.turn === you &&
                   state.turnPhase === 'spell' &&
                   state.players[you].spellsThisTurn < state.players[you].maxSpellsThisTurn) ||
                   (selectedCard && activeCardDef?.playOnOpponentTurn && state.turn !== you)) && (
-                  <button type="button" className="primary" onClick={castCard} disabled={!selectedCard}>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={castCard}
+                    disabled={!selectedCard || !!spellConfirm}
+                  >
                     Cast selected
                   </button>
                 )}
                 {state.turn === you && state.turnPhase === 'spell' && (
-                  <button type="button" onClick={() => send({ type: 'skip_spell' })}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      send({ type: 'skip_spell' });
+                      setSelectedCard(null);
+                      setPendingTargets([]);
+                      setSpellConfirm(null);
+                      clearBoardConfirm();
+                      setStatus('Spell phase skipped — move a piece.');
+                    }}
+                  >
                     Skip spell
                   </button>
                 )}
@@ -922,13 +1236,77 @@ export default function App() {
                     return target && p.class === target.class && p.id !== target.defId && p.class !== 'king' && p.class !== 'queen';
                   })
                   .map((p) => (
-                    <button key={p.id} type="button" onClick={() => finishCard([pendingTargets[0], p.id])}>
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => offerSpellConfirm([pendingTargets[0], p.id])}
+                    >
                       <PieceIcon defId={p.id} color={you ?? 'white'} className="sm" />
                       {p.name}
                     </button>
                   ))}
               </div>
             )}
+
+            {activeCardDef?.id === 'pawn_summon' &&
+              selectedCard &&
+              !spellConfirm &&
+              pendingTargets.length % 2 === 0 && (
+                <div className="variant-grid">
+                  <p className="hint">
+                    Choose pawn variant{' '}
+                    {Math.floor(pendingTargets.length / 2) + 1} of{' '}
+                    {Math.min(
+                      2,
+                      you ? state.players[you].graveyard.filter((g) => g.class === 'pawn').length : 0,
+                    )}
+                  </p>
+                  {catalog?.pieces
+                    .filter((p) => p.class === 'pawn')
+                    .map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => {
+                          setPendingTargets([...pendingTargets, p.id]);
+                          clearBoardConfirm();
+                          setSpellConfirm(null);
+                          setStatus(`Pick an empty allied square for ${p.name}`);
+                        }}
+                      >
+                        <PieceIcon defId={p.id} color={you ?? 'white'} className="sm" />
+                        {p.name}
+                      </button>
+                    ))}
+                </div>
+              )}
+
+            {activeCardDef?.targeting === 'graveyard' &&
+              selectedCard &&
+              !spellConfirm &&
+              pendingTargets.length === 0 &&
+              you && (
+                <div className="variant-grid">
+                  <p className="hint">Pick a fallen piece to revive</p>
+                  {state.players[you].graveyard.map((g, i) => (
+                    <button
+                      key={`${g.defId}-${i}`}
+                      type="button"
+                      onClick={() => {
+                        setPendingTargets([i]);
+                        clearBoardConfirm();
+                        setSpellConfirm(null);
+                        setStatus(
+                          `Revive ${pieceMeta(catalog, g.defId)?.name ?? g.defId}: pick an empty spawn square`,
+                        );
+                      }}
+                    >
+                      <PieceIcon defId={g.defId} color={you} className="sm" />
+                      {pieceMeta(catalog, g.defId)?.name ?? g.defId}
+                    </button>
+                  ))}
+                </div>
+              )}
 
             {activeCardDef && (
               <div className="card-details">
@@ -953,21 +1331,30 @@ export default function App() {
         <PieceInfoTile
           defId={inspectedPiece.defId}
           color={inspectedPiece.color}
+          locked={infoLocked}
           live={{
             charges: inspectedPiece.charges,
             ritualTurns: inspectedPiece.ritualTurns,
             gadgetUsed: inspectedPiece.gadgetUsed,
             abilityCooldown: inspectedPiece.abilityCooldown,
             bloodlust: inspectedPiece.bloodlust,
+            effects: inspectedPiece.effects,
           }}
-          onClose={() => setInspectedId(null)}
+          onClose={() => {
+            setInspectedId(null);
+            setHoveredId(null);
+          }}
         />
       )}
       {draftInspectDefId && (
         <PieceInfoTile
           defId={draftInspectDefId}
           color={you ?? 'white'}
-          onClose={() => setInspectedId(null)}
+          locked={Boolean(inspectedId?.startsWith('draft:'))}
+          onClose={() => {
+            setInspectedId(null);
+            setHoveredId(null);
+          }}
         />
       )}
       </div>
@@ -1005,6 +1392,7 @@ function PieceInfoTile({
   defId,
   color,
   live,
+  locked = false,
   onClose,
 }: {
   defId: string;
@@ -1015,7 +1403,9 @@ function PieceInfoTile({
     gadgetUsed?: boolean;
     abilityCooldown?: number;
     bloodlust?: boolean;
+    effects?: Array<{ id: string; kind: string; turnsRemaining?: number }>;
   };
+  locked?: boolean;
   onClose: () => void;
 }) {
   const info = getPieceInfo(defId);
@@ -1026,10 +1416,18 @@ function PieceInfoTile({
   }, [color, defId]);
 
   return (
-    <aside className={`piece-info-tile ${previewColor}`} aria-live="polite">
+    <aside
+      className={`piece-info-tile ${previewColor} ${locked ? 'is-locked' : 'is-hover'}`}
+      aria-live="polite"
+    >
       <button type="button" className="piece-info-close" onClick={onClose} aria-label="Close piece info">
         ×
       </button>
+      {locked ? (
+        <p className="piece-info-lock-badge">Locked</p>
+      ) : (
+        <p className="piece-info-lock-badge hover">Hover · click piece to lock</p>
+      )}
       <div className="piece-info-head">
         <div className="piece-info-icon-wrap">
           <PieceIcon defId={defId} color={previewColor} title={info.name} />
@@ -1096,6 +1494,11 @@ function PieceInfoTile({
             <span>Cooldown: {live.abilityCooldown}</span>
           )}
           {live.bloodlust && <span>Bloodlust</span>}
+          {live.effects?.map((e) => (
+            <span key={e.id} className={`live-effect tone-${effectTone(e.kind)}`}>
+              {formatEffectTitle(e)}
+            </span>
+          ))}
         </div>
       )}
     </aside>

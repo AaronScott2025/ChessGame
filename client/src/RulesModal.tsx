@@ -201,7 +201,8 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
               (20 half-turns).
             </p>
             <ul>
-              <li>At the start of each new day, both players draw a card.</li>
+              <li>At the start of each new day, both players draw <strong>2 cards</strong>.</li>
+              <li>At the end of a full day–night cycle, both players draw <strong>2 cards</strong>.</li>
               <li>Hand size is capped at <strong>5</strong>. Drawing at 5 means discard one card first.</li>
               <li>Some pieces only act by day or by night — see their entries.</li>
             </ul>

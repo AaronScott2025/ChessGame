@@ -43,7 +43,7 @@ function emptyPlayer(color: Color, name: string): PlayerState {
 }
 
 export function createLobbyState(roomCode: string, seed = Date.now()): GameState {
-  return {
+  const state: GameState = {
     roomCode,
     phase: 'lobby',
     boardSize: BOARD_SIZE,
@@ -63,11 +63,13 @@ export function createLobbyState(roomCode: string, seed = Date.now()): GameState
     draft: null,
     check: null,
     winner: null,
-    history: ['Room created. Waiting for players…'],
+    history: [],
     snapshots: [],
     pendingPrompt: null,
     rngSeed: seed,
   };
+  log(state, 'Room created. Waiting for players…');
+  return state;
 }
 
 export function startDraft(state: GameState): GameState {
@@ -1015,10 +1017,12 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
 
   const rng = mulberry32(next.rngSeed + next.turnCount * 31);
   const result = def.play({ state: next, player: color, card, rng }, targets);
+  // Cards may replace the whole board (e.g. Rewind) — always honor returned state
+  const out = result.state;
 
   if (!result.done) {
-    if (!next.pendingPrompt) {
-      next.pendingPrompt = {
+    if (!out.pendingPrompt) {
+      out.pendingPrompt = {
         type: 'card_target',
         color,
         cardInstanceId: instanceId,
@@ -1028,30 +1032,31 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
         selected: targets,
       };
     }
-    return next;
+    return out;
   }
 
-  // consume
-  const idx = player.hand.findIndex((c) => c.instanceId === instanceId);
+  // Consume if still in hand (Rewind removes itself on the restored board)
+  const outPlayer = out.players[color];
+  const idx = outPlayer.hand.findIndex((c) => c.instanceId === instanceId);
   if (idx >= 0) {
-    const [used] = player.hand.splice(idx, 1);
-    next.discardPile.push(used);
+    const [used] = outPlayer.hand.splice(idx, 1);
+    out.discardPile.push(used);
+    outPlayer.spellsThisTurn += 1;
   }
-  player.spellsThisTurn += 1;
-  player.lastPlayedCardDefId = def.id;
-  log(next, `${color} played ${def.name}`);
+  outPlayer.lastPlayedCardDefId = def.id;
+  log(out, `${color} played ${def.name}`);
 
-  // One spell per turn (unless an effect raised the cap): leave spell phase when spent
-  if (!isOppTurn && player.spellsThisTurn >= player.maxSpellsThisTurn) {
-    next.turnPhase = 'move';
+  // One spell per turn: leave spell phase when spent
+  if (!isOppTurn && outPlayer.spellsThisTurn >= outPlayer.maxSpellsThisTurn) {
+    out.turnPhase = 'move';
   }
 
-  if (isInCheck(next, opposite(color))) {
-    next.check = opposite(color);
-    log(next, 'Check from spell — turn passes');
-    return endTurn(next, next.turn, true);
+  if (isInCheck(out, opposite(color))) {
+    out.check = opposite(color);
+    log(out, 'Check from spell — turn passes');
+    return endTurn(out, out.turn, true);
   }
-  return next;
+  return out;
 }
 
 export function resolvePrompt(state: GameState, color: Color, payload: unknown): GameState {
@@ -1310,9 +1315,9 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
       next.dayNight = next.dayNight === 'day' ? 'night' : 'day';
       log(next, `It is now ${next.dayNight}`);
       if (next.dayNight === 'day') {
-        // first day of cycle both draw
+        // first day of cycle both draw 2
         for (const c of ['white', 'black'] as Color[]) {
-          tryDrawWithHandLimit(next, c);
+          tryDrawWithHandLimit(next, c, 2);
         }
       }
       // reaper gains charge at night if alive; ghosts unlock permanently
@@ -1328,7 +1333,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
       }
     }
     if (next.cycleCount % 10 === 0) {
-      for (const c of ['white', 'black'] as Color[]) tryDrawWithHandLimit(next, c);
+      for (const c of ['white', 'black'] as Color[]) tryDrawWithHandLimit(next, c, 2);
     }
   }
 
@@ -1370,17 +1375,19 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
   return next;
 }
 
-function tryDrawWithHandLimit(state: GameState, color: Color): void {
-  const p = state.players[color];
-  if (p.hand.length >= 5) {
-    state.pendingPrompt = {
-      type: 'discard_to_draw',
-      color,
-      message: 'Hand full — discard a card to draw',
-    };
-    return;
+function tryDrawWithHandLimit(state: GameState, color: Color, times = 1): void {
+  for (let i = 0; i < times; i++) {
+    const p = state.players[color];
+    if (p.hand.length >= 5) {
+      state.pendingPrompt = {
+        type: 'discard_to_draw',
+        color,
+        message: `Hand full — discard a card to draw (${times - i} remaining)`,
+      };
+      return;
+    }
+    drawCard(state, color);
   }
-  drawCard(state, color);
 }
 
 function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
@@ -1417,6 +1424,8 @@ function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
             piece.effects.push({
               id: `mp_${piece.id}`,
               kind: 'mathematical',
+              turnsRemaining: Number(e.data?.duration ?? 2),
+              sourceCardId: 'mathematical',
             });
           } else if (e.kind === 'enchant_ritual') {
             // success

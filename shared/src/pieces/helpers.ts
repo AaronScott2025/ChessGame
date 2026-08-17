@@ -120,28 +120,32 @@ export function knightMoves(
     for (const [dr, dc] of deltas) {
       const to = { row: piece.pos.row + dr, col: piece.pos.col + dc };
       if (!inBounds(to)) continue;
-      if (!canJump) {
-        // simplified blocked check along longer axis first
-        const stepR = Math.sign(dr);
-        const stepC = Math.sign(dc);
-        let blocked = false;
-        if (Math.abs(dr) > Math.abs(dc)) {
-          for (let i = 1; i < Math.abs(dr); i++) {
-            if (pieceAt(state, { row: piece.pos.row + stepR * i, col: piece.pos.col })) {
-              blocked = true;
-              break;
-            }
-          }
-        } else {
-          for (let i = 1; i < Math.abs(dc); i++) {
-            if (pieceAt(state, { row: piece.pos.row, col: piece.pos.col + stepC * i })) {
-              blocked = true;
-              break;
-            }
+      // Path check along the long leg first (simplified L path).
+      // Barriers always block; pieces block unless canJump (Horse / Snake bloodlust).
+      const stepR = Math.sign(dr);
+      const stepC = Math.sign(dc);
+      let blocked = false;
+      const pathBlocked = (pos: Coord) => {
+        if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, pos))) return true;
+        if (!canJump && pieceAt(state, pos)) return true;
+        return false;
+      };
+      if (Math.abs(dr) > Math.abs(dc)) {
+        for (let i = 1; i < Math.abs(dr); i++) {
+          if (pathBlocked({ row: piece.pos.row + stepR * i, col: piece.pos.col })) {
+            blocked = true;
+            break;
           }
         }
-        if (blocked) continue;
+      } else {
+        for (let i = 1; i < Math.abs(dc); i++) {
+          if (pathBlocked({ row: piece.pos.row, col: piece.pos.col + stepC * i })) {
+            blocked = true;
+            break;
+          }
+        }
       }
+      if (blocked) continue;
       const opt = emptyOrEnemy(state, to, piece.color);
       if (opt) moves.push(opt);
     }

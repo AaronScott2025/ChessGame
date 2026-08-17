@@ -181,12 +181,18 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'prince_princess',
     name: 'Prince & Princess',
     classLabel: 'Wildcard',
-    movement: ['Moves up to 3 orthogonally, or 1 diagonally.'],
+    movement: [
+      'Moves up to 3 orthogonally, or 1 diagonally.',
+      'Cannot move over pieces (path must be clear for the piece you move).',
+    ],
     abilities: [
       'Dance of Romance: moving one mirrors the other (horizontal directions reverse).',
       "True Love's Gambit: if one dies, the other falls too.",
     ],
-    misc: ['Both mirrored destinations must be legal.'],
+    misc: [
+      'If the piece you move has a clear straight-line path, its partner mirrors to the matching square even if other pieces stand in that partner’s way.',
+      'The mirrored destination must still be on the board and cannot land on an allied piece.',
+    ],
   },
   demon: {
     id: 'demon',

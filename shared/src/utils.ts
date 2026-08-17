@@ -162,7 +162,13 @@ export function shuffleInPlace<T>(arr: T[], rng: () => number): T[] {
 }
 
 export function log(state: GameState, message: string): void {
-  state.history.unshift(message);
+  const ts = new Date().toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  state.history.unshift(`[${ts}] ${message}`);
   if (state.history.length > 80) state.history.length = 80;
 }
 

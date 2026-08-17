@@ -39,9 +39,19 @@ export function useKnowledgeEnabled() {
   return { knowledgeEnabled, setKnowledgeEnabled };
 }
 
-export function CosmicBackdrop({ enabled }: { enabled: boolean }) {
+export function CosmicBackdrop({
+  enabled,
+  dayNight = 'day',
+}: {
+  enabled: boolean;
+  dayNight?: 'day' | 'night' | string;
+}) {
+  const cycle = dayNight === 'night' ? 'cycle-night' : 'cycle-day';
   return (
-    <div className={`cosmic-backdrop ${enabled ? 'is-on' : 'is-off'}`} aria-hidden>
+    <div
+      className={`cosmic-backdrop ${enabled ? 'is-on' : 'is-off'} ${cycle}`}
+      aria-hidden
+    >
       <div className="cosmic-nebula cosmic-nebula-a" />
       <div className="cosmic-nebula cosmic-nebula-b" />
       <div className="cosmic-nebula cosmic-nebula-c" />
