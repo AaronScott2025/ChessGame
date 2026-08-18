@@ -208,6 +208,11 @@ export function isInvincible(piece: PieceState): boolean {
   return Boolean(hasEffect(piece, 'invincible') || hasEffect(piece, 'pause'));
 }
 
+/** Spell cards unlock at the first night (after 5 mutual turn cycles) and stay available thereafter. */
+export function spellsUnlocked(state: { cycleCount: number; dayNight: string }): boolean {
+  return state.cycleCount >= 5 || state.dayNight === 'night';
+}
+
 export function barriersAdjacent(state: GameState, pos: Coord): boolean {
   return state.tokens.some((t) => {
     if (t.kind !== 'barrier') return false;

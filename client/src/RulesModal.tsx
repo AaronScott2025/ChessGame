@@ -172,6 +172,7 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
                 Once, during this opening only, you may discard one card to draw a replacement. If you waive
                 it, you cannot exchange later.
               </li>
+              <li>You cannot cast those cards until the first night of the game.</li>
             </ul>
           </section>
 
@@ -181,7 +182,8 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
               <li>
                 <strong>Spell</strong> — Optionally cast one spell. Instant effects discard when finished;
                 lasting effects stay face-up. You may only cast one spell per turn unless an effect says
-                otherwise.
+                otherwise. Spell cards cannot be used until the <strong>first night</strong>; after that they
+                work as normal.
               </li>
               <li>
                 <strong>Movement</strong> — Move or activate exactly one piece, then the turn ends.
@@ -202,8 +204,10 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
             </p>
             <ul>
               <li>At the start of each new day, both players draw <strong>2 cards</strong>.</li>
-              <li>At the end of a full day–night cycle, both players draw <strong>2 cards</strong>.</li>
-              <li>Hand size is capped at <strong>5</strong>. Drawing at 5 means discard one card first.</li>
+              <li>Hand size is capped at <strong>5</strong>. If a draw would go over 5, you still see the card, then must discard down to 5 before anything else.</li>
+              <li>
+                Spell cards stay in your hand from the opening, but cannot be cast until the first night.
+              </li>
               <li>Some pieces only act by day or by night — see their entries.</li>
             </ul>
           </section>

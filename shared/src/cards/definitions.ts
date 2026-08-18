@@ -1,4 +1,4 @@
-import type { Coord } from '../types.js';
+import type { Coord, GameState, PieceState } from '../types.js';
 import {
   addEffect,
   barriersAdjacent,
@@ -19,6 +19,47 @@ import { registerCard, requirePiece } from './registry.js';
 
 function uid(prefix: string) {
   return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function swapSubjects(state: GameState, piece: PieceState, newDefId: string): PieceState[] {
+  const subjects: PieceState[] = [piece];
+  const add = (p: PieceState | undefined) => {
+    if (p && !subjects.some((s) => s.id === p.id)) subjects.push(p);
+  };
+  if (piece.linkedPieceId) {
+    add(state.pieces.find((p) => p.id === piece.linkedPieceId));
+  }
+  if (piece.defId === 'prince_princess' || newDefId === 'prince_princess') {
+    for (const p of state.pieces) {
+      if (p.color === piece.color && p.class === 'wildcard' && p.id !== piece.id) add(p);
+    }
+  }
+  return subjects;
+}
+
+function applyVariantSwap(state: GameState, piece: PieceState, newDefId: string): void {
+  const def = getPieceDef(newDefId);
+  if (def.class !== piece.class) throw new Error('Must be same class');
+  if (def.id === piece.defId) throw new Error('Must be different variant');
+  const fromName = getPieceDef(piece.defId).name;
+  const subjects = swapSubjects(state, piece, def.id);
+  for (const p of subjects) {
+    if (endBestBuddy(state, p, p.pos)) log(state, 'Best Buddy ended');
+    p.defId = def.id;
+    p.class = def.class;
+    p.linkedPieceId = undefined;
+    if (def.id === 'reaper') p.charges = p.charges ?? 0;
+    if (def.id !== 'snake') p.bloodlust = undefined;
+    p.pos = { row: -99, col: -99 };
+  }
+  for (const p of subjects) {
+    p.pos = nearestEmptyAround(state, p.startPos) ?? { ...p.startPos };
+  }
+  if (def.id === 'prince_princess' && subjects.length >= 2) {
+    subjects[0].linkedPieceId = subjects[1].id;
+    subjects[1].linkedPieceId = subjects[0].id;
+  }
+  log(state, `Swapped ${fromName} → ${def.name}`);
 }
 
 registerCard({
@@ -479,9 +520,9 @@ registerCard({
   id: 'swap',
   name: 'Swap',
   description: [
-    'Swap a non-king non-queen piece with a different variant.',
-    'Pieces must be in play.',
-    'Piece returns to that piece\'s starting point.',
+    'Swap a non-king non-queen piece with a different variant of the same class.',
+    'Prince & Princess swap together (both become the new variant).',
+    'Each swapped piece returns to its starting square.',
   ],
   image: '/cards/Swap.png',
   targeting: 'allied_piece',
@@ -492,13 +533,8 @@ registerCard({
     if (piece.color !== ctx.player) throw new Error('Allied only');
     if (piece.class === 'king' || piece.class === 'queen') throw new Error('Cannot swap king/queen');
     const newDefId = targets[1] as string;
-    const def = getPieceDef(newDefId);
-    if (def.class !== piece.class) throw new Error('Must be same class');
-    if (def.id === piece.defId) throw new Error('Must be different variant');
-    piece.defId = def.id;
-    if (endBestBuddy(ctx.state, piece, piece.pos)) log(ctx.state, 'Best Buddy ended');
-    piece.pos = nearestEmptyAround(ctx.state, piece.startPos) ?? piece.startPos;
-    // clear start occupancy conflict already handled
+    applyVariantSwap(ctx.state, piece, newDefId);
+    if (piece.class === 'wildcard') ctx.state.players[ctx.player].army.wildcard = newDefId;
     return { state: ctx.state, done: true };
   },
 });

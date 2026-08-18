@@ -64,9 +64,9 @@ export function buildDeck(seed: number): CardInstance[] {
   return shuffleInPlace(deck, rng);
 }
 
-export function drawCard(state: GameState, color: Color, opts?: { avoidRally?: boolean; avoidDupes?: boolean }): CardInstance | null {
+export function drawCard(state: GameState, color: Color, opts?: { avoidRally?: boolean; avoidDupes?: boolean; ignoreLimit?: boolean }): CardInstance | null {
   const player = state.players[color];
-  if (player.hand.length >= MAX_HAND) return null;
+  if (!opts?.ignoreLimit && player.hand.length >= MAX_HAND) return null;
 
   const tryDraw = (): CardInstance | null => {
     if (!state.deck.length) {

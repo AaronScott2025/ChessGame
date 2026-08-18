@@ -1,9 +1,9 @@
-import type { Color, Coord, GameState, PieceState, PlayerState } from '../types.js';
-import { BOARD_SIZE } from '../types.js';
+import type { Color, Coord, GameState, PendingPrompt, PieceState, PlayerState } from '../types.js';
+import { BOARD_SIZE, MAX_HAND } from '../types.js';
 import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS } from '../pieces/index.js';
 import type { MoveOption } from '../pieces/helpers.js';
 import { isKnightLanding, isPigLShape } from '../pieces/helpers.js';
-import { buildDeck, drawCard, getCardDef } from '../cards/index.js';
+import { buildDeck, discardCard, drawCard, getCardDef } from '../cards/index.js';
 import {
   addEffect,
   backRow,
@@ -26,7 +26,86 @@ import {
   sameCoord,
   shuffleInPlace,
   movementBonus,
+  spellsUnlocked,
 } from '../utils.js';
+
+function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
+  const chooser =
+    prompt.type === 'gambler_choice' && prompt.roll <= 4 ? opposite(prompt.color) : prompt.color;
+  const yours = chooser === color;
+
+  switch (prompt.type) {
+    case 'discard_to_draw':
+      return yours
+        ? 'Discard a card from the full-hand popup first'
+        : 'Waiting for opponent to discard a card (hand is full)';
+    case 'promote':
+      return yours ? 'Choose a promotion first' : 'Waiting for opponent to choose a promotion';
+    case 'card_target': {
+      const name = getCardDef(prompt.cardDefId)?.name ?? 'spell';
+      return yours
+        ? `Finish choosing targets for ${name} first`
+        : `Waiting for opponent to finish targeting ${name}`;
+    }
+    case 'opening_mulligan':
+      return yours
+        ? 'Keep or redraw your opening hand first'
+        : 'Waiting for opponent to finish their opening hand';
+    case 'gambler_choice': {
+      const cardName = prompt.cardDefId === 'gamblers_delight' ? "Gambler's Delight" : "Gambler's Gambit";
+      if (prompt.roll <= 4) {
+        return yours
+          ? `Click a highlighted piece on the board to remove it (${cardName})`
+          : `Waiting for opponent to choose a piece to remove (${cardName})`;
+      }
+      if (prompt.roll >= 7 && prompt.roll <= 9) {
+        return yours
+          ? `Choose a piece type to immobilize first (${cardName})`
+          : `Waiting for opponent to choose a piece type (${cardName})`;
+      }
+      return yours
+        ? `Confirm the ${cardName} result first`
+        : `Waiting for opponent to confirm ${cardName}`;
+    }
+    case 'opponent_choose_piece':
+      return yours
+        ? prompt.message || 'Choose a piece on the board first'
+        : 'Waiting for opponent to choose a piece';
+    case 'ability_target':
+      if (prompt.abilityId === 'enchant') {
+        return yours
+          ? 'Click an adjacent piece to Enchant first'
+          : 'Waiting for opponent to choose an Enchant target';
+      }
+      if (prompt.abilityId === 'revive') {
+        return yours
+          ? 'Choose a fallen piece to revive first'
+          : 'Waiting for opponent to choose a piece to revive';
+      }
+      if (prompt.abilityId === 'barrier_shift') {
+        return yours
+          ? 'Finish Barrier Shift: pick a barrier, then a destination'
+          : 'Waiting for opponent to finish Barrier Shift';
+      }
+      return yours
+        ? prompt.message || 'Finish the ability choice first'
+        : 'Waiting for opponent to finish their ability';
+    case 'gadget_choice':
+      return yours
+        ? 'Choose a gadget type, then click an adjacent empty square'
+        : 'Waiting for opponent to place a gadget';
+    case 'spring_bounce':
+      return yours
+        ? 'Choose a Spring Board bounce square first (exactly 2 tiles)'
+        : 'Waiting for opponent to bounce off the Spring Board';
+    case 'gnome_hole_travel':
+      return yours
+        ? 'Choose a Gnome Hole destination first, or skip'
+        : 'Waiting for opponent to choose a Gnome Hole destination';
+    default:
+      return yours ? 'Finish the current choice first' : 'Waiting for opponent to finish their choice';
+  }
+}
 
 function emptyPlayer(color: Color, name: string): PlayerState {
   return {
@@ -224,9 +303,9 @@ export function openingKeep(state: GameState, color: Color): GameState {
     next.pendingPrompt = null;
     next.phase = 'playing';
     next.turn = 'white';
-    next.turnPhase = 'spell';
+    next.turnPhase = spellsUnlocked(next) ? 'spell' : 'move';
     pushSnapshot(next);
-    log(next, 'Game start — White to play.');
+    log(next, 'Game start — White to play. Spell cards unlock at the first night.');
   }
   return next;
 }
@@ -470,7 +549,7 @@ export function useAbility(
       state.pendingPrompt.type === 'ability_target' &&
       state.pendingPrompt.abilityId === 'barrier_shift' &&
       Boolean(targets && typeof targets === 'object' && 'from' in (targets as object) && 'to' in (targets as object));
-    if (!finishingBarrier) throw new Error('Resolve pending prompt first');
+    if (!finishingBarrier) throw new Error(pendingPromptBusyMessage(state.pendingPrompt, color));
   }
 
   const next = cloneState(state);
@@ -796,7 +875,7 @@ export function applyMove(
   if (state.turnPhase !== 'move' && state.turnPhase !== 'spell') {
     // allow move after skipping spell; turnPhase should be move
   }
-  if (state.pendingPrompt) throw new Error('Resolve pending prompt first');
+  if (state.pendingPrompt) throw new Error(pendingPromptBusyMessage(state.pendingPrompt, color));
 
   const next = cloneState(state);
   if (next.turnPhase === 'spell') {
@@ -1095,7 +1174,7 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
   // prince princess true love
   if (piece.defId === 'prince_princess' && piece.linkedPieceId) {
     const other = state.pieces.find((p) => p.id === piece.linkedPieceId);
-    if (other) {
+    if (other && other.defId === 'prince_princess') {
       state.pieces = state.pieces.filter((p) => p.id !== other.id);
       state.players[other.color].graveyard.push({ defId: other.defId, class: other.class });
       log(state, 'True Love\'s Gambit — both fall');
@@ -1112,6 +1191,7 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
 }
 
 export function skipSpell(state: GameState, color: Color): GameState {
+  if (state.pendingPrompt) throw new Error(pendingPromptBusyMessage(state.pendingPrompt, color));
   if (state.turn !== color || state.turnPhase !== 'spell') throw new Error('Cannot skip spell now');
   const next = cloneState(state);
   next.turnPhase = 'move';
@@ -1125,7 +1205,20 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
   if (!card) throw new Error('Card not in hand');
   const def = getCardDef(card.defId);
 
+  if (next.pendingPrompt) {
+    const prompt = next.pendingPrompt;
+    if (prompt.type === 'card_target' && prompt.color === color && prompt.cardInstanceId === instanceId) {
+      next.pendingPrompt = null;
+      if (!targets.length) targets = prompt.selected;
+      else if (targets.length === 1 && prompt.selected.length) {
+        targets = [...prompt.selected, ...targets];
+      }
+    } else {
+      throw new Error(pendingPromptBusyMessage(prompt, color));
+    }
+  }
   const isOppTurn = next.turn !== color;
+  if (!spellsUnlocked(next)) throw new Error('Spell cards cannot be used until the first night');
   if (isOppTurn && !def.playOnOpponentTurn) throw new Error('Cannot play that on opponent turn');
   if (!isOppTurn && next.turnPhase !== 'spell') {
     throw new Error('Spell phase only');
@@ -1225,11 +1318,16 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
   }
 
   if (prompt.type === 'gambler_choice') {
-    if (prompt.color !== color && prompt.cardDefId === 'gamblers_gambit') {
-      // some rolls need opponent — handled via payload shape
+    const cardPlayer = prompt.color;
+    const roll = prompt.roll ?? 0;
+    if (roll <= 4) {
+      if (color === cardPlayer) throw new Error('Waiting for opponent');
+      if (color !== opposite(cardPlayer)) throw new Error('Not your prompt');
+    } else if (color !== cardPlayer) {
+      throw new Error('Not your prompt');
     }
     next.pendingPrompt = null;
-    applyGambler(next, prompt.cardDefId, prompt.roll, color, payload);
+    applyGambler(next, prompt.cardDefId, roll, cardPlayer, payload);
     const inst = (prompt as { _instanceId?: string })._instanceId;
     if (inst) {
       const idx = next.players[prompt.color].hand.findIndex((c) => c.instanceId === inst);
@@ -1248,10 +1346,17 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
   if (prompt.type === 'discard_to_draw') {
     if (prompt.color !== color) throw new Error('Not your prompt');
     const instanceId = payload as string;
-    const idx = next.players[color].hand.findIndex((c) => c.instanceId === instanceId);
-    if (idx >= 0) next.discardPile.push(...next.players[color].hand.splice(idx, 1));
+    if (!next.players[color].hand.some((c) => c.instanceId === instanceId)) {
+      throw new Error('Card not in hand');
+    }
+    if (next.players[color].hand.length <= MAX_HAND) throw new Error('No discard needed');
+    discardCard(next, color, instanceId);
+    const remaining = prompt.remaining ?? 0;
+    const queued = prompt.queuedDraws ?? [];
     next.pendingPrompt = null;
-    drawCard(next, color);
+    log(next, `${color} discarded to make room in hand`);
+    tryDrawWithHandLimit(next, color, remaining);
+    for (const q of queued) tryDrawWithHandLimit(next, q.color, q.remaining);
     return next;
   }
 
@@ -1342,21 +1447,21 @@ function applyGambler(
   state: GameState,
   cardDefId: string,
   roll: number,
-  actor: Color,
+  cardPlayer: Color,
   payload: unknown,
 ): void {
   if (cardDefId === 'gamblers_gambit') {
     if (roll <= 4) {
       const pieceId = payload as string;
-      const piece = state.pieces.find((p) => p.id === pieceId && p.color === actor);
+      const piece = state.pieces.find((p) => p.id === pieceId && p.color === cardPlayer);
       if (!piece || piece.class === 'king' || piece.class === 'queen') throw new Error('Invalid loss');
-      removePiece(state, piece, opposite(actor));
+      removePiece(state, piece, opposite(cardPlayer));
     } else if (roll <= 6) {
-      state.players[actor].skipTurns += 1;
+      state.players[cardPlayer].skipTurns += 1;
     } else if (roll <= 9) {
       const cls = payload as string;
       for (const p of state.pieces) {
-        if (p.color !== actor && p.class === cls) {
+        if (p.color !== cardPlayer && p.class === cls) {
           p.effects.push({ id: `imm_${p.id}`, kind: 'immobilized', turnsRemaining: 2 });
         }
       }
@@ -1366,15 +1471,15 @@ function applyGambler(
       // self revive
     } else if (roll === 12) {
       const spot = nearestEmptyAround(state, {
-        row: frontRow(actor),
+        row: frontRow(cardPlayer),
         col: 4,
       });
       if (spot) {
         state.pieces.push({
-          id: `bonus_queen_${actor}`,
+          id: `bonus_queen_${cardPlayer}`,
           defId: 'queen',
           class: 'queen',
-          color: actor,
+          color: cardPlayer,
           pos: spot,
           hasMoved: false,
           startPos: spot,
@@ -1387,8 +1492,10 @@ function applyGambler(
     if (roll <= 4) {
       const pieceId = payload as string | null;
       if (pieceId) {
-        const piece = state.pieces.find((p) => p.id === pieceId && p.color === actor && p.class === 'pawn');
-        if (piece) removePiece(state, piece, opposite(actor));
+        const piece = state.pieces.find(
+          (p) => p.id === pieceId && p.color === cardPlayer && p.class === 'pawn',
+        );
+        if (piece) removePiece(state, piece, opposite(cardPlayer));
       }
     } else if (roll <= 6) {
       log(state, 'Gambler\'s Delight: nothing happens');
@@ -1400,13 +1507,13 @@ function applyGambler(
         }
       }
     } else if (roll === 12) {
-      const spot = nearestEmptyAround(state, { row: frontRow(actor), col: 5 });
+      const spot = nearestEmptyAround(state, { row: frontRow(cardPlayer), col: 5 });
       if (spot) {
         state.pieces.push({
-          id: `bonus_queen2_${actor}`,
+          id: `bonus_queen2_${cardPlayer}`,
           defId: 'angel',
           class: 'queen',
-          color: actor,
+          color: cardPlayer,
           pos: spot,
           hasMoved: false,
           startPos: spot,
@@ -1453,13 +1560,14 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
       next.dayNight = next.dayNight === 'day' ? 'night' : 'day';
       log(next, `It is now ${next.dayNight}`);
       if (next.dayNight === 'day') {
-        // first day of cycle both draw 2
         for (const c of ['white', 'black'] as Color[]) {
           tryDrawWithHandLimit(next, c, 2);
         }
+        log(next, 'New day — both players draw 2');
       }
       // reaper gains charge at night if alive; ghosts unlock permanently
       if (next.dayNight === 'night') {
+        if (next.cycleCount === 5) log(next, 'First night — spell cards are now available');
         for (const p of next.pieces) {
           if (p.defId === 'reaper' && (p.disabledTurns ?? 0) <= 0) {
             p.charges = (p.charges ?? 0) + 1;
@@ -1469,9 +1577,6 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
           }
         }
       }
-    }
-    if (next.cycleCount % 10 === 0) {
-      for (const c of ['white', 'black'] as Color[]) tryDrawWithHandLimit(next, c, 2);
     }
   }
 
@@ -1492,7 +1597,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
   }
 
   next.turn = nextColor;
-  next.turnPhase = 'spell';
+  next.turnPhase = spellsUnlocked(next) ? 'spell' : 'move';
   next.players[nextColor].maxSpellsThisTurn = 1;
 
   pushSnapshot(next);
@@ -1514,17 +1619,28 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
 }
 
 function tryDrawWithHandLimit(state: GameState, color: Color, times = 1): void {
+  if (times <= 0) return;
+  if (state.pendingPrompt?.type === 'discard_to_draw') {
+    const prompt = state.pendingPrompt;
+    prompt.queuedDraws = [...(prompt.queuedDraws ?? []), { color, remaining: times }];
+    return;
+  }
+
   for (let i = 0; i < times; i++) {
-    const p = state.players[color];
-    if (p.hand.length >= 5) {
+    const card = drawCard(state, color, { ignoreLimit: true });
+    if (!card) return;
+    if (state.players[color].hand.length > MAX_HAND) {
       state.pendingPrompt = {
         type: 'discard_to_draw',
         color,
-        message: `Hand full — discard a card to draw (${times - i} remaining)`,
+        drawnInstanceId: card.instanceId,
+        remaining: times - i - 1,
+        queuedDraws: [],
+        message: 'You drew a card with a full hand — discard one to continue.',
       };
+      log(state, `${color} drew with a full hand and must discard`);
       return;
     }
-    drawCard(state, color);
   }
 }
 

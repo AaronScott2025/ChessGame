@@ -154,6 +154,9 @@ export type PendingPrompt =
       type: 'discard_to_draw';
       color: Color;
       message: string;
+      drawnInstanceId: string;
+      remaining: number;
+      queuedDraws?: Array<{ color: Color; remaining: number }>;
     }
   | {
       type: 'opening_mulligan';

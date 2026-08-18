@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { listMoves as engineListMoves, availableAbilities as engineAbilities } from '@shared/engine/game.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
+import { spellsUnlocked } from '@shared/utils.ts';
 import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
 import {
   AudioToggles,
@@ -100,6 +101,8 @@ interface GameState {
     roll?: number;
     selected?: unknown[];
     cardInstanceId?: string;
+    drawnInstanceId?: string;
+    remaining?: number;
     abilityId?: string;
     from?: Coord;
   };
@@ -367,7 +370,29 @@ export default function App() {
     return { barriers, destinations, fromKey };
   }, [state, you]);
 
+  const gamblerChoiceHighlights = useMemo(() => {
+    const targets = new Set<string>();
+    if (!state || !you) return targets;
+    const prompt = state.pendingPrompt;
+    if (prompt?.type !== 'gambler_choice') return targets;
+    const roll = prompt.roll ?? 0;
+    if (roll > 4 || you === prompt.color) return targets;
+    for (const p of state.pieces) {
+      if (p.color !== prompt.color) continue;
+      if (prompt.cardDefId === 'gamblers_gambit') {
+        if (p.class === 'king' || p.class === 'queen') continue;
+      } else if (prompt.cardDefId === 'gamblers_delight') {
+        if (p.class !== 'pawn') continue;
+      } else {
+        continue;
+      }
+      targets.add(`${p.pos.row},${p.pos.col}`);
+    }
+    return targets;
+  }, [state, you]);
+
   const targetNeeded = activeCardDef?.targeting && activeCardDef.targeting !== 'none';
+  const canCastSpells = Boolean(state && spellsUnlocked(state));
 
   const clearBoardConfirm = () => {
     setConfirmKey(null);
@@ -480,10 +505,28 @@ export default function App() {
 
   const onSquareClick = (row: number, col: number) => {
     if (!state || !you) return;
+    if (state.pendingPrompt?.type === 'discard_to_draw') return;
     playPieceSfx();
     const squareKey = `${row},${col}`;
 
     const prompt = state.pendingPrompt;
+    if (prompt?.type === 'gambler_choice') {
+      const roll = prompt.roll ?? 0;
+      const cardPlayer = prompt.color;
+      if (roll <= 4 && you !== cardPlayer) {
+        const piece = board[row][col];
+        if (!piece || piece.color !== cardPlayer || !gamblerChoiceHighlights.has(squareKey)) {
+          setStatus('Click one of the highlighted enemy pieces');
+          return;
+        }
+        const name = pieceMeta(catalog, piece.defId)?.name ?? piece.defId;
+        const summary = `Remove ${name}?`;
+        setSpellConfirm({ summary, mode: 'resolve_prompt', payload: piece.id });
+        setStatus(summary);
+        clearBoardConfirm();
+        return;
+      }
+    }
     if (prompt && prompt.color === you) {
       if (prompt.type === 'gadget_choice' && gadgetKind) {
         armOrConfirm(squareKey, 'Place gadget here', () => {
@@ -581,7 +624,7 @@ export default function App() {
       }
     }
 
-    if (selectedCard && targetNeeded) {
+    if (selectedCard && targetNeeded && canCastSpells) {
       const mode = activeCardDef!.targeting;
 
       // Revive: after choosing a graveyard index, pick spawn square
@@ -705,7 +748,7 @@ export default function App() {
     }
 
     const piece = board[row][col];
-    if (piece && selectedCard && targetNeeded) {
+    if (piece && selectedCard && targetNeeded && canCastSpells) {
       const mode = activeCardDef!.targeting;
       if (['piece', 'allied_piece', 'any_piece_non_king', 'enemy_piece', 'multi_allied'].includes(mode)) {
         if (mode === 'allied_piece' && piece.color !== you) return;
@@ -737,14 +780,11 @@ export default function App() {
           return;
         }
         if (activeCardDef!.id === 'swap') {
-          const next = [...pendingTargets, piece.id];
-          setPendingTargets(next);
+          setPendingTargets([piece.id]);
           clearBoardConfirm();
           setSpellConfirm(null);
-          if (next.length === 1) {
-            setStatus('Swap: pick a different variant id from the buttons below');
-            return;
-          }
+          setStatus('Swap: pick a different variant from the buttons below');
+          return;
         }
         offerSpellConfirm([piece.id]);
         return;
@@ -786,6 +826,10 @@ export default function App() {
 
   const castCard = () => {
     if (!selectedCard || !activeCardDef) return;
+    if (!state || !spellsUnlocked(state)) {
+      setError('Spell cards cannot be used until the first night');
+      return;
+    }
     if (activeCardDef.targeting === 'none') {
       offerSpellConfirm([]);
       return;
@@ -910,6 +954,16 @@ export default function App() {
   return (
     <div className="shell">
       <CosmicBackdrop enabled={fxEnabled} dayNight={state.dayNight} />
+      {state.pendingPrompt?.type === 'discard_to_draw' && (
+        <DiscardToDrawOverlay
+          key={state.pendingPrompt.drawnInstanceId}
+          prompt={state.pendingPrompt}
+          you={you!}
+          state={state}
+          catalog={catalog}
+          onDiscard={(instanceId) => send({ type: 'resolve_prompt', payload: instanceId })}
+        />
+      )}
       {(state.phase === 'playing' && state.turn !== you) ||
       (state.phase === 'opening_draw' &&
         state.pendingPrompt?.type === 'opening_mulligan' &&
@@ -964,7 +1018,11 @@ export default function App() {
       {state.phase === 'playing' && state.turn === you && (
         <div className="turn-banner turn-yours" role="status">
           <strong>Your turn</strong>
-          <span> — cast a spell or move a piece ({state.turnPhase})</span>
+          <span>
+            {spellsUnlocked(state)
+              ? ` — cast a spell or move a piece (${state.turnPhase})`
+              : ' — move a piece (spell cards unlock at the first night)'}
+          </span>
         </div>
       )}
 
@@ -1210,6 +1268,7 @@ export default function App() {
                   const barrierPick = barrierShiftHighlights.barriers.has(key);
                   const barrierFrom = barrierShiftHighlights.fromKey === key;
                   const barrierDest = barrierShiftHighlights.destinations.has(key);
+                  const gamblerTarget = gamblerChoiceHighlights.has(key);
                   const toks = state.tokens.filter((t) => t.pos.row === row && t.pos.col === col);
                   const meta = piece ? pieceMeta(catalog, piece.defId) : null;
                   const pigOnSquare = state.pieces.find(
@@ -1253,6 +1312,7 @@ export default function App() {
                           : '',
                         barrierPick || barrierFrom ? 'barrier-source' : '',
                         barrierDest ? 'barrier-target' : '',
+                        gamblerTarget ? 'gambler-target' : '',
                       ].join(' ')}
                       onClick={() => onSquareClick(row, col)}
                       onMouseEnter={() => {
@@ -1399,7 +1459,8 @@ export default function App() {
             <h2>Your hand</h2>
             <div
               className={`hand ${
-                state.phase === 'playing' && state.turn === you && state.turnPhase === 'move'
+                state.phase === 'playing' &&
+                ((state.turn === you && state.turnPhase === 'move') || !spellsUnlocked(state))
                   ? 'hand-spell-locked'
                   : ''
               }`}
@@ -1407,15 +1468,23 @@ export default function App() {
               {you &&
                 state.players[you].hand.map((c) => {
                   const meta = cardMeta(catalog, c.defId);
+                  const nightLocked = state.phase === 'playing' && !spellsUnlocked(state);
                   const spellLocked =
-                    state.phase === 'playing' && state.turn === you && state.turnPhase === 'move';
+                    nightLocked ||
+                    (state.phase === 'playing' && state.turn === you && state.turnPhase === 'move');
                   return (
                     <button
                       key={c.instanceId}
                       type="button"
                       className={`card ${selectedCard === c.instanceId ? 'active' : ''} ${spellLocked ? 'card-dimmed' : ''}`}
                       disabled={spellLocked}
-                      title={spellLocked ? 'Spell phase skipped — cards available next turn' : undefined}
+                      title={
+                        nightLocked
+                          ? 'Spell cards unlock at the first night'
+                          : spellLocked
+                            ? 'Spell phase skipped — cards available next turn'
+                            : undefined
+                      }
                       onClick={() => {
                         if (spellLocked) return;
                         setSelectedCard(c.instanceId);
@@ -1461,10 +1530,11 @@ export default function App() {
 
             {state.phase === 'playing' && (
               <div className="row">
-                {((state.turn === you &&
-                  state.turnPhase === 'spell' &&
-                  state.players[you].spellsThisTurn < state.players[you].maxSpellsThisTurn) ||
-                  (selectedCard && activeCardDef?.playOnOpponentTurn && state.turn !== you)) && (
+                {spellsUnlocked(state) &&
+                  ((state.turn === you &&
+                    state.turnPhase === 'spell' &&
+                    state.players[you].spellsThisTurn < state.players[you].maxSpellsThisTurn) ||
+                    (selectedCard && activeCardDef?.playOnOpponentTurn && state.turn !== you)) && (
                   <button
                     type="button"
                     className="primary"
@@ -1474,7 +1544,7 @@ export default function App() {
                     Cast selected
                   </button>
                 )}
-                {state.turn === you && state.turnPhase === 'spell' && (
+                {spellsUnlocked(state) && state.turn === you && state.turnPhase === 'spell' && (
                   <button
                     type="button"
                     onClick={() => {
@@ -1492,7 +1562,7 @@ export default function App() {
               </div>
             )}
 
-            {activeCardDef?.id === 'swap' && pendingTargets.length === 1 && (
+            {activeCardDef?.id === 'swap' && pendingTargets.length === 1 && canCastSpells && (
               <div className="variant-grid">
                 {catalog?.pieces
                   .filter((p) => {
@@ -1514,6 +1584,7 @@ export default function App() {
 
             {activeCardDef?.id === 'pawn_summon' &&
               selectedCard &&
+              canCastSpells &&
               !spellConfirm &&
               pendingTargets.length % 2 === 0 && (
                 <div className="variant-grid">
@@ -1547,6 +1618,7 @@ export default function App() {
 
             {activeCardDef?.targeting === 'graveyard' &&
               selectedCard &&
+              canCastSpells &&
               !spellConfirm &&
               pendingTargets.length === 0 &&
               you && (
@@ -1775,6 +1847,99 @@ function PieceInfoTile({
   );
 }
 
+function DiscardToDrawOverlay({
+  prompt,
+  you,
+  state,
+  catalog,
+  onDiscard,
+}: {
+  prompt: NonNullable<GameState['pendingPrompt']>;
+  you: Color;
+  state: GameState;
+  catalog: Catalog | null;
+  onDiscard: (instanceId: string) => void;
+}) {
+  const [picked, setPicked] = useState<string | null>(null);
+  const chooser = prompt.color;
+  if (you !== chooser) {
+    return (
+      <div className="hand-limit-overlay" role="dialog" aria-modal="true" aria-labelledby="hand-limit-title">
+        <div className="hand-limit-panel">
+          <p className="hand-limit-eyebrow">Hand full</p>
+          <h2 id="hand-limit-title">Waiting for opponent</h2>
+          <p className="hand-limit-copy">
+            They drew a card with a full hand and must discard before the game continues.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const drawnId = prompt.drawnInstanceId;
+  const drawn = state.players[you].hand.find((c) => c.instanceId === drawnId);
+  const drawnMeta = drawn ? cardMeta(catalog, drawn.defId) : null;
+  const remaining = prompt.remaining ?? 0;
+
+  return (
+    <div className="hand-limit-overlay" role="dialog" aria-modal="true" aria-labelledby="hand-limit-title">
+      <div className="hand-limit-panel">
+        <p className="hand-limit-eyebrow">Hand full</p>
+        <h2 id="hand-limit-title">You drew a card</h2>
+        <p className="hand-limit-copy">
+          Your hand is over the limit of 5. Discard one card to continue
+          {remaining > 0 ? ` — then you will draw ${remaining} more` : ''}. No other actions until you do.
+        </p>
+
+        {drawn && (
+          <div className="hand-limit-drawn">
+            <p className="hand-limit-drawn-label">Drawn card</p>
+            <div className="card hand-limit-drawn-card">
+              <img src={drawnMeta?.image ?? '/cards/Back_Of_Card.png'} alt={drawnMeta?.name ?? drawn.defId} />
+              <span>{drawnMeta?.name ?? drawn.defId}</span>
+              {drawnMeta?.description?.[0] && (
+                <small className="card-blurb">{drawnMeta.description[0]}</small>
+              )}
+            </div>
+          </div>
+        )}
+
+        <p className="hand-limit-pick-label">Choose a card to discard</p>
+        <div className="hand-limit-grid">
+          {state.players[you].hand.map((c) => {
+            const meta = cardMeta(catalog, c.defId);
+            const isDrawn = c.instanceId === drawnId;
+            return (
+              <button
+                key={c.instanceId}
+                type="button"
+                className={`card ${picked === c.instanceId ? 'active' : ''} ${isDrawn ? 'hand-limit-new' : ''}`}
+                onClick={() => setPicked(c.instanceId)}
+              >
+                {isDrawn ? <em className="hand-limit-new-tag">New</em> : null}
+                <img src={meta?.image ?? '/cards/Back_Of_Card.png'} alt={meta?.name ?? c.defId} />
+                <span>{meta?.name ?? c.defId}</span>
+                {meta?.description?.[0] && <small className="card-blurb">{meta.description[0]}</small>}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="hand-limit-actions">
+          <button
+            type="button"
+            className="primary"
+            disabled={!picked}
+            onClick={() => picked && onDiscard(picked)}
+          >
+            Discard selected
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Graveyard({
   items,
   catalog,
@@ -1804,7 +1969,6 @@ function GamblerPrompt({
   prompt,
   you,
   state,
-  catalog,
   onResolve,
 }: {
   prompt: NonNullable<GameState['pendingPrompt']>;
@@ -1814,22 +1978,28 @@ function GamblerPrompt({
   onResolve: (payload: unknown) => void;
 }) {
   const roll = prompt.roll ?? 0;
-  const actor = prompt.color ?? you;
-  if (prompt.cardDefId === 'gamblers_gambit' && roll <= 4 && you !== actor) {
-    const choices = state.pieces.filter(
-      (p) => p.color === actor && p.class !== 'king' && p.class !== 'queen',
-    );
+  const cardPlayer = prompt.color ?? you;
+  if (roll <= 4 && you !== cardPlayer) {
+    const filter =
+      prompt.cardDefId === 'gamblers_gambit'
+        ? (p: { class: string }) => p.class !== 'king' && p.class !== 'queen'
+        : (p: { class: string }) => p.class === 'pawn';
+    const choices = state.pieces.filter((p) => p.color === cardPlayer && filter(p));
+    if (prompt.cardDefId === 'gamblers_delight' && choices.length === 0) {
+      return (
+        <div className="banner">
+          {prompt.message}
+          <span className="prompt-actions">
+            <button type="button" className="primary" onClick={() => onResolve(null)}>
+              Confirm
+            </button>
+          </span>
+        </div>
+      );
+    }
     return (
       <div className="banner">
-        Choose an enemy piece to remove:
-        <span className="prompt-actions">
-          {choices.map((p) => (
-            <button key={p.id} type="button" onClick={() => onResolve(p.id)}>
-              <PieceIcon defId={p.defId} color={p.color} className="sm" />{' '}
-              {pieceMeta(catalog, p.defId)?.name}
-            </button>
-          ))}
-        </span>
+        {prompt.message} Click a highlighted piece on the board, then Confirm.
       </div>
     );
   }
