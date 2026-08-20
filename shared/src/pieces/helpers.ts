@@ -141,7 +141,13 @@ export function knightTargetCoords(
       let blocked = false;
       const pathBlocked = (pos: Coord) => {
         if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, pos))) return true;
-        if (!canJump && pieceAt(state, pos)) return true;
+        if (!canJump) {
+          const occ = pieceAt(state, pos);
+          if (!occ || occ.id === piece.id) return false;
+          // Non-jumping L movers can pass through allied tiles on the long leg.
+          if (occ.color === piece.color) return false;
+          return true;
+        }
         return false;
       };
       if (Math.abs(dr) > Math.abs(dc)) {

@@ -1,12 +1,24 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { listMoves as engineListMoves, availableAbilities as engineAbilities } from '@shared/engine/game.ts';
+import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
 import { spellsUnlocked } from '@shared/utils.ts';
 import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
 import {
   AudioToggles,
   playCardCastSfx,
+  playCardDiscardSfx,
+  playCaptureSfx,
+  playDayToNightSfx,
+  playDraftOrderSfx,
+  playDraftPickSfx,
+  playDraftSelectSfx,
+  playLobbyCreatedSfx,
+  playMatchJoinSfx,
+  playMoveSfx,
+  playNightToDaySfx,
+  playPieceLostSfx,
   playPieceSfx,
   useAudioScene,
   useAudioSettings,
@@ -109,8 +121,11 @@ interface GameState {
   draft: null | {
     pickingColor: Color;
     blackChoseFirstPicker: boolean | null;
-    order: string[];
-    index: number;
+    lastPick?: {
+      color: Color;
+      defId: string;
+      pieceClass: string;
+    };
   };
 }
 
@@ -139,6 +154,109 @@ function pieceMeta(catalog: Catalog | null, defId: string) {
   return catalog?.pieces.find((p) => p.id === defId);
 }
 
+const DRAFT_CLASS_LABELS: Record<string, string> = {
+  pawn: 'Pawn',
+  rook: 'Rook',
+  knight: 'Knight',
+  bishop: 'Bishop',
+  wildcard: 'Wildcard',
+  queen: 'Queen',
+};
+
+const BOARD_SQ_PX = 68;
+
+function moveAnimDuration(deltaCol: number, deltaRow: number): number {
+  const dist = Math.max(Math.abs(deltaCol), Math.abs(deltaRow));
+  return Math.min(360, Math.max(130, 90 + dist * 48));
+}
+
+function phaseLabel(phase: GameState['phase']): string {
+  switch (phase) {
+    case 'draft':
+      return 'Army draft';
+    case 'opening_draw':
+      return 'Opening hand';
+    case 'playing':
+      return 'In game';
+    case 'ended':
+      return 'Game over';
+    default:
+      return phase;
+  }
+}
+
+function cyclesUntilDayNightFlip(cycleCount: number): number {
+  const mod = cycleCount % 5;
+  return mod === 0 ? 5 : 5 - mod;
+}
+
+function gameTurnInfo(
+  state: GameState,
+  you: Color,
+): { yours: boolean; label: string; detail?: string } | null {
+  if (state.phase === 'playing') {
+    return {
+      yours: state.turn === you,
+      label: state.turn === you ? 'Your turn' : "Opponent's turn",
+      detail: state.turnPhase,
+    };
+  }
+  if (state.phase === 'draft' && state.draft) {
+    if (state.draft.blackChoseFirstPicker == null) {
+      if (you === 'black') {
+        return { yours: true, label: 'Your choice', detail: 'Who drafts first?' };
+      }
+      return { yours: false, label: 'Waiting', detail: 'Black picks draft order' };
+    }
+    const picking = state.draft.pickingColor;
+    return {
+      yours: picking === you,
+      label: picking === you ? 'Your pick' : `${state.players[picking].name} is picking`,
+      detail: 'Army draft',
+    };
+  }
+  if (state.phase === 'opening_draw') {
+    return { yours: true, label: 'Opening hand', detail: 'Keep or mulligan cards' };
+  }
+  return null;
+}
+
+function turnStripContent(
+  state: GameState,
+  you: Color | null,
+): { mode: 'yours' | 'waiting' | 'ended'; title: string; detail: string } {
+  if (state.phase === 'ended') {
+    return {
+      mode: 'ended',
+      title: `${state.winner ?? 'Someone'} wins`,
+      detail: state.winReason ?? '',
+    };
+  }
+  const info = you ? gameTurnInfo(state, you) : null;
+  if (info?.yours) {
+    if (state.phase === 'playing') {
+      return {
+        mode: 'yours',
+        title: 'Your turn',
+        detail: spellsUnlocked(state)
+          ? `Cast a spell or move a piece (${state.turnPhase})`
+          : 'Move a piece — spell cards unlock at the first night',
+      };
+    }
+    return { mode: 'yours', title: info.label, detail: info.detail ?? '' };
+  }
+  return {
+    mode: 'waiting',
+    title: 'Waiting for opponent',
+    detail:
+      state.phase === 'draft'
+        ? 'Draft'
+        : info?.detail
+          ? info.detail
+          : state.turnPhase ?? '',
+  };
+}
+
 function cardMeta(catalog: Catalog | null, defId: string) {
   return catalog?.cards.find((c) => c.id === defId);
 }
@@ -152,9 +270,22 @@ function chebyshev(a: Coord, b: Coord): number {
 }
 
 /** Drop Best Buddy teleports that aren't a real Pig L (2×1). */
+function pigMoveBonus(piece: Piece): number {
+  let bonus = 0;
+  for (const e of piece.effects ?? []) {
+    if (e.kind === 'movement_plus') bonus += 1;
+    if (e.kind === 'mathematical') bonus += 1;
+    if (e.kind === 'wizard_enchant') bonus += 1;
+  }
+  return bonus;
+}
+
 function sanitizeMoves(piece: Piece | undefined, opts: MoveOption[]): MoveOption[] {
   if (!piece || piece.defId !== 'pig') return opts;
-  return opts.filter((m) => m.special !== 'best_buddy' || isPigLShape(piece.pos, m.to));
+  const bonus = pigMoveBonus(piece);
+  return opts.filter(
+    (m) => m.special !== 'best_buddy' || isPigLShape(piece.pos, m.to, bonus),
+  );
 }
 
 export default function App() {
@@ -193,6 +324,35 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState('Connect and create or join a room.');
   const prevTurnRef = useRef<string | null>(null);
+  const skipMoveAnimRef = useRef(true);
+  const lastMoveAnimKeyRef = useRef<string | null>(null);
+  const lastDraftPickKeyRef = useRef<string | null>(null);
+  const skipGameSfxRef = useRef(true);
+  const lastDayNightSfxRef = useRef<string | null>(null);
+  const lastHistorySfxRef = useRef<string | null>(null);
+  const lastCaptureSfxKeyRef = useRef<string | null>(null);
+  const lastGraveCountsRef = useRef<{ white: number; black: number } | null>(null);
+  const [moveAnim, setMoveAnim] = useState<{
+    key: string;
+    pieceId: string;
+    deltaCol: number;
+    deltaRow: number;
+    durationMs: number;
+    phase: 'from' | 'to';
+  } | null>(null);
+  const [draftPickFlash, setDraftPickFlash] = useState<{
+    color: Color;
+    defId: string;
+    pieceClass: string;
+  } | null>(null);
+  const [ceremony, setCeremony] = useState<
+    | { kind: 'lobby'; code: string }
+    | { kind: 'vs'; white: string; black: string }
+    | { kind: 'order'; whiteFirst: boolean }
+    | null
+  >(null);
+  const prevPhaseRef = useRef<string | null>(null);
+  const prevFirstPickerRef = useRef<boolean | null | 'unset'>('unset');
 
   useEffect(() => {
     const s = io(SOCKET_URL || undefined, { transports: ['websocket', 'polling'] });
@@ -213,7 +373,6 @@ export default function App() {
         setAbilities([]);
       }
       prevTurnRef.current = turnKey;
-      if (payload.state.pendingPrompt?.message) setStatus(payload.state.pendingPrompt.message);
     });
     s.on('error_message', (msg: string) => setError(msg));
     return () => {
@@ -221,10 +380,190 @@ export default function App() {
     };
   }, []);
 
+  const clearMoveAnim = useCallback(() => setMoveAnim(null), []);
+
+  useLayoutEffect(() => {
+    const lm = state?.lastMove;
+    if (!lm) return;
+
+    const key = `${lm.pieceId}:${lm.from.row},${lm.from.col}:${lm.to.row},${lm.to.col}`;
+    if (skipMoveAnimRef.current) {
+      skipMoveAnimRef.current = false;
+      lastMoveAnimKeyRef.current = key;
+      return;
+    }
+    if (key === lastMoveAnimKeyRef.current) return;
+    lastMoveAnimKeyRef.current = key;
+
+    if (lm.from.row === lm.to.row && lm.from.col === lm.to.col) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    const flipBoard = you === 'black';
+    const visualFromRow = flipBoard ? 9 - lm.from.row : lm.from.row;
+    const visualFromCol = flipBoard ? 9 - lm.from.col : lm.from.col;
+    const visualToRow = flipBoard ? 9 - lm.to.row : lm.to.row;
+    const visualToCol = flipBoard ? 9 - lm.to.col : lm.to.col;
+
+    const deltaCol = visualToCol - visualFromCol;
+    const deltaRow = visualToRow - visualFromRow;
+
+    setMoveAnim({
+      key,
+      pieceId: lm.pieceId,
+      deltaCol,
+      deltaRow,
+      durationMs: moveAnimDuration(deltaCol, deltaRow),
+      phase: 'from',
+    });
+    playMoveSfx(deltaCol, deltaRow);
+  }, [state?.lastMove, you]);
+
+  useLayoutEffect(() => {
+    if (moveAnim?.phase !== 'from') return;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        setMoveAnim((m) => (m?.phase === 'from' ? { ...m, phase: 'to' } : m));
+      });
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
+  }, [moveAnim?.key, moveAnim?.phase]);
+
+  useEffect(() => {
+    if (!moveAnim) return;
+    const fallback = window.setTimeout(clearMoveAnim, moveAnim.durationMs + 120);
+    return () => window.clearTimeout(fallback);
+  }, [moveAnim, clearMoveAnim]);
+
   useEffect(() => {
     if (state?.phase !== 'draft') return;
     setInspectedId((id) => (id?.startsWith('draft:') ? null : id));
-  }, [state?.draft?.index, state?.draft?.pickingColor]);
+  }, [state?.draft?.lastPick, state?.draft?.pickingColor]);
+
+  useEffect(() => {
+    const lp = state?.draft?.lastPick;
+    if (!lp) return;
+    const key = `${lp.color}:${lp.pieceClass}:${lp.defId}`;
+    if (key === lastDraftPickKeyRef.current) return;
+    lastDraftPickKeyRef.current = key;
+    setDraftPickFlash(lp);
+    playDraftPickSfx();
+    const timer = window.setTimeout(() => setDraftPickFlash(null), 900);
+    return () => window.clearTimeout(timer);
+  }, [state?.draft?.lastPick]);
+
+  useEffect(() => {
+    if (!state) return;
+    const prev = prevPhaseRef.current;
+    prevPhaseRef.current = state.phase;
+
+    if (state.phase === 'lobby' && prev !== 'lobby') {
+      setCeremony({ kind: 'lobby', code: state.roomCode });
+      playLobbyCreatedSfx();
+    }
+
+    if (state.phase === 'draft' && prev !== 'draft') {
+      const alreadyPicking = prev === null && state.draft?.blackChoseFirstPicker != null;
+      if (!alreadyPicking) {
+        setCeremony({
+          kind: 'vs',
+          white: state.players.white.name || 'White',
+          black: state.players.black.name || 'Black',
+        });
+        playMatchJoinSfx();
+      }
+    }
+
+    const chose = state.draft?.blackChoseFirstPicker ?? null;
+    if (prevFirstPickerRef.current === 'unset') {
+      prevFirstPickerRef.current = chose;
+    } else if (state.phase === 'draft' && prevFirstPickerRef.current == null && chose != null) {
+      prevFirstPickerRef.current = chose;
+      setCeremony({ kind: 'order', whiteFirst: chose });
+      playDraftOrderSfx(chose);
+    } else {
+      prevFirstPickerRef.current = chose;
+    }
+  }, [state]);
+
+  useEffect(() => {
+    if (!state || !you) return;
+    const head = state.history[0] ?? '';
+    const graves = {
+      white: state.players.white.graveyard.length,
+      black: state.players.black.graveyard.length,
+    };
+    const lm = state.lastMove;
+    const captureKey = lm?.capturedId
+      ? `${lm.pieceId}:${lm.capturedId}:${lm.from.row},${lm.from.col}:${lm.to.row},${lm.to.col}`
+      : null;
+
+    if (skipGameSfxRef.current) {
+      skipGameSfxRef.current = false;
+      lastDayNightSfxRef.current = state.dayNight;
+      lastHistorySfxRef.current = head;
+      lastCaptureSfxKeyRef.current = captureKey;
+      lastGraveCountsRef.current = graves;
+      return;
+    }
+
+    if (state.dayNight !== lastDayNightSfxRef.current) {
+      if (state.dayNight === 'night') playDayToNightSfx();
+      else playNightToDaySfx();
+      lastDayNightSfxRef.current = state.dayNight;
+    }
+
+    if (head && head !== lastHistorySfxRef.current) {
+      lastHistorySfxRef.current = head;
+      const text = head.replace(/^\[[^\]]+\]\s*/, '');
+      if (text.includes(' played ')) playCardCastSfx();
+      else if (
+        text.includes('discarded to make room') ||
+        text.includes('redrew one opening') ||
+        text.includes('stolen card discarded')
+      ) {
+        playCardDiscardSfx();
+      }
+    } else {
+      lastHistorySfxRef.current = head;
+    }
+
+    if (captureKey && captureKey !== lastCaptureSfxKeyRef.current) {
+      lastCaptureSfxKeyRef.current = captureKey;
+      if (lm?.color === you) playCaptureSfx();
+      else playPieceLostSfx();
+    } else {
+      const prev = lastGraveCountsRef.current;
+      if (prev) {
+        const opp: Color = you === 'white' ? 'black' : 'white';
+        if (graves[you] > prev[you]) playPieceLostSfx();
+        if (graves[opp] > prev[opp]) playCaptureSfx();
+      }
+    }
+    lastGraveCountsRef.current = graves;
+  }, [state, you]);
+
+  useEffect(() => {
+    if (!state) return;
+    const promptMsg = state.pendingPrompt?.message;
+    if (promptMsg) {
+      setStatus(promptMsg);
+      return;
+    }
+    if (state.phase === 'lobby') {
+      setStatus('Share the room code. Game starts when a second player joins.');
+      return;
+    }
+    setStatus((current) =>
+      current === 'Connect and create or join a room.' ||
+      current === 'Share the room code. Game starts when a second player joins.'
+        ? ''
+        : current,
+    );
+  }, [state?.phase, state?.pendingPrompt?.message]);
 
   const send = (action: object) => {
     if (!socket || !roomCode) return;
@@ -301,6 +640,7 @@ export default function App() {
         if (!res.ok) return setError(res.error ?? 'Join failed');
         setRoomCode(res.code!);
         setYou(res.color!);
+        setStatus('');
       },
     );
   };
@@ -423,7 +763,6 @@ export default function App() {
 
   const finishCard = (targets: unknown[]) => {
     if (!selectedCard) return;
-    playCardCastSfx();
     send({ type: 'play_card', instanceId: selectedCard, targets });
     setSelectedCard(null);
     setPendingTargets([]);
@@ -506,6 +845,7 @@ export default function App() {
   const onSquareClick = (row: number, col: number) => {
     if (!state || !you) return;
     if (state.pendingPrompt?.type === 'discard_to_draw') return;
+    if (state.pendingPrompt?.type === 'opening_mulligan') return;
     playPieceSfx();
     const squareKey = `${row},${col}`;
 
@@ -592,38 +932,6 @@ export default function App() {
       }
     }
 
-    // Click your barrier on your turn to start Barrier Shift (Enchanted Pawn)
-    const barrierHere = state.tokens.find(
-      (t) => t.kind === 'barrier' && t.owner === you && t.pos.row === row && t.pos.col === col,
-    );
-    if (
-      barrierHere &&
-      state.turn === you &&
-      state.phase === 'playing' &&
-      !state.pendingPrompt &&
-      state.players[you].army.pawn === 'enchanted_pawn'
-    ) {
-      const ep = state.pieces.find((p) => p.color === you && p.defId === 'enchanted_pawn');
-      if (ep) {
-        const summary = `Shift barrier at file ${col + 1}, rank ${10 - row}?`;
-        setSpellConfirm({
-          summary,
-          mode: 'move',
-          move: {
-            pieceId: ep.id,
-            to: { row, col },
-            meta: { special: 'barrier_shift_select', from: { row, col } },
-          },
-        });
-        setSelectedPiece(ep.id);
-        setMoves([]);
-        setAbilities([]);
-        setStatus(summary);
-        clearBoardConfirm();
-        return;
-      }
-    }
-
     if (selectedCard && targetNeeded && canCastSpells) {
       const mode = activeCardDef!.targeting;
 
@@ -685,18 +993,17 @@ export default function App() {
     }
 
     if (selectedPiece && moves.some((m) => m.to.row === row && m.to.col === col)) {
-      const pool = focusSpecial ? moves.filter((m) => m.special === focusSpecial) : moves;
-      const candidates = pool.filter((m) => m.to.row === row && m.to.col === col);
-      if (!candidates.length) {
-        if (focusSpecial) {
-          setStatus(`That square is not a valid ${focusSpecial.replace(/_/g, ' ')} target`);
-          return;
-        }
-      } else {
-        const move = candidates.find((m) => m.special) ?? candidates[0]!;
+      const candidates = moves.filter((m) => m.to.row === row && m.to.col === col);
+      if (candidates.length) {
+        const move =
+          focusSpecial != null
+            ? candidates.find((m) => m.special === focusSpecial) ??
+              candidates.find((m) => !m.special) ??
+              candidates[0]!
+            : candidates.find((m) => m.special) ?? candidates[0]!;
         if (move.special === 'best_buddy') {
           const pig = state.pieces.find((p) => p.id === selectedPiece);
-          if (!pig || !isPigLShape(pig.pos, { row, col })) {
+          if (!pig || !isPigLShape(pig.pos, { row, col }, pigMoveBonus(pig))) {
             setStatus('Best Buddy only shares a tile in the Pig’s L-move range (2×1).');
             return;
           }
@@ -802,7 +1109,7 @@ export default function App() {
         (focusSpecial === 'best_buddy' ||
           moves.some((m) => m.special === 'best_buddy' && m.to.row === row && m.to.col === col))
       ) {
-        if (!isPigLShape(selected.pos, piece.pos)) {
+        if (!isPigLShape(selected.pos, piece.pos, pigMoveBonus(selected))) {
           setStatus('Best Buddy only shares a tile in the Pig’s L-move range (2×1).');
           return;
         }
@@ -940,20 +1247,35 @@ export default function App() {
           </button>
         </main>
         <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
-        <KnowledgeToggle
-          enabled={knowledgeEnabled}
-          onToggle={() => setKnowledgeEnabled((v) => !v)}
-        />
         {audioFxStack}
       </div>
     );
   }
 
   const flip = you === 'black';
+  const showBoardKnowledge =
+    state.phase === 'playing' || state.phase === 'opening_draw' || state.phase === 'ended';
+  const draftPreviewDefId =
+    state.phase === 'draft' && draftOptions.length > 0
+      ? draftInspectDefId ?? draftOptions[0]
+      : null;
 
   return (
     <div className="shell">
       <CosmicBackdrop enabled={fxEnabled} dayNight={state.dayNight} />
+      {ceremony && (
+        <MatchCeremony
+          key={
+            ceremony.kind === 'lobby'
+              ? `lobby:${ceremony.code}`
+              : ceremony.kind === 'vs'
+                ? `vs:${ceremony.white}:${ceremony.black}`
+                : `order:${ceremony.whiteFirst}`
+          }
+          ceremony={ceremony}
+          onDone={() => setCeremony(null)}
+        />
+      )}
       {state.pendingPrompt?.type === 'discard_to_draw' && (
         <DiscardToDrawOverlay
           key={state.pendingPrompt.drawnInstanceId}
@@ -964,49 +1286,64 @@ export default function App() {
           onDiscard={(instanceId) => send({ type: 'resolve_prompt', payload: instanceId })}
         />
       )}
-      {(state.phase === 'playing' && state.turn !== you) ||
-      (state.phase === 'opening_draw' &&
-        state.pendingPrompt?.type === 'opening_mulligan' &&
-        state.pendingPrompt.color !== you) ||
-      (state.phase === 'draft' &&
-        state.draft &&
-        state.draft.blackChoseFirstPicker != null &&
-        state.draft.pickingColor !== you) ? (
-        <div className="waiting-opponent" role="status" aria-live="polite">
-          <span className="waiting-opponent-dot" aria-hidden />
-          Waiting for opponent
-          {state.phase === 'opening_draw' ? (
-            <span className="waiting-opponent-sub"> — opening hand</span>
-          ) : state.phase === 'draft' ? (
-            <span className="waiting-opponent-sub"> — draft</span>
-          ) : null}
-        </div>
-      ) : null}
+      {state.pendingPrompt?.type === 'opening_mulligan' && (
+        <OpeningMulliganOverlay
+          key={state.players[state.pendingPrompt.color!].hand.map((c) => c.instanceId).join(',')}
+          prompt={state.pendingPrompt}
+          you={you!}
+          state={state}
+          catalog={catalog}
+          onKeep={() => send({ type: 'opening_keep' })}
+          onRedraw={(instanceId) => send({ type: 'opening_redraw', instanceId })}
+        />
+      )}
+      <TurnStrip state={state} you={you} />
       <div className="shell-content">
       <header className="top">
-        <div>
+        <div className="top-left">
           <p className="brand">
             Chesspansion <span className="beta-tag" aria-label="Beta">Beta</span>
           </p>
-          <p className="meta">
-            Room <strong>{roomCode}</strong> · You are <strong>{you}</strong> ·{' '}
-            <span className={state.dayNight}>{state.dayNight}</span> · cycle {state.cycleCount}
-          </p>
-        </div>
-        <div className="meta right">
-          {state.phase === 'playing' && (
-            <div
-              className={`turn-pill ${state.turn === you ? 'turn-yours' : 'turn-theirs'}`}
-              role="status"
-              aria-live="polite"
-            >
-              <span className="turn-pill-label">
-                {state.turn === you ? 'Your turn' : "Opponent's turn"}
+          <div className="game-status-bar" role="status" aria-live="polite">
+            <span className="status-chip chip-room">
+              Room <strong>{roomCode}</strong>
+            </span>
+            <span className={`status-chip chip-you chip-you-${you}`}>
+              You · <strong>{you}</strong>
+            </span>
+            <span className={`status-chip chip-cycle chip-${state.dayNight}`}>
+              <span className="chip-cycle-mark" aria-hidden />
+              <span className="chip-cycle-phase">{state.dayNight === 'day' ? 'Day' : 'Night'}</span>
+              <span className="chip-cycle-meta">
+                Cycle {state.cycleCount}
+                {state.phase === 'playing' || state.phase === 'opening_draw' ? (
+                  <> · flip in {cyclesUntilDayNightFlip(state.cycleCount)}</>
+                ) : null}
               </span>
-              <span className="turn-pill-phase">{state.turnPhase}</span>
-              {state.check ? <span className="turn-pill-check">{state.check} in check</span> : null}
-            </div>
-          )}
+            </span>
+            <span className="status-chip chip-phase">{phaseLabel(state.phase)}</span>
+          </div>
+        </div>
+        <div className="top-right">
+          {you
+            ? (() => {
+                const turnInfo = gameTurnInfo(state, you);
+                if (!turnInfo) return null;
+                return (
+                  <div
+                    className={`turn-pill ${turnInfo.yours ? 'turn-yours' : 'turn-theirs'}`}
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span className="turn-pill-label">{turnInfo.label}</span>
+                    {turnInfo.detail ? <span className="turn-pill-phase">{turnInfo.detail}</span> : null}
+                    {state.phase === 'playing' && state.check ? (
+                      <span className="turn-pill-check">{state.check} in check</span>
+                    ) : null}
+                  </div>
+                );
+              })()
+            : null}
           {state.phase === 'ended' && (
             <span className="winner">
               {state.winner} wins ({state.winReason})
@@ -1015,214 +1352,152 @@ export default function App() {
         </div>
       </header>
 
-      {state.phase === 'playing' && state.turn === you && (
-        <div className="turn-banner turn-yours" role="status">
-          <strong>Your turn</strong>
-          <span>
-            {spellsUnlocked(state)
-              ? ` — cast a spell or move a piece (${state.turnPhase})`
-              : ' — move a piece (spell cards unlock at the first night)'}
-          </span>
-        </div>
-      )}
-
-      <div className="banner">{status}</div>
-      {error && <div className="banner error">{error}</div>}
-
-      {state.pendingPrompt?.type === 'opening_mulligan' && state.pendingPrompt.color === you && (
-        <div className="banner">
-          Opening hand — keep, or select one card and redraw once.
-          <span className="prompt-actions">
-            <button type="button" className="primary" onClick={() => send({ type: 'opening_keep' })}>
-              Keep hand
-            </button>
-            {selectedCard && !state.players[you!].openingRedrawUsed && (
-              <button type="button" onClick={() => send({ type: 'opening_redraw', instanceId: selectedCard })}>
-                Redraw selected
-              </button>
-            )}
-          </span>
-        </div>
-      )}
-
-      {state.pendingPrompt?.type === 'promote' && state.pendingPrompt.color === you && (
-        <div className="banner">
-          Promote to:
-          <span className="prompt-actions">
-            {(state.pendingPrompt.options as string[] | undefined)?.map((opt) => (
-              <button key={opt} type="button" onClick={() => send({ type: 'resolve_prompt', payload: opt })}>
-                <PieceIcon defId={opt} color={you ?? 'white'} className="sm" />{' '}
-                {pieceMeta(catalog, opt)?.name ?? opt}
-              </button>
-            ))}
-          </span>
-        </div>
-      )}
-
-      {state.pendingPrompt?.type === 'gadget_choice' && state.pendingPrompt.color === you && (
-        <div className="banner">
-          Deploy a gadget on an adjacent empty square:
-          <span className="prompt-actions">
-            {(['ice_floor', 'spring_board', 'gnome_hole'] as const).map((kind) => (
-              <button
-                key={kind}
-                type="button"
-                className={gadgetKind === kind ? 'primary' : ''}
-                onClick={() => {
-                  setGadgetKind(kind);
-                  setStatus(`Selected ${kind} — click an adjacent empty square`);
-                }}
-              >
-                {kind.replace('_', ' ')}
-              </button>
-            ))}
-            <button type="button" onClick={cancelAbility}>
-              Cancel
-            </button>
-          </span>
-        </div>
-      )}
-
-      {state.pendingPrompt?.type === 'ability_target' &&
-        state.pendingPrompt.color === you &&
-        state.pendingPrompt.abilityId === 'revive' && (
-          <div className="banner">
-            Revive from graveyard:
-            <span className="prompt-actions">
-              {state.players[you].graveyard
-                .filter((g) => g.defId !== 'angel')
-                .map((g, i) => (
-                  <button
-                    key={`${g.defId}-${i}`}
-                    type="button"
-                    onClick={() => send({ type: 'resolve_prompt', payload: g.defId })}
-                  >
-                    <PieceIcon defId={g.defId} color={you} className="sm" /> {pieceMeta(catalog, g.defId)?.name}
-                  </button>
-                ))}
-              <button type="button" onClick={cancelAbility}>
-                Cancel
-              </button>
-            </span>
-          </div>
-        )}
-
-      {state.pendingPrompt?.type === 'ability_target' &&
-        state.pendingPrompt.color === you &&
-        state.pendingPrompt.abilityId !== 'revive' && (
-          <div className="banner">
-            {state.pendingPrompt.message}
-            <span className="prompt-actions">
-              <button type="button" onClick={cancelAbility}>
-                Cancel
-              </button>
-            </span>
-          </div>
-        )}
-
-      {(state.pendingPrompt?.type === 'spring_bounce' || state.pendingPrompt?.type === 'gnome_hole_travel') &&
-        state.pendingPrompt.color === you && (
-          <div className="banner">
-            {state.pendingPrompt.message}
-            {state.pendingPrompt.type === 'gnome_hole_travel' && (
-              <span className="prompt-actions">
-                <button type="button" onClick={() => send({ type: 'resolve_prompt', payload: 'skip' })}>
-                  Stay here
-                </button>
-              </span>
-            )}
-          </div>
-        )}
-
-      {state.pendingPrompt?.type === 'gambler_choice' && (
-        <GamblerPrompt
-          prompt={state.pendingPrompt}
-          you={you!}
+      {!showBoardKnowledge && (
+        <PlayPromptBanners
+          status={status}
+          error={error}
           state={state}
+          you={you}
           catalog={catalog}
-          onResolve={(payload) => send({ type: 'resolve_prompt', payload })}
+          gadgetKind={gadgetKind}
+          setGadgetKind={setGadgetKind}
+          setStatus={setStatus}
+          send={send}
+          cancelAbility={cancelAbility}
         />
       )}
 
+      {state.phase === 'lobby' && (
+        <div className="waiting-room">
+          <p className="waiting-room-kicker">Lobby ready</p>
+          <p className="waiting-room-code">{roomCode}</p>
+          <p className="waiting-room-copy">Share this code. Waiting for an opponent to join…</p>
+        </div>
+      )}
+
       {state.phase === 'draft' && state.draft && (
-        <section className="panel draft">
-          <h2>Army draft</h2>
-          {state.draft.blackChoseFirstPicker == null ? (
-            you === 'black' ? (
-              <div className="row draft-center-actions">
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => send({ type: 'choose_first_picker', whitePicksFirst: true })}
-                >
-                  White picks first
-                </button>
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => send({ type: 'choose_first_picker', whitePicksFirst: false })}
-                >
-                  Black picks first
-                </button>
-              </div>
-            ) : (
-              <p className="draft-status">Waiting for Black to choose who drafts first…</p>
-            )
-          ) : (
-            <>
-              <p className="draft-status">
-                Picking <strong>{state.draft.order[state.draft.index]}</strong> —{' '}
-                {state.draft.pickingColor === you ? 'Your pick' : 'Opponent picking'}
-              </p>
-              <div className="variant-grid draft-grid">
-                {draftOptions.map((id) => {
-                  const p = pieceMeta(catalog, id);
-                  const selected = draftInspectDefId === id;
-                  return (
-                    <button
-                      key={id}
-                      type="button"
-                      className={[
-                        'draft-tile',
-                        selected ? 'selected' : '',
-                        state.draft?.pickingColor !== you ? 'muted-pick' : '',
-                      ]
-                        .filter(Boolean)
-                        .join(' ')}
-                      onClick={() => setInspectedId(`draft:${id}`)}
-                      onMouseEnter={() => setHoveredId(`draft:${id}`)}
-                      onMouseLeave={() =>
-                        setHoveredId((h) => (h === `draft:${id}` ? null : h))
-                      }
-                    >
-                      <span className="sym">
-                        <PieceIcon defId={id} color={you ?? 'white'} title={p?.name} />
-                      </span>
-                      <span className="draft-tile-name">{p?.name ?? id}</span>
-                    </button>
-                  );
-                })}
-              </div>
-              {draftInspectDefId && state.draft.pickingColor === you && (
-                <div className="draft-confirm-row">
-                  <button
-                    type="button"
-                    className="primary draft-confirm"
-                    onClick={() => {
-                      send({ type: 'draft_pick', defId: draftInspectDefId });
-                      setInspectedId(null);
-                    }}
-                  >
-                    Confirm {pieceMeta(catalog, draftInspectDefId)?.name ?? draftInspectDefId}
-                  </button>
+        <div className="draft-screen">
+          <aside className="draft-info-fixed" aria-live="polite">
+            <div className="draft-info-panel">
+              {draftPreviewDefId ? (
+                <DraftPieceInfoPanel defId={draftPreviewDefId} color={you ?? 'white'} />
+              ) : (
+                <div className="draft-info-empty">
+                  <p className="draft-info-label">Piece details</p>
+                  <h3>Select a variant</h3>
+                  <p>Hover or click any piece to read its movement and abilities here.</p>
                 </div>
               )}
-              {draftInspectDefId && state.draft.pickingColor !== you && (
-                <p className="draft-status muted">Select a piece to preview — waiting for opponent to pick.</p>
-              )}
-            </>
-          )}
-        </section>
+            </div>
+            {draftInspectDefId && state.draft.pickingColor === you && (
+              <button
+                type="button"
+                className="primary draft-confirm"
+                onClick={() => {
+                  send({ type: 'draft_pick', defId: draftInspectDefId });
+                  setInspectedId(null);
+                }}
+              >
+                Confirm {pieceMeta(catalog, draftInspectDefId)?.name ?? draftInspectDefId}
+              </button>
+            )}
+            {draftInspectDefId && state.draft.pickingColor !== you && (
+              <p className="draft-info-wait muted">Waiting for opponent to pick.</p>
+            )}
+          </aside>
+
+          <section className="panel draft draft-stage">
+            <h2>Army draft</h2>
+            <DraftArmyRoster
+              state={state}
+              catalog={catalog}
+              pickFlash={draftPickFlash}
+            />
+            {state.draft.blackChoseFirstPicker != null && (
+              <p className="draft-status draft-status-global">
+                {state.draft.pickingColor === you ? (
+                  <>
+                    <strong>Your pick</strong> — choose any class you have not drafted yet
+                  </>
+                ) : (
+                  <>
+                    <strong>{state.players[state.draft.pickingColor].name}</strong> is picking…
+                  </>
+                )}
+              </p>
+            )}
+
+            {state.draft.blackChoseFirstPicker == null ? (
+              you === 'black' ? (
+                <div className="row draft-center-actions">
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => send({ type: 'choose_first_picker', whitePicksFirst: true })}
+                  >
+                    White picks first
+                  </button>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => send({ type: 'choose_first_picker', whitePicksFirst: false })}
+                  >
+                    Black picks first
+                  </button>
+                </div>
+              ) : (
+                <p className="draft-status">Waiting for Black to choose who drafts first…</p>
+              )
+            ) : (
+              <div className="draft-class-groups">
+                {DRAFT_ORDER.filter((cls) => !state.players[state.draft!.pickingColor].army[cls]).map(
+                  (cls) => (
+                    <div key={cls} className="draft-class-group">
+                      <h3 className="draft-class-heading">{DRAFT_CLASS_LABELS[cls] ?? cls}</h3>
+                      <div className="variant-grid draft-grid draft-class-options">
+                        {(VARIANTS_BY_CLASS[cls] ?? []).map((id) => {
+                          const p = pieceMeta(catalog, id);
+                          const selected = draftInspectDefId === id;
+                          const canPick = state.draft?.pickingColor === you;
+                          return (
+                            <button
+                              key={id}
+                              type="button"
+                              className={[
+                                'draft-tile',
+                                selected ? 'selected' : '',
+                                !canPick ? 'muted-pick' : '',
+                              ]
+                                .filter(Boolean)
+                                .join(' ')}
+                              onClick={() => {
+                                playDraftSelectSfx();
+                                setInspectedId(`draft:${id}`);
+                              }}
+                              onMouseEnter={() => setHoveredId(`draft:${id}`)}
+                              onMouseLeave={() =>
+                                setHoveredId((h) => (h === `draft:${id}` ? null : h))
+                              }
+                            >
+                              <span className="sym">
+                                <PieceIcon
+                                  defId={id}
+                                  color={state.draft!.pickingColor}
+                                  title={p?.name}
+                                />
+                              </span>
+                              <span className="draft-tile-name">{p?.name ?? id}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ),
+                )}
+              </div>
+            )}
+          </section>
+        </div>
       )}
 
       {(state.phase === 'playing' || state.phase === 'opening_draw' || state.phase === 'ended') && (
@@ -1249,6 +1524,7 @@ export default function App() {
           </aside>
 
           <main className="board-wrap">
+            <div className="board-stage">
             <div className={`board ${flip ? 'flipped' : ''} ${state.phase === 'playing' ? (state.turn === you ? 'board-your-turn' : 'board-their-turn') : ''}`}>
               {Array.from({ length: 10 }, (_, visualRow) =>
                 Array.from({ length: 10 }, (_, visualCol) => {
@@ -1257,10 +1533,7 @@ export default function App() {
                   const piece = board[row][col];
                   const dark = (row + col) % 2 === 1;
                   const selected = piece && piece.id === selectedPiece;
-                  const moveOpts = (focusSpecial
-                    ? moves.filter((m) => m.special === focusSpecial)
-                    : moves
-                  ).filter((m) => m.to.row === row && m.to.col === col);
+                  const moveOpts = moves.filter((m) => m.to.row === row && m.to.col === col);
                   const moveHere = moveOpts.length > 0;
                   const specialHere = moveOpts.some((m) => Boolean(m.special));
                   const captureHere = moveOpts.some((m) => m.capture || Boolean(m.special));
@@ -1288,6 +1561,15 @@ export default function App() {
                     state.lastMove.to.row === row &&
                     state.lastMove.to.col === col;
                   const lastPiece = !!(piece && state.lastMove?.pieceId === piece.id);
+                  const sliding =
+                    piece && moveAnim?.pieceId === piece.id
+                      ? {
+                          dx: -moveAnim.deltaCol * BOARD_SQ_PX,
+                          dy: -moveAnim.deltaRow * BOARD_SQ_PX,
+                          durationMs: moveAnim.durationMs,
+                          phase: moveAnim.phase,
+                        }
+                      : null;
                   const showingInfo =
                     (piece && piece.id === inspectedId) ||
                     (piece && !infoLocked && piece.id === hoveredId);
@@ -1313,6 +1595,8 @@ export default function App() {
                         barrierPick || barrierFrom ? 'barrier-source' : '',
                         barrierDest ? 'barrier-target' : '',
                         gamblerTarget ? 'gambler-target' : '',
+                        sliding ? 'sq-sliding' : '',
+                        piece?.defId === 'reaper' && (piece.charges ?? 0) > 0 ? 'sq-reaper-fx' : '',
                       ].join(' ')}
                       onClick={() => onSquareClick(row, col)}
                       onMouseEnter={() => {
@@ -1339,14 +1623,48 @@ export default function App() {
                       {piece && (
                         <span
                           className={`piece ${lastPiece ? 'last-moved' : ''}${
+                            sliding ? ` piece-move-slide${sliding.phase === 'to' ? ' is-sliding' : ' is-pre-slide'}` : ''
+                          }${
+                            piece.defId === 'reaper' && (piece.charges ?? 0) > 0
+                              ? ` reaper-charged reaper-charged-${Math.min(piece.charges ?? 0, 5)}`
+                              : ''
+                          }${
                             (piece.effects ?? []).some((e) => effectTone(e.kind) === 'debuff')
                               ? ' has-debuff'
                               : (piece.effects ?? []).length
                                 ? ' has-buff'
                                 : ''
                           }`}
+                          style={
+                            sliding || (piece.defId === 'reaper' && (piece.charges ?? 0) > 0)
+                              ? ({
+                                  ...(sliding
+                                    ? {
+                                        '--move-dx': `${sliding.dx}px`,
+                                        '--move-dy': `${sliding.dy}px`,
+                                        '--move-duration': `${sliding.durationMs}ms`,
+                                      }
+                                    : {}),
+                                  ...(piece.defId === 'reaper' && (piece.charges ?? 0) > 0
+                                    ? { '--reaper-c': Math.min(piece.charges ?? 0, 5) }
+                                    : {}),
+                                } as React.CSSProperties)
+                              : undefined
+                          }
+                          onTransitionEnd={(e) => {
+                            if (
+                              sliding?.phase === 'to' &&
+                              e.propertyName === 'transform' &&
+                              moveAnim?.pieceId === piece.id
+                            ) {
+                              clearMoveAnim();
+                            }
+                          }}
                           title={[
                             meta?.name ?? piece.defId,
+                            piece.defId === 'reaper' && (piece.charges ?? 0) > 0
+                              ? `${piece.charges} charge${piece.charges === 1 ? '' : 's'}`
+                              : null,
                             hasPigBuddy ? 'Pig Best Buddy sharing this tile' : null,
                             ...visibleBoardEffects(piece.effects ?? []).map(formatEffectTitle),
                           ]
@@ -1359,7 +1677,11 @@ export default function App() {
                               <PieceIcon defId="pig" color={piece.color} className="sm" title="Pig buddy" />
                             </i>
                           )}
-                          {piece.charges != null && piece.charges > 0 && <i className="charge">{piece.charges}</i>}
+                          {piece.defId === 'reaper' && (piece.charges ?? 0) > 0 ? (
+                            <ReaperChargeFx charges={piece.charges ?? 0} />
+                          ) : piece.charges != null && piece.charges > 0 ? (
+                            <i className="charge">{piece.charges}</i>
+                          ) : null}
                           {piece.ritualTurns != null && piece.ritualTurns > 0 && (
                             <i className="ritual" title="Revive ritual">{piece.ritualTurns}</i>
                           )}
@@ -1403,6 +1725,7 @@ export default function App() {
                 }),
               )}
             </div>
+            </div>
 
             <div className="ability-bar" aria-live="polite">
               {selectedPiece && abilities.length > 0 && state.turn === you
@@ -1442,17 +1765,6 @@ export default function App() {
                 </button>
               ) : null}
             </div>
-            {you &&
-              state.turn === you &&
-              state.phase === 'playing' &&
-              state.players[you].army.pawn === 'enchanted_pawn' &&
-              state.tokens.some((t) => t.kind === 'barrier' && t.owner === you) &&
-              !state.pendingPrompt && (
-                <p className="hint barrier-hint">
-                  Tip: click a barrier, press <strong>Confirm</strong>, then click a highlighted square and Confirm again
-                  (<strong>Barrier Shift</strong>). Or select an Enchanted Pawn and use the ability button.
-                </p>
-              )}
           </main>
 
           <aside className="side hand-side">
@@ -1656,50 +1968,77 @@ export default function App() {
             )}
 
             <p className="hint">
-              Flow: spell (optional) → move one piece. Putting the opponent in check ends your turn immediately. Add more
-              cards in <code>shared/src/cards/</code> without touching the UI.
+              Flow: spell (optional) → move one piece. Putting the opponent in check ends your turn immediately.
             </p>
+          </aside>
+
+          <aside className="play-dock" aria-live="polite">
+            <div className="play-dock-box">
+              <p className="play-dock-label">Messages</p>
+              <PlayPromptBanners
+                status={status}
+                error={error}
+                state={state}
+                you={you}
+                catalog={catalog}
+                gadgetKind={gadgetKind}
+                setGadgetKind={setGadgetKind}
+                setStatus={setStatus}
+                send={send}
+                cancelAbility={cancelAbility}
+              />
+              {you &&
+                state.turn === you &&
+                state.phase === 'playing' &&
+                state.players[you].army.pawn === 'enchanted_pawn' &&
+                state.tokens.some((t) => t.kind === 'barrier' && t.owner === you) &&
+                !state.pendingPrompt && (
+                  <p className="hint barrier-hint">
+                    To relocate a barrier, select an Enchanted Pawn and press <strong>Barrier Shift</strong>. Clicking a
+                    barrier while the pawn is selected will walk onto it (Barrier Phase).
+                  </p>
+                )}
+              {!status && !error && !state.pendingPrompt && !spellConfirm && !inspectedPiece && (
+                <p className="play-dock-idle">
+                  {knowledgeEnabled
+                    ? 'Prompts appear here. Hover a piece for details, or click to lock info.'
+                    : 'Prompts and confirmations appear here.'}
+                </p>
+              )}
+              {knowledgeEnabled && inspectedPiece ? (
+                <PieceInfoTile
+                  defId={inspectedPiece.defId}
+                  color={inspectedPiece.color}
+                  locked={infoLocked}
+                  docked
+                  live={{
+                    charges: inspectedPiece.charges,
+                    ritualTurns: inspectedPiece.ritualTurns,
+                    gadgetUsed: inspectedPiece.gadgetUsed,
+                    abilityCooldown: inspectedPiece.abilityCooldown,
+                    bloodlust: inspectedPiece.bloodlust,
+                    coOccupantId: inspectedPiece.coOccupantId,
+                    hasPigBuddy: pigHostIds.has(inspectedPiece.id),
+                    effects: inspectedPiece.effects,
+                  }}
+                  onClose={() => {
+                    setInspectedId(null);
+                    setHoveredId(null);
+                  }}
+                />
+              ) : null}
+            </div>
           </aside>
         </div>
       )}
 
-      {knowledgeEnabled && inspectedPiece && (
-        <PieceInfoTile
-          defId={inspectedPiece.defId}
-          color={inspectedPiece.color}
-          locked={infoLocked}
-          live={{
-            charges: inspectedPiece.charges,
-            ritualTurns: inspectedPiece.ritualTurns,
-            gadgetUsed: inspectedPiece.gadgetUsed,
-            abilityCooldown: inspectedPiece.abilityCooldown,
-            bloodlust: inspectedPiece.bloodlust,
-            coOccupantId: inspectedPiece.coOccupantId,
-            hasPigBuddy: pigHostIds.has(inspectedPiece.id),
-            effects: inspectedPiece.effects,
-          }}
-          onClose={() => {
-            setInspectedId(null);
-            setHoveredId(null);
-          }}
-        />
-      )}
-      {draftInspectDefId && (
-        <PieceInfoTile
-          defId={draftInspectDefId}
-          color={you ?? 'white'}
-          locked={Boolean(inspectedId?.startsWith('draft:'))}
-          onClose={() => {
-            setInspectedId(null);
-            setHoveredId(null);
-          }}
-        />
-      )}
       </div>
-      <KnowledgeToggle
-        enabled={knowledgeEnabled}
-        onToggle={() => setKnowledgeEnabled((v) => !v)}
-      />
+      {showBoardKnowledge && (
+        <KnowledgeToggle
+          enabled={knowledgeEnabled}
+          onToggle={() => setKnowledgeEnabled((v) => !v)}
+        />
+      )}
       {audioFxStack}
     </div>
   );
@@ -1726,12 +2065,183 @@ function formatNamedLine(line: string) {
   return line;
 }
 
-function PieceInfoTile({
+function MatchCeremony({
+  ceremony,
+  onDone,
+}: {
+  ceremony:
+    | { kind: 'lobby'; code: string }
+    | { kind: 'vs'; white: string; black: string }
+    | { kind: 'order'; whiteFirst: boolean };
+  onDone: () => void;
+}) {
+  useEffect(() => {
+    const ms = ceremony.kind === 'vs' ? 2500 : ceremony.kind === 'order' ? 2300 : 2100;
+    const timer = window.setTimeout(onDone, ms);
+    return () => window.clearTimeout(timer);
+  }, [ceremony.kind]);
+
+  return (
+    <div className={`match-ceremony is-${ceremony.kind}`} role="status" aria-live="polite">
+      <div className="match-ceremony-card">
+        {ceremony.kind === 'lobby' && (
+          <>
+            <p className="match-ceremony-kicker">Lobby created</p>
+            <p className="match-ceremony-code">{ceremony.code}</p>
+            <p className="match-ceremony-sub">Waiting for an opponent</p>
+          </>
+        )}
+        {ceremony.kind === 'vs' && (
+          <div className="match-vs">
+            <span className="match-vs-name white">{ceremony.white}</span>
+            <span className="match-vs-mark">VS</span>
+            <span className="match-vs-name black">{ceremony.black}</span>
+          </div>
+        )}
+        {ceremony.kind === 'order' && (
+          <>
+            <p className="match-ceremony-kicker">Draft order</p>
+            <p className={`match-order-title ${ceremony.whiteFirst ? 'white' : 'black'}`}>
+              {ceremony.whiteFirst ? 'White picks first' : 'Black picks first'}
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TurnStrip({ state, you }: { state: GameState; you: Color | null }) {
+  const { mode, title, detail } = turnStripContent(state, you);
+  const check =
+    state.phase === 'playing' && state.check ? `${state.check} in check` : '';
+  const yoursDetail = [detail, check].filter(Boolean).join(' · ');
+
+  return (
+    <div
+      className={`turn-strip is-${mode}`}
+      role="status"
+      aria-live="polite"
+    >
+      <div
+        className={`turn-strip-layer ${mode === 'yours' ? 'is-on' : ''}`}
+        aria-hidden={mode !== 'yours'}
+      >
+        <span className="turn-strip-title">{mode === 'yours' ? title : 'Your turn'}</span>
+        <span className="turn-strip-detail">{mode === 'yours' ? yoursDetail || '\u00a0' : '\u00a0'}</span>
+      </div>
+      <div
+        className={`turn-strip-layer ${mode === 'waiting' ? 'is-on' : ''}`}
+        aria-hidden={mode !== 'waiting'}
+      >
+        <span className="turn-strip-title">
+          <span className="waiting-opponent-dot" aria-hidden />
+          Waiting for opponent
+        </span>
+        <span className="turn-strip-detail">{mode === 'waiting' ? detail || '\u00a0' : '\u00a0'}</span>
+      </div>
+      <div
+        className={`turn-strip-layer ${mode === 'ended' ? 'is-on' : ''}`}
+        aria-hidden={mode !== 'ended'}
+      >
+        <span className="turn-strip-title">{mode === 'ended' ? title : 'Game over'}</span>
+        <span className="turn-strip-detail">{mode === 'ended' ? detail || '\u00a0' : '\u00a0'}</span>
+      </div>
+    </div>
+  );
+}
+
+function ReaperChargeFx({ charges }: { charges: number }) {
+  const shown = Math.max(0, Math.min(5, charges));
+  if (shown <= 0) return null;
+  return (
+    <span className="reaper-charge-fx" aria-hidden title={`${charges} charge${charges === 1 ? '' : 's'}`}>
+      <i className="reaper-aura" />
+      {Array.from({ length: shown }, (_, i) => (
+        <svg
+          key={i}
+          className="reaper-skull"
+          viewBox="0 0 16 18"
+          style={{ '--skull-i': i, '--skull-n': shown } as React.CSSProperties}
+        >
+          <path
+            fill="currentColor"
+            d="M8 1.1c-3.7 0-6.6 2.8-6.6 6.2 0 2.1 1.1 3.9 2.8 5v2.2c0 .6.5 1.1 1.1 1.1h.7v1.3c0 .5.4.9.9.9h2.2c.5 0 .9-.4.9-.9v-1.3h.7c.6 0 1.1-.5 1.1-1.1V12.3c1.7-1.1 2.8-2.9 2.8-5C14.6 3.9 11.7 1.1 8 1.1z"
+          />
+          <ellipse cx="5.35" cy="7.1" rx="1.55" ry="1.9" fill="#1a0818" />
+          <ellipse cx="10.65" cy="7.1" rx="1.55" ry="1.9" fill="#1a0818" />
+          <path fill="#1a0818" d="M8 8.6 6.7 11.4 8 10.6l1.3.8z" />
+          <rect x="5.15" y="13.35" width="1.15" height="2.15" rx="0.35" fill="#1a0818" />
+          <rect x="7.42" y="13.35" width="1.15" height="2.15" rx="0.35" fill="#1a0818" />
+          <rect x="9.7" y="13.35" width="1.15" height="2.15" rx="0.35" fill="#1a0818" />
+        </svg>
+      ))}
+    </span>
+  );
+}
+
+function DraftArmyRoster({
+  state,
+  catalog,
+  pickFlash,
+}: {
+  state: GameState;
+  catalog: Catalog | null;
+  pickFlash: { color: Color; defId: string; pieceClass: string } | null;
+}) {
+  return (
+    <div className="draft-armies">
+      {(['white', 'black'] as Color[]).map((color) => (
+        <div key={color} className={`draft-army-col ${color}`}>
+          <h3 className="draft-army-title">
+            {state.players[color].name}{' '}
+            <span className="draft-army-color">({color})</span>
+          </h3>
+          <div className="draft-army-slots">
+            {DRAFT_ORDER.map((cls) => {
+              const defId = state.players[color].army[cls];
+              const meta = defId ? pieceMeta(catalog, defId) : null;
+              const flashing =
+                pickFlash?.color === color && pickFlash.pieceClass === cls;
+              return (
+                <div
+                  key={cls}
+                  className={[
+                    'draft-army-slot',
+                    defId ? 'filled' : 'empty',
+                    flashing ? 'draft-pick-flash' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
+                  title={meta?.name ?? DRAFT_CLASS_LABELS[cls]}
+                >
+                  <span className="draft-slot-label">{DRAFT_CLASS_LABELS[cls] ?? cls}</span>
+                  {defId ? (
+                    <PieceIcon defId={defId} color={color} className="draft-slot-piece" title={meta?.name} />
+                  ) : (
+                    <span className="draft-slot-empty" aria-hidden>
+                      ◇
+                    </span>
+                  )}
+                  {defId && meta && <span className="draft-slot-name">{meta.name}</span>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DraftPieceInfoPanel({ defId, color }: { defId: string; color: Color }) {
+  return <PieceInfoBody defId={defId} color={color} />;
+}
+
+function PieceInfoBody({
   defId,
   color,
   live,
-  locked = false,
-  onClose,
 }: {
   defId: string;
   color: Color;
@@ -1745,8 +2255,6 @@ function PieceInfoTile({
     hasPigBuddy?: boolean;
     effects?: Array<{ id?: string; kind: string; turnsRemaining?: number }>;
   };
-  locked?: boolean;
-  onClose: () => void;
 }) {
   const info = getPieceInfo(defId);
   const [previewColor, setPreviewColor] = useState<Color>(color);
@@ -1756,18 +2264,7 @@ function PieceInfoTile({
   }, [color, defId]);
 
   return (
-    <aside
-      className={`piece-info-tile ${previewColor} ${locked ? 'is-locked' : 'is-hover'}`}
-      aria-live="polite"
-    >
-      <button type="button" className="piece-info-close" onClick={onClose} aria-label="Close piece info">
-        ×
-      </button>
-      {locked ? (
-        <p className="piece-info-lock-badge">Locked</p>
-      ) : (
-        <p className="piece-info-lock-badge hover">Hover · click piece to lock</p>
-      )}
+    <>
       <div className="piece-info-head">
         <div className="piece-info-icon-wrap">
           <PieceIcon defId={defId} color={previewColor} title={info.name} />
@@ -1843,7 +2340,146 @@ function PieceInfoTile({
           ))}
         </div>
       )}
+    </>
+  );
+}
+
+function PieceInfoTile({
+  defId,
+  color,
+  live,
+  locked = false,
+  docked = false,
+  onClose,
+}: {
+  defId: string;
+  color: Color;
+  live?: {
+    charges?: number;
+    ritualTurns?: number;
+    gadgetUsed?: boolean;
+    abilityCooldown?: number;
+    bloodlust?: boolean;
+    coOccupantId?: string;
+    hasPigBuddy?: boolean;
+    effects?: Array<{ id?: string; kind: string; turnsRemaining?: number }>;
+  };
+  locked?: boolean;
+  docked?: boolean;
+  onClose: () => void;
+}) {
+  return (
+    <aside
+      className={`piece-info-tile ${color} ${locked ? 'is-locked' : 'is-hover'}${docked ? ' is-docked' : ''}`}
+      aria-live="polite"
+    >
+      <button type="button" className="piece-info-close" onClick={onClose} aria-label="Close piece info">
+        ×
+      </button>
+      {locked ? (
+        <p className="piece-info-lock-badge">Locked</p>
+      ) : (
+        <p className="piece-info-lock-badge hover">Hover · click piece to lock</p>
+      )}
+      <PieceInfoBody defId={defId} color={color} live={live} />
     </aside>
+  );
+}
+
+function OpeningMulliganOverlay({
+  prompt,
+  you,
+  state,
+  catalog,
+  onKeep,
+  onRedraw,
+}: {
+  prompt: NonNullable<GameState['pendingPrompt']>;
+  you: Color;
+  state: GameState;
+  catalog: Catalog | null;
+  onKeep: () => void;
+  onRedraw: (instanceId: string) => void;
+}) {
+  const [picked, setPicked] = useState<string | null>(null);
+  const chooser = prompt.color;
+  const canRedraw = chooser === you && !state.players[you].openingRedrawUsed;
+
+  if (you !== chooser) {
+    return (
+      <div className="hand-limit-overlay opening-mulligan-overlay" role="dialog" aria-modal="true" aria-labelledby="opening-mulligan-title">
+        <div className="hand-limit-panel opening-mulligan-panel">
+          <p className="hand-limit-eyebrow">Opening hand</p>
+          <h2 id="opening-mulligan-title">Waiting for opponent</h2>
+          <p className="opening-mulligan-lead">
+            They are reviewing their opening spell cards. The game will continue once they keep their hand.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const pickedMeta = picked ? cardMeta(catalog, state.players[you].hand.find((c) => c.instanceId === picked)!.defId) : null;
+
+  return (
+    <div className="hand-limit-overlay opening-mulligan-overlay" role="dialog" aria-modal="true" aria-labelledby="opening-mulligan-title">
+      <div className="hand-limit-panel opening-mulligan-panel">
+        <header className="opening-mulligan-header">
+          <p className="hand-limit-eyebrow">Opening hand</p>
+          <h2 id="opening-mulligan-title">Review your cards</h2>
+          <p className="opening-mulligan-lead">
+            Keep your hand, or select one card to redraw once.
+          </p>
+        </header>
+
+        <div className="opening-mulligan-cards">
+          {state.players[you].hand.map((c) => {
+            const meta = cardMeta(catalog, c.defId);
+            const selected = picked === c.instanceId;
+            return (
+              <button
+                key={c.instanceId}
+                type="button"
+                className={`opening-mulligan-card ${selected ? 'selected' : ''}`}
+                onClick={() => setPicked(selected ? null : c.instanceId)}
+                aria-pressed={selected}
+              >
+                <img src={meta?.image ?? '/cards/Back_Of_Card.png'} alt={meta?.name ?? c.defId} />
+                <span className="opening-card-name">{meta?.name ?? c.defId}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {picked && pickedMeta ? (
+          <div className="opening-mulligan-detail">
+            <h3>{pickedMeta.name}</h3>
+            <ul>
+              {pickedMeta.description.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p className="opening-mulligan-hint">Tap a card to preview it, or keep your hand as-is.</p>
+        )}
+
+        <div className="hand-limit-actions opening-mulligan-actions">
+          <button type="button" className="primary" onClick={onKeep}>
+            Keep hand
+          </button>
+          {canRedraw && (
+            <button type="button" disabled={!picked} onClick={() => picked && onRedraw(picked)}>
+              Redraw selected
+            </button>
+          )}
+        </div>
+
+        <p className="opening-mulligan-footnote">
+          Opening hands cannot include Rally cards or duplicate spells.
+        </p>
+      </div>
+    </div>
   );
 }
 
@@ -1937,6 +2573,136 @@ function DiscardToDrawOverlay({
         </div>
       </div>
     </div>
+  );
+}
+
+function PlayPromptBanners({
+  status,
+  error,
+  state,
+  you,
+  catalog,
+  gadgetKind,
+  setGadgetKind,
+  setStatus,
+  send,
+  cancelAbility,
+}: {
+  status: string;
+  error: string | null;
+  state: GameState;
+  you: Color | null;
+  catalog: Catalog | null;
+  gadgetKind: string | null;
+  setGadgetKind: (kind: string | null) => void;
+  setStatus: (msg: string) => void;
+  send: (action: object) => void;
+  cancelAbility: () => void;
+}) {
+  return (
+    <>
+      {status ? <div className="banner">{status}</div> : null}
+      {error && <div className="banner error">{error}</div>}
+
+      {state.pendingPrompt?.type === 'promote' && state.pendingPrompt.color === you && (
+        <div className="banner">
+          Promote to:
+          <span className="prompt-actions">
+            {(state.pendingPrompt.options as string[] | undefined)?.map((opt) => (
+              <button key={opt} type="button" onClick={() => send({ type: 'resolve_prompt', payload: opt })}>
+                <PieceIcon defId={opt} color={you ?? 'white'} className="sm" />{' '}
+                {pieceMeta(catalog, opt)?.name ?? opt}
+              </button>
+            ))}
+          </span>
+        </div>
+      )}
+
+      {state.pendingPrompt?.type === 'gadget_choice' && state.pendingPrompt.color === you && (
+        <div className="banner">
+          Deploy a gadget on an adjacent empty square:
+          <span className="prompt-actions">
+            {(['ice_floor', 'spring_board', 'gnome_hole'] as const).map((kind) => (
+              <button
+                key={kind}
+                type="button"
+                className={gadgetKind === kind ? 'primary' : ''}
+                onClick={() => {
+                  setGadgetKind(kind);
+                  setStatus(`Selected ${kind} — click an adjacent empty square`);
+                }}
+              >
+                {kind.replace('_', ' ')}
+              </button>
+            ))}
+            <button type="button" onClick={cancelAbility}>
+              Cancel
+            </button>
+          </span>
+        </div>
+      )}
+
+      {state.pendingPrompt?.type === 'ability_target' &&
+        state.pendingPrompt.color === you &&
+        state.pendingPrompt.abilityId === 'revive' && (
+          <div className="banner">
+            Revive from graveyard:
+            <span className="prompt-actions">
+              {state.players[you].graveyard
+                .filter((g) => g.defId !== 'angel')
+                .map((g, i) => (
+                  <button
+                    key={`${g.defId}-${i}`}
+                    type="button"
+                    onClick={() => send({ type: 'resolve_prompt', payload: g.defId })}
+                  >
+                    <PieceIcon defId={g.defId} color={you} className="sm" /> {pieceMeta(catalog, g.defId)?.name}
+                  </button>
+                ))}
+              <button type="button" onClick={cancelAbility}>
+                Cancel
+              </button>
+            </span>
+          </div>
+        )}
+
+      {state.pendingPrompt?.type === 'ability_target' &&
+        state.pendingPrompt.color === you &&
+        state.pendingPrompt.abilityId !== 'revive' && (
+          <div className="banner">
+            {state.pendingPrompt.message}
+            <span className="prompt-actions">
+              <button type="button" onClick={cancelAbility}>
+                Cancel
+              </button>
+            </span>
+          </div>
+        )}
+
+      {(state.pendingPrompt?.type === 'spring_bounce' || state.pendingPrompt?.type === 'gnome_hole_travel') &&
+        state.pendingPrompt.color === you && (
+          <div className="banner">
+            {state.pendingPrompt.message}
+            {state.pendingPrompt.type === 'gnome_hole_travel' && (
+              <span className="prompt-actions">
+                <button type="button" onClick={() => send({ type: 'resolve_prompt', payload: 'skip' })}>
+                  Stay here
+                </button>
+              </span>
+            )}
+          </div>
+        )}
+
+      {state.pendingPrompt?.type === 'gambler_choice' && you && (
+        <GamblerPrompt
+          prompt={state.pendingPrompt}
+          you={you}
+          state={state}
+          catalog={catalog}
+          onResolve={(payload) => send({ type: 'resolve_prompt', payload })}
+        />
+      )}
+    </>
   );
 }
 

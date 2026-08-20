@@ -45,8 +45,8 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     ],
     abilities: [
       'Barrier Spell: starting army places barriers on the side frontline squares instead of those pawns.',
-      'Barrier Shift: move a barrier to an empty allied-territory square (uses your turn).',
-      'Barrier Phase: can move over barriers.',
+      'Barrier Phase: may occupy and pass through barrier tiles (click the highlighted square to walk onto it).',
+      'Barrier Shift: press the Barrier Shift button, then choose a barrier and an empty allied square (uses your turn).',
       'Promote into Rook variants at the far edge.',
     ],
     misc: ['Captures diagonally only.', 'Barriers cannot sit adjacent to each other.'],
@@ -100,7 +100,9 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'pig',
     name: 'Pig',
     classLabel: 'Knight',
-    movement: ['Moves in an L shape (2 then 1). Cannot jump over pieces.'],
+    movement: [
+      'Moves in an L shape (2 then 1). Cannot jump over enemy pieces or barriers (allies on the long leg do not block).',
+    ],
     abilities: [
       'Best Buddy: may share a tile with an allied non-king piece that sits on a normal L (2–1) landing (same path rules as movement — not a teleport).',
       'If that shared tile is captured, both pieces fall and you gain up to 3 bonus turns.',

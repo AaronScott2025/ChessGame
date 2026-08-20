@@ -145,12 +145,13 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
             <h2>Starting the game</h2>
             <p>
               Build your army by drafting <strong>one variant of each class</strong>: Pawn, Rook, Bishop,
-              Knight, Wildcard, and Queen (plus your King). You cannot mix variants of the same class during
-              army building (e.g. Pawn and Rogue together).
+              Knight, Wildcard, and Queen (plus your King). Pick classes in any order — you could take Queen
+              first, then Pawn, and so on.
             </p>
             <ul>
               <li>
-                <strong>Black</strong> decides who drafts first. Players then alternate picking variants.
+                <strong>Black</strong> decides who drafts first. Players then alternate picks until both
+                armies are complete. Each player&apos;s picks are visible during the draft.
               </li>
               <li>
                 Place your pawn row on the <strong>2nd rank</strong> from your side.
@@ -203,7 +204,7 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
               (20 half-turns).
             </p>
             <ul>
-              <li>At the start of each new day, both players draw <strong>2 cards</strong>.</li>
+              <li>At the start of each new day, both players draw <strong>1 card</strong>.</li>
               <li>Hand size is capped at <strong>5</strong>. If a draw would go over 5, you still see the card, then must discard down to 5 before anything else.</li>
               <li>
                 Spell cards stay in your hand from the opening, but cannot be cast until the first night.

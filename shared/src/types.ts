@@ -96,8 +96,11 @@ export interface PlayerState {
 export interface DraftState {
   pickingColor: Color;
   blackChoseFirstPicker: boolean | null;
-  order: PieceClass[];
-  index: number;
+  lastPick?: {
+    color: Color;
+    defId: string;
+    pieceClass: PieceClass;
+  };
 }
 
 export interface GameState {

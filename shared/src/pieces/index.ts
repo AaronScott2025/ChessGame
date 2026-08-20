@@ -105,24 +105,30 @@ export const PIECES: Record<string, PieceDefinition> = {
     promoteOptions: ['rook', 'stoneman', 'gnome'],
     getMoves: (p, s) => {
       const moves = [];
-      const bonus = hasEffect(p, 'movement_plus') ? 1 : 0;
+      const bonus = movementBonus(p);
       const max = (!p.hasMoved ? 2 : 1) + bonus;
       for (const d of ORTH) {
         for (let i = 1; i <= max; i++) {
           const to = { row: p.pos.row + d.row * i, col: p.pos.col + d.col * i };
           if (!inBounds(to)) break;
-          const barrier = s.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, to));
-          if (barrier) continue; // phase over barriers
           const occ = pieceAt(s, to);
           if (occ) break;
+          // Barrier Phase: may occupy and pass through barrier tiles
           moves.push({ to });
-          if (p.hasMoved && i >= 1 + bonus) break;
         }
       }
       for (const d of DIAG) {
         const to = { row: p.pos.row + d.row, col: p.pos.col + d.col };
-        const opt = emptyOrEnemy(s, to, p.color);
-        if (opt?.capture) moves.push(opt);
+        if (!inBounds(to)) continue;
+        const occ = pieceAt(s, to);
+        if (
+          occ &&
+          occ.color !== p.color &&
+          !hasEffect(occ, 'invincible') &&
+          !hasEffect(occ, 'pause')
+        ) {
+          moves.push({ to, capture: true });
+        }
       }
       return filterLegal(p, s, moves);
     },

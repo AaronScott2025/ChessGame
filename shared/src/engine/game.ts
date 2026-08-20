@@ -1,4 +1,4 @@
-import type { Color, Coord, GameState, PendingPrompt, PieceState, PlayerState } from '../types.js';
+import type { Color, Coord, GameState, PendingPrompt, PieceClass, PieceState, PlayerState } from '../types.js';
 import { BOARD_SIZE, MAX_HAND } from '../types.js';
 import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS } from '../pieces/index.js';
 import type { MoveOption } from '../pieces/helpers.js';
@@ -160,8 +160,6 @@ export function startDraft(state: GameState): GameState {
   next.draft = {
     pickingColor: 'white',
     blackChoseFirstPicker: null,
-    order: [...DRAFT_ORDER],
-    index: 0,
   };
   log(next, 'Draft started — Black chooses who picks first.');
   return next;
@@ -182,24 +180,28 @@ export function draftPick(state: GameState, color: Color, defId: string): GameSt
   if (state.phase !== 'draft' || !state.draft) throw new Error('Not drafting');
   if (state.draft.blackChoseFirstPicker == null) throw new Error('Black must choose who picks first');
   if (state.draft.pickingColor !== color) throw new Error('Not your pick');
-  const cls = state.draft.order[state.draft.index];
-  const options = VARIANTS_BY_CLASS[cls];
-  if (!options.includes(defId)) throw new Error('Invalid variant for this slot');
+
+  const def = getPieceDef(defId);
+  const cls = def.class;
+  if (cls === 'king' || !DRAFT_ORDER.includes(cls)) throw new Error('Invalid draft class');
+  if (!VARIANTS_BY_CLASS[cls]?.includes(defId)) throw new Error('Invalid variant for this class');
+  if (state.players[color].army[cls]) throw new Error(`Already drafted ${cls}`);
+
   const next = cloneState(state);
   next.players[color].army[cls] = defId;
-  // opponent picks same class next, then advance
-  const other = opposite(color);
-  if (!next.players[other].army[cls]) {
-    next.draft!.pickingColor = other;
-  } else {
-    next.draft!.index += 1;
-    if (next.draft!.index >= next.draft!.order.length) {
-      return finishDraftAndSetup(next);
-    }
-    next.draft!.pickingColor = next.draft!.blackChoseFirstPicker ? 'white' : 'black';
+  next.draft!.lastPick = { color, defId, pieceClass: cls };
+  next.draft!.pickingColor = opposite(color);
+
+  if (armyDraftComplete(next.players.white.army) && armyDraftComplete(next.players.black.army)) {
+    return finishDraftAndSetup(next);
   }
-  log(next, `${color} drafted ${getPieceDef(defId).name}`);
+
+  log(next, `${color} drafted ${def.name} (${cls})`);
   return next;
+}
+
+function armyDraftComplete(army: Partial<Record<PieceClass, string>>): boolean {
+  return DRAFT_ORDER.every((cls) => Boolean(army[cls]));
 }
 
 function finishDraftAndSetup(state: GameState): GameState {
@@ -429,6 +431,7 @@ export function listMoves(state: GameState, pieceId: string): MoveOption[] {
         // special without meta — illegal
         return false;
       } else {
+        endBestBuddy(trial, tp, { ...tp.pos });
         tp.pos = { ...m.to };
       }
       return !isInCheck(trial, piece.color);
@@ -478,7 +481,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       id: 'barrier_shift',
       name: 'Barrier Shift',
       ready: hasBarrier && (piece.disabledTurns ?? 0) <= 0,
-      hint: 'Move one of your barriers to an empty allied-territory square (uses turn)',
+      hint: 'Press this, then click a barrier and an empty allied square. Walking onto a barrier is a normal move (Barrier Phase).',
     });
   }
   if (piece.defId === 'reaper') {
@@ -1163,6 +1166,9 @@ function addEchoOption(state: GameState, piece: PieceState, from: Coord, to: Coo
 
 function removePiece(state: GameState, piece: PieceState, byColor: Color): void {
   endBestBuddy(state, piece, piece.pos);
+  for (const p of state.pieces) {
+    if (p.coOccupantId === piece.id) p.coOccupantId = undefined;
+  }
   // enchant fails if ally taken
   for (const p of state.pieces) {
     const ench = hasEffect(p, 'enchant_ritual');
@@ -1561,9 +1567,9 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
       log(next, `It is now ${next.dayNight}`);
       if (next.dayNight === 'day') {
         for (const c of ['white', 'black'] as Color[]) {
-          tryDrawWithHandLimit(next, c, 2);
+          tryDrawWithHandLimit(next, c);
         }
-        log(next, 'New day — both players draw 2');
+        log(next, 'New day — both players draw 1');
       }
       // reaper gains charge at night if alive; ghosts unlock permanently
       if (next.dayNight === 'night') {
@@ -1731,10 +1737,15 @@ export function publicState(state: GameState, viewer: Color | null): GameState {
   return view;
 }
 
-export function getDraftOptions(state: GameState): string[] {
+export function getDraftOptions(state: GameState, color?: Color): string[] {
   if (!state.draft) return [];
-  const cls = state.draft.order[state.draft.index];
-  return VARIANTS_BY_CLASS[cls] ?? [];
+  const picker = color ?? state.draft.pickingColor;
+  const army = state.players[picker].army;
+  const out: string[] = [];
+  for (const cls of DRAFT_ORDER) {
+    if (!army[cls]) out.push(...(VARIANTS_BY_CLASS[cls] ?? []));
+  }
+  return out;
 }
 
 export { VARIANTS_BY_CLASS, PIECES, DRAFT_ORDER, shuffleInPlace };
