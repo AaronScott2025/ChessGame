@@ -53,6 +53,12 @@ export interface PieceState {
   gadgetUsed?: boolean;
   /** Wizard enchant cooldown (owner turns remaining) */
   abilityCooldown?: number;
+  /** Scamman: last captured piece type available to steal (once). */
+  identityLootDefId?: string;
+  /** Scamman: Identity Theft already used. */
+  identityTheftUsed?: boolean;
+  /** Scamman: permanently use this piece definition's movement. */
+  copiedMoveDefId?: string;
 }
 
 export interface TokenState {
@@ -90,6 +96,8 @@ export interface PlayerState {
   maxSpellsThisTurn: number;
   openingRedrawUsed: boolean;
   skipTurns: number;
+  /** Extra turns earned (e.g. capturing a Best Buddy pair). */
+  bonusTurns: number;
   lastPlayedCardDefId?: string;
 }
 

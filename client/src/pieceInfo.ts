@@ -91,7 +91,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'snake',
     name: 'Snake',
     classLabel: 'Knight',
-    movement: ['Moves in an L shape (3 then 1). Cannot jump over pieces normally.'],
+    movement: ['Moves in an L shape (2 then 1). Cannot jump over pieces or barriers normally.'],
     abilities: [
       'Bloodlust: after capturing, on the Snake’s next move it gains ±1 on an L-leg and can jump over pieces.',
     ],
@@ -105,7 +105,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     ],
     abilities: [
       'Best Buddy: may share a tile with an allied non-king piece that sits on a normal L (2–1) landing (same path rules as movement — not a teleport).',
-      'If that shared tile is captured, both pieces fall and you gain up to 3 bonus turns.',
+      'If that shared tile is captured, both pieces fall and the Pig’s owner gains 3 bonus turns.',
     ],
     misc: ['Can only act during the day.'],
   },
@@ -123,6 +123,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves 1 square diagonally.'],
     abilities: [
       'Fraudulent Fate: any non-pawn that captures this piece becomes a basic Pawn.',
+      'Identity Theft (once): after capturing a piece, activate whenever you want to permanently move like that piece (movement only, not specials). Later captures replace the stored identity until you activate.',
     ],
   },
   wizard: {
@@ -161,7 +162,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     name: 'Ghost',
     classLabel: 'Queen',
     movement: ['Moves to any tile in a 2×2 Chebyshev area around itself.'],
-    abilities: ['Phase Walk: can pass through pieces (like the Horse).'],
+    abilities: ['Phase Walk: can move over pieces only during Night.'],
     misc: ['Cannot move until the first night of the game.'],
   },
   reaper: {

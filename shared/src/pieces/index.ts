@@ -10,6 +10,7 @@ import {
 } from '../utils.js';
 import {
   areaMoves,
+  chebyshevPathBlocked,
   emptyOrEnemy,
   filterLegal,
   knightMoves,
@@ -194,12 +195,12 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♞',
     getMoves: (p, s) => {
       const jump = Boolean(p.bloodlust);
-      const moves = knightMoves(p, s, 3, 1, jump);
+      const moves = knightMoves(p, s, 2, 1, jump);
       // Bloodlust: +1/-1 on either leg of the L
       if (p.bloodlust) {
-        moves.push(...knightMoves(p, s, 4, 1, true));
-        moves.push(...knightMoves(p, s, 2, 1, true));
-        moves.push(...knightMoves(p, s, 3, 2, true));
+        moves.push(...knightMoves(p, s, 3, 1, true));
+        moves.push(...knightMoves(p, s, 1, 1, true));
+        moves.push(...knightMoves(p, s, 2, 2, true));
       }
       return filterLegal(p, s, moves);
     },
@@ -214,9 +215,9 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♞',
     canAct: dayOnly,
     getMoves: (p, s) => {
-      const moves = knightMoves(p, s, 2, 1, false);
+      const moves = knightMoves(p, s, 2, 1, false, true);
       // Best Buddy: only allies on the Pig’s normal L landings (same path rules as movement)
-      for (const to of knightTargetCoords(p, s, 2, 1, false)) {
+      for (const to of knightTargetCoords(p, s, 2, 1, false, true)) {
         const ally = pieceAt(s, to);
         if (!ally || ally.color !== p.color || ally.id === p.id || ally.class === 'king') continue;
         if (!isPigLShape(p.pos, to, movementBonus(p))) continue;
@@ -237,7 +238,17 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'TheScamMan',
     class: 'bishop',
     symbol: '♝',
-    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, DIAG, 1)),
+    getMoves: (p, s) => {
+      const stolen = p.copiedMoveDefId;
+      if (stolen && stolen !== 'scamman') {
+        const def = PIECES[stolen];
+        if (def) {
+          const copied = def.getMoves(p, s).filter((m) => !m.special);
+          return filterLegal(p, s, copied);
+        }
+      }
+      return filterLegal(p, s, rayMoves(p, s, DIAG, 1));
+    },
   },
   wizard: {
     id: 'wizard',
@@ -279,7 +290,12 @@ export const PIECES: Record<string, PieceDefinition> = {
       const unlocked =
         hasEffect(p, 'ghost_unlocked') || s.dayNight === 'night' || s.cycleCount >= 5;
       if (!unlocked) return [];
-      return filterLegal(p, s, areaMoves(p, s, 2));
+      let moves = areaMoves(p, s, 2);
+      // Phase Walk: can move over pieces only during Night
+      if (s.dayNight !== 'night') {
+        moves = moves.filter((m) => !chebyshevPathBlocked(p.pos, m.to, s));
+      }
+      return filterLegal(p, s, moves);
     },
   },
   reaper: {

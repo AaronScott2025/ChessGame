@@ -28,7 +28,7 @@ export interface CardDefinition {
   name: string;
   description: string[];
   image: string;
-  /** Starting hand cannot include Rally */
+  /** Optional draw filters (e.g. opening hand avoids duplicates) */
   tags?: Array<'rally' | 'instant' | 'persistent'>;
   playOnOpponentTurn?: boolean;
   copiesInDeck?: number;

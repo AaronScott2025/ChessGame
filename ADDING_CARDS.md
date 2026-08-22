@@ -16,7 +16,7 @@ registerCard({
   image: '/cards/Example.png',
   copiesInDeck: 2,
   targeting: 'allied_piece',
-  tags: [], // add 'rally' for opening-hand ban; 'instant' for flavor; 'persistent' if face-up ongoing
+  tags: [], // 'rally' | 'instant' | 'persistent' for card classification
   playOnOpponentTurn: false,
   canPlay: (ctx) => null, // or return an error string
   play: (ctx, targets) => {

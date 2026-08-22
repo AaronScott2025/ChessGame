@@ -168,7 +168,6 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
             <p>After armies are placed, each player draws <strong>3 spell cards</strong>.</p>
             <ul>
               <li>No duplicate spells in the opening hand — redraw if you draw a duplicate.</li>
-              <li>No Rally cards in the opening hand — redraw if you draw one.</li>
               <li>
                 Once, during this opening only, you may discard one card to draw a replacement. If you waive
                 it, you cannot exchange later.

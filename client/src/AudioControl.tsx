@@ -10,6 +10,7 @@
  * - sfxUi      → buttons outside the board
  * - sfxPiece   → board square / piece interactions
  * - sfxCardCast→ successfully casting a spell card
+ * Draw / discard / day-night SFX are procedural (Web Audio) and need no files.
  */
 
 import { useEffect, useState, type Dispatch, type SetStateAction } from 'react';
@@ -467,6 +468,41 @@ export function playPieceLostSfx() {
   playTone(ctx, master, { type: 'triangle', freq: 240, endFreq: 90, start: t + 0.03, dur: 0.18, peak: 0.08 });
 }
 
+/** Sharp warning sting when your king is put in check. */
+export function playCheckSfx() {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const master = ctx.createGain();
+  master.gain.value = 1;
+  master.connect(ctx.destination);
+
+  // Two urgent rising hits, then a low held dissonance
+  playTone(ctx, master, { type: 'sawtooth', freq: 220, endFreq: 440, start: t, dur: 0.14, peak: 0.16 });
+  playTone(ctx, master, { type: 'square', freq: 330, endFreq: 520, start: t + 0.12, dur: 0.16, peak: 0.14 });
+  playTone(ctx, master, { type: 'triangle', freq: 185, endFreq: 110, start: t + 0.28, dur: 0.45, peak: 0.2 });
+  playTone(ctx, master, { type: 'sine', freq: 277, endFreq: 196, start: t + 0.3, dur: 0.4, peak: 0.1 });
+
+  const noise = ctx.createBufferSource();
+  noise.buffer = noiseBuffer(ctx, 0.35);
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.setValueAtTime(1200, t);
+  filter.frequency.exponentialRampToValueAtTime(400, t + 0.3);
+  filter.Q.value = 2.5;
+  const nGain = ctx.createGain();
+  nGain.gain.setValueAtTime(0.0001, t);
+  nGain.gain.linearRampToValueAtTime(0.08, t + 0.04);
+  nGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
+  noise.connect(filter);
+  filter.connect(nGain);
+  nGain.connect(master);
+  noise.start(t);
+  noise.stop(t + 0.35);
+}
+
 /** Cool descending wash as day becomes night. */
 export function playDayToNightSfx() {
   if (!engine.sfxEnabled) return;
@@ -573,6 +609,48 @@ export function playCardDiscardSfx() {
   noise.stop(t + 0.14);
 
   playTone(ctx, master, { type: 'triangle', freq: 220, endFreq: 140, start: t + 0.02, dur: 0.08, peak: 0.06 });
+}
+
+/** Soft deal swoosh when a card is drawn into hand. */
+export function playCardDrawSfx(count = 1) {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const master = ctx.createGain();
+  master.gain.value = 1;
+  master.connect(ctx.destination);
+
+  const n = Math.min(4, Math.max(1, Math.floor(count)));
+  for (let i = 0; i < n; i++) {
+    const start = t + i * 0.068;
+    const noise = ctx.createBufferSource();
+    noise.buffer = noiseBuffer(ctx, 0.12);
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(2400, start);
+    filter.frequency.exponentialRampToValueAtTime(900, start + 0.09);
+    filter.Q.value = 0.75;
+    const nGain = ctx.createGain();
+    nGain.gain.setValueAtTime(0.0001, start);
+    nGain.gain.linearRampToValueAtTime(0.07, start + 0.01);
+    nGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.11);
+    noise.connect(filter);
+    filter.connect(nGain);
+    nGain.connect(master);
+    noise.start(start);
+    noise.stop(start + 0.12);
+
+    playTone(ctx, master, {
+      type: 'triangle',
+      freq: 360 + i * 18,
+      endFreq: 210,
+      start: start + 0.015,
+      dur: 0.09,
+      peak: 0.055,
+    });
+  }
 }
 
 /** Soft chime when a room/lobby is created. */

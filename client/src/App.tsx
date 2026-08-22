@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { listMoves as engineListMoves, availableAbilities as engineAbilities } from '@shared/engine/game.ts';
+import {
+  applyClientAction,
+  createLobbyState,
+  getDraftOptions,
+  startDraft,
+  CARD_REGISTRY,
+  PIECES,
+} from '@shared/index.ts';
 import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
 import { spellsUnlocked } from '@shared/utils.ts';
@@ -9,7 +17,9 @@ import {
   AudioToggles,
   playCardCastSfx,
   playCardDiscardSfx,
+  playCardDrawSfx,
   playCaptureSfx,
+  playCheckSfx,
   playDayToNightSfx,
   playDraftOrderSfx,
   playDraftPickSfx,
@@ -44,7 +54,7 @@ interface Piece {
   class: string;
   color: Color;
   pos: Coord;
-  effects: Array<{ id?: string; kind: string; turnsRemaining?: number }>;
+  effects: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   charges?: number;
   gadgetUsed?: boolean;
   abilityCooldown?: number;
@@ -52,6 +62,9 @@ interface Piece {
   reviveCount?: number;
   bloodlust?: boolean;
   coOccupantId?: string;
+  identityLootDefId?: string;
+  identityTheftUsed?: boolean;
+  copiedMoveDefId?: string;
 }
 
 interface AbilityInfo {
@@ -163,7 +176,7 @@ const DRAFT_CLASS_LABELS: Record<string, string> = {
   queen: 'Queen',
 };
 
-const BOARD_SQ_PX = 68;
+const BOARD_SQ_PX = 60;
 
 function moveAnimDuration(deltaCol: number, deltaRow: number): number {
   const dist = Math.max(Math.abs(deltaCol), Math.abs(deltaRow));
@@ -193,30 +206,50 @@ function cyclesUntilDayNightFlip(cycleCount: number): number {
 function gameTurnInfo(
   state: GameState,
   you: Color,
+  localMode = false,
 ): { yours: boolean; label: string; detail?: string } | null {
   if (state.phase === 'playing') {
+    const seatName = you === 'white' ? 'White' : 'Black';
+    const turnName = state.turn === 'white' ? 'White' : 'Black';
     return {
       yours: state.turn === you,
-      label: state.turn === you ? 'Your turn' : "Opponent's turn",
+      label: localMode
+        ? state.turn === you
+          ? `${seatName} to play`
+          : `Pass to ${turnName}`
+        : state.turn === you
+          ? 'Your turn'
+          : "Opponent's turn",
       detail: state.turnPhase,
     };
   }
   if (state.phase === 'draft' && state.draft) {
     if (state.draft.blackChoseFirstPicker == null) {
       if (you === 'black') {
-        return { yours: true, label: 'Your choice', detail: 'Who drafts first?' };
+        return { yours: true, label: localMode ? 'Black chooses' : 'Your choice', detail: 'Who drafts first?' };
       }
       return { yours: false, label: 'Waiting', detail: 'Black picks draft order' };
     }
     const picking = state.draft.pickingColor;
+    const pickName = picking === 'white' ? 'White' : 'Black';
     return {
       yours: picking === you,
-      label: picking === you ? 'Your pick' : `${state.players[picking].name} is picking`,
+      label: localMode
+        ? picking === you
+          ? `${pickName} picks`
+          : `Pass to ${pickName}`
+        : picking === you
+          ? 'Your pick'
+          : `${state.players[picking].name} is picking`,
       detail: 'Army draft',
     };
   }
   if (state.phase === 'opening_draw') {
-    return { yours: true, label: 'Opening hand', detail: 'Keep or mulligan cards' };
+    return {
+      yours: true,
+      label: localMode ? `${you === 'white' ? 'White' : 'Black'} opening hand` : 'Opening hand',
+      detail: 'Keep or mulligan cards',
+    };
   }
   return null;
 }
@@ -224,6 +257,7 @@ function gameTurnInfo(
 function turnStripContent(
   state: GameState,
   you: Color | null,
+  localMode = false,
 ): { mode: 'yours' | 'waiting' | 'ended'; title: string; detail: string } {
   if (state.phase === 'ended') {
     return {
@@ -232,12 +266,12 @@ function turnStripContent(
       detail: state.winReason ?? '',
     };
   }
-  const info = you ? gameTurnInfo(state, you) : null;
+  const info = you ? gameTurnInfo(state, you, localMode) : null;
   if (info?.yours) {
     if (state.phase === 'playing') {
       return {
         mode: 'yours',
-        title: 'Your turn',
+        title: localMode ? `${you === 'white' ? 'White' : 'Black'} to play` : 'Your turn',
         detail: spellsUnlocked(state)
           ? `Cast a spell or move a piece (${state.turnPhase})`
           : 'Move a piece — spell cards unlock at the first night',
@@ -247,7 +281,7 @@ function turnStripContent(
   }
   return {
     mode: 'waiting',
-    title: 'Waiting for opponent',
+    title: localMode ? 'Pass the device' : 'Waiting for opponent',
     detail:
       state.phase === 'draft'
         ? 'Draft'
@@ -288,6 +322,37 @@ function sanitizeMoves(piece: Piece | undefined, opts: MoveOption[]): MoveOption
   );
 }
 
+function buildLocalCatalog(): Catalog {
+  return {
+    pieces: Object.values(PIECES).map((p) => ({
+      id: p.id,
+      name: p.name,
+      class: p.class,
+      symbol: p.symbol,
+    })),
+    cards: Object.values(CARD_REGISTRY).map((c) => ({
+      id: c.id,
+      name: c.name,
+      description: c.description,
+      image: c.image,
+      playOnOpponentTurn: c.playOnOpponentTurn,
+      targeting: c.targeting,
+    })),
+  };
+}
+
+/** Which seat should control the UI in pass-and-play. */
+function localActiveSeat(state: GameState): Color {
+  const promptColor = state.pendingPrompt?.color;
+  if (promptColor === 'white' || promptColor === 'black') return promptColor;
+  if (state.phase === 'draft' && state.draft) {
+    if (state.draft.blackChoseFirstPicker == null) return 'black';
+    return state.draft.pickingColor ?? 'white';
+  }
+  if (state.phase === 'playing' || state.phase === 'ended') return state.turn;
+  return 'white';
+}
+
 export default function App() {
   const { fxEnabled, setFxEnabled } = useFxEnabled();
   const { knowledgeEnabled, setKnowledgeEnabled } = useKnowledgeEnabled();
@@ -299,6 +364,8 @@ export default function App() {
   const [name, setName] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [roomCode, setRoomCode] = useState<string | null>(null);
+  const [localMode, setLocalMode] = useState(false);
+  const localModeRef = useRef(false);
   const [you, setYou] = useState<Color | null>(null);
   const [state, setState] = useState<GameState | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
@@ -332,11 +399,15 @@ export default function App() {
   const lastHistorySfxRef = useRef<string | null>(null);
   const lastCaptureSfxKeyRef = useRef<string | null>(null);
   const lastGraveCountsRef = useRef<{ white: number; black: number } | null>(null);
+  const lastHandIdsRef = useRef<string[] | null>(null);
+  const lastCheckRef = useRef<Color | null | 'unset'>('unset');
+  const [checkAlert, setCheckAlert] = useState(false);
   const [moveAnim, setMoveAnim] = useState<{
     key: string;
     pieceId: string;
     deltaCol: number;
     deltaRow: number;
+    sqPx: number;
     durationMs: number;
     phase: 'from' | 'to';
   } | null>(null);
@@ -358,6 +429,7 @@ export default function App() {
     const s = io(SOCKET_URL || undefined, { transports: ['websocket', 'polling'] });
     setSocket(s);
     s.on('state', (payload: { state: GameState; you: Color; draftOptions: string[]; catalog: Catalog }) => {
+      if (localModeRef.current) return;
       setState(payload.state);
       setYou(payload.you);
       setDraftOptions(payload.draftOptions ?? []);
@@ -404,6 +476,9 @@ export default function App() {
     const visualToRow = flipBoard ? 9 - lm.to.row : lm.to.row;
     const visualToCol = flipBoard ? 9 - lm.to.col : lm.to.col;
 
+    const boardEl = document.querySelector('.board') as HTMLElement | null;
+    const sqRaw = boardEl ? getComputedStyle(boardEl).getPropertyValue('--sq') : '';
+    const sqPx = Number.parseFloat(sqRaw) || BOARD_SQ_PX;
     const deltaCol = visualToCol - visualFromCol;
     const deltaRow = visualToRow - visualFromRow;
 
@@ -412,6 +487,7 @@ export default function App() {
       pieceId: lm.pieceId,
       deltaCol,
       deltaRow,
+      sqPx,
       durationMs: moveAnimDuration(deltaCol, deltaRow),
       phase: 'from',
     });
@@ -501,12 +577,16 @@ export default function App() {
       ? `${lm.pieceId}:${lm.capturedId}:${lm.from.row},${lm.from.col}:${lm.to.row},${lm.to.col}`
       : null;
 
+    const handIds = state.players[you].hand.map((c) => c.instanceId);
+
     if (skipGameSfxRef.current) {
       skipGameSfxRef.current = false;
       lastDayNightSfxRef.current = state.dayNight;
       lastHistorySfxRef.current = head;
       lastCaptureSfxKeyRef.current = captureKey;
       lastGraveCountsRef.current = graves;
+      lastHandIdsRef.current = handIds;
+      lastCheckRef.current = state.check;
       return;
     }
 
@@ -515,6 +595,14 @@ export default function App() {
       else playNightToDaySfx();
       lastDayNightSfxRef.current = state.dayNight;
     }
+
+    const prevCheck = lastCheckRef.current;
+    if (prevCheck !== 'unset' && state.check === you && prevCheck !== you) {
+      playCheckSfx();
+      setCheckAlert(true);
+      setStatus('Check! Your king is under attack.');
+    }
+    lastCheckRef.current = state.check;
 
     if (head && head !== lastHistorySfxRef.current) {
       lastHistorySfxRef.current = head;
@@ -531,6 +619,13 @@ export default function App() {
       lastHistorySfxRef.current = head;
     }
 
+    const prevHand = lastHandIdsRef.current;
+    if (prevHand) {
+      const added = handIds.filter((id) => !prevHand.includes(id)).length;
+      if (added > 0) playCardDrawSfx(added);
+    }
+    lastHandIdsRef.current = handIds;
+
     if (captureKey && captureKey !== lastCaptureSfxKeyRef.current) {
       lastCaptureSfxKeyRef.current = captureKey;
       if (lm?.color === you) playCaptureSfx();
@@ -545,6 +640,12 @@ export default function App() {
     }
     lastGraveCountsRef.current = graves;
   }, [state, you]);
+
+  useEffect(() => {
+    if (!checkAlert) return;
+    const t = window.setTimeout(() => setCheckAlert(false), 2400);
+    return () => window.clearTimeout(t);
+  }, [checkAlert]);
 
   useEffect(() => {
     if (!state) return;
@@ -565,7 +666,58 @@ export default function App() {
     );
   }, [state?.phase, state?.pendingPrompt?.message]);
 
+  // Pass-the-device toasts are informational only — auto-dismiss so they don't cover the board.
+  useEffect(() => {
+    if (!status.startsWith('Pass the device')) return;
+    if (error || state?.pendingPrompt || spellConfirm || confirmKey) return;
+    const t = window.setTimeout(() => {
+      setStatus((current) => (current.startsWith('Pass the device') ? '' : current));
+    }, 2200);
+    return () => window.clearTimeout(t);
+  }, [status, error, state?.pendingPrompt, spellConfirm, confirmKey]);
+
+  const clearTransientUi = () => {
+    setConfirmKey(null);
+    setSpellConfirm(null);
+    setFocusSpecial(null);
+    setSelectedPiece(null);
+    setSelectedCard(null);
+    setPendingTargets([]);
+    setMoves([]);
+    setAbilities([]);
+    setGadgetKind(null);
+  };
+
+  const applyLocalState = (next: GameState, actingAs: Color) => {
+    const seat = localActiveSeat(next);
+    const turnKey = `${next.turn}:${next.phase}:${next.pendingPrompt?.type ?? ''}:${seat}`;
+    if (prevTurnRef.current && prevTurnRef.current !== turnKey) {
+      clearTransientUi();
+    }
+    prevTurnRef.current = turnKey;
+    setState(next as GameState);
+    setYou(seat);
+    setDraftOptions(getDraftOptions(next as never));
+    setError(null);
+    if (seat !== actingAs) {
+      const label = seat === 'white' ? 'White' : 'Black';
+      setStatus(`Pass the device — ${label}'s turn`);
+    } else {
+      setStatus((current) => (current.startsWith('Pass the device') ? '' : current));
+    }
+  };
+
   const send = (action: object) => {
+    if (localMode) {
+      if (!state || !you) return;
+      try {
+        const next = applyClientAction(state as never, you, action as never);
+        applyLocalState(next as GameState, you);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+      return;
+    }
     if (!socket || !roomCode) return;
     socket.emit('action', { code: roomCode, action }, (res: { ok: boolean; error?: string }) => {
       if (!res?.ok) setError(res?.error ?? 'Action failed');
@@ -605,8 +757,7 @@ export default function App() {
     if (!state) return;
     setFocusSpecial(null);
     refreshMoves(pieceId, state);
-    // Also ask server (authoritative); merge if still selecting this piece
-    if (!socket || !roomCode) return;
+    if (localMode || !socket || !roomCode) return;
     socket.emit(
       'get_moves',
       { code: roomCode, pieceId },
@@ -623,7 +774,56 @@ export default function App() {
     );
   };
 
+  const startLocalGame = () => {
+    localModeRef.current = true;
+    setLocalMode(true);
+    skipGameSfxRef.current = true;
+    skipMoveAnimRef.current = true;
+    clearTransientUi();
+    setError(null);
+
+    let next = createLobbyState('LOCAL');
+    const whiteName = name.trim() || 'White';
+    next.players.white.connected = true;
+    next.players.black.connected = true;
+    next.players.white.name = whiteName;
+    next.players.black.name = 'Black';
+    next = startDraft(next);
+
+    setCatalog(buildLocalCatalog());
+    setDraftOptions(getDraftOptions(next));
+    setRoomCode('LOCAL');
+    setState(next as GameState);
+    setYou('black');
+    prevTurnRef.current = `${next.turn}:${next.phase}: :black`;
+    setStatus('Local play — Black chooses who drafts first. Pass the device as seats change.');
+    setCeremony({
+      kind: 'vs',
+      white: next.players.white.name,
+      black: next.players.black.name,
+    });
+  };
+
+  const exitToHome = () => {
+    localModeRef.current = false;
+    setLocalMode(false);
+    setRoomCode(null);
+    setState(null);
+    setYou(null);
+    setCatalog(null);
+    setDraftOptions([]);
+    clearTransientUi();
+    setError(null);
+    setStatus('Connect and create or join a room.');
+    setCeremony(null);
+    skipGameSfxRef.current = true;
+    skipMoveAnimRef.current = true;
+    prevTurnRef.current = null;
+  };
+
   const createRoom = () => {
+    localModeRef.current = false;
+    setLocalMode(false);
     socket?.emit('create_room', { name }, (res: { ok: boolean; code?: string; color?: Color; error?: string }) => {
       if (!res.ok) return setError(res.error ?? 'Create failed');
       setRoomCode(res.code!);
@@ -633,6 +833,8 @@ export default function App() {
   };
 
   const joinRoom = () => {
+    localModeRef.current = false;
+    setLocalMode(false);
     socket?.emit(
       'join_room',
       { code: joinCode.trim(), name },
@@ -935,6 +1137,36 @@ export default function App() {
     if (selectedCard && targetNeeded && canCastSpells) {
       const mode = activeCardDef!.targeting;
 
+      // Teleport: piece already chosen — next click is an empty destination 2 steps away
+      if (
+        activeCardDef!.id === 'teleport' &&
+        pendingTargets.length === 1 &&
+        typeof pendingTargets[0] === 'string'
+      ) {
+        if (board[row][col]) {
+          setStatus('Teleport: destination must be empty (no captures)');
+          return;
+        }
+        const piece = state.pieces.find((p) => p.id === pendingTargets[0]);
+        if (!piece) {
+          setPendingTargets([]);
+          setStatus('Teleport: pick an allied piece in allied territory');
+          return;
+        }
+        const dr = row - piece.pos.row;
+        const dc = col - piece.pos.col;
+        const legal =
+          (Math.abs(dr) === 2 && dc === 0) ||
+          (Math.abs(dc) === 2 && dr === 0) ||
+          (Math.abs(dr) === 2 && Math.abs(dc) === 2);
+        if (!legal) {
+          setStatus('Teleport: pick a square exactly 2 spaces away (orthogonal or diagonal)');
+          return;
+        }
+        offerSpellConfirm([...pendingTargets, { row, col }]);
+        return;
+      }
+
       // Revive: after choosing a graveyard index, pick spawn square
       if (mode === 'graveyard' && pendingTargets.length === 1 && typeof pendingTargets[0] === 'number') {
         offerSpellConfirm([...pendingTargets, { row, col }]);
@@ -969,17 +1201,6 @@ export default function App() {
         }
         const next = [...pendingTargets, { row, col }];
         const need = activeCardDef!.id === 'portal' ? 2 : 1;
-        if (activeCardDef!.id === 'teleport') {
-          if (next.length >= 2) {
-            offerSpellConfirm(next);
-          } else {
-            setPendingTargets(next);
-            clearBoardConfirm();
-            setSpellConfirm(null);
-            setStatus('Teleport: pick destination (exactly 2 steps).');
-          }
-          return;
-        }
         if (next.length >= need) {
           offerSpellConfirm(next);
         } else {
@@ -1080,10 +1301,14 @@ export default function App() {
           return;
         }
         if (activeCardDef!.id === 'teleport') {
+          if (!isAlliedTerritory(you!, piece.pos)) {
+            setStatus('Teleport: piece must be in allied territory');
+            return;
+          }
           setPendingTargets([piece.id]);
           clearBoardConfirm();
           setSpellConfirm(null);
-          setStatus('Teleport: now pick a destination 2 spaces away');
+          setStatus('Teleport: now pick an empty destination exactly 2 spaces away');
           return;
         }
         if (activeCardDef!.id === 'swap') {
@@ -1224,8 +1449,11 @@ export default function App() {
               <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Player" />
             </label>
             <div className="home-actions">
-              <button type="button" className="primary home-cta" onClick={createRoom}>
-                Create room
+              <button type="button" className="primary home-cta" onClick={startLocalGame}>
+                Local play
+              </button>
+              <button type="button" className="home-cta home-cta-secondary" onClick={createRoom}>
+                Create online room
               </button>
               <div className="home-join">
                 <input
@@ -1297,7 +1525,77 @@ export default function App() {
           onRedraw={(instanceId) => send({ type: 'opening_redraw', instanceId })}
         />
       )}
-      <TurnStrip state={state} you={you} />
+      <TurnStrip state={state} you={you} localMode={localMode} />
+      {checkAlert && (
+        <div className="check-alert" role="alert" aria-live="assertive">
+          <span className="check-alert-mark" aria-hidden />
+          <span className="check-alert-title">Check!</span>
+          <span className="check-alert-sub">Your king is under attack</span>
+        </div>
+      )}
+      {(status || error || state.pendingPrompt || spellConfirm) && (
+        <div
+          key={[
+            status,
+            error ?? '',
+            state.pendingPrompt?.type ?? '',
+            state.pendingPrompt?.message ?? '',
+            spellConfirm?.summary ?? '',
+            confirmKey ?? '',
+          ].join('|')}
+          className={[
+            'board-prompt-float',
+            error ? 'is-error' : '',
+            spellConfirm || state.pendingPrompt || confirmKey ? 'is-action' : '',
+          ]
+            .filter(Boolean)
+            .join(' ')}
+          role="status"
+          aria-live="assertive"
+        >
+          <p className="board-prompt-float-label">
+            {error ? 'Error' : spellConfirm || confirmKey ? 'Confirm' : state.pendingPrompt ? 'Action needed' : 'Message'}
+          </p>
+          <PlayPromptBanners
+            status={status}
+            error={error}
+            state={state}
+            you={you}
+            catalog={catalog}
+            gadgetKind={gadgetKind}
+            setGadgetKind={setGadgetKind}
+            setStatus={setStatus}
+            send={send}
+            cancelAbility={cancelAbility}
+          />
+          {spellConfirm && (
+            <div className="spell-confirm" role="dialog" aria-label="Confirm spell">
+              <p className="spell-confirm-summary">{spellConfirm.summary}</p>
+              <div className="spell-confirm-actions">
+                <button type="button" className="primary" onClick={confirmSpell}>
+                  Confirm
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const promptType = state.pendingPrompt?.type;
+                    if (promptType === 'gadget_choice' || promptType === 'ability_target') {
+                      cancelAbility();
+                      return;
+                    }
+                    setSpellConfirm(null);
+                    setFocusSpecial(null);
+                    clearBoardConfirm();
+                    setStatus('Canceled.');
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       <div className="shell-content">
       <header className="top">
         <div className="top-left">
@@ -1306,10 +1604,18 @@ export default function App() {
           </p>
           <div className="game-status-bar" role="status" aria-live="polite">
             <span className="status-chip chip-room">
-              Room <strong>{roomCode}</strong>
+              {localMode ? (
+                <>
+                  Mode <strong>Local</strong>
+                </>
+              ) : (
+                <>
+                  Room <strong>{roomCode}</strong>
+                </>
+              )}
             </span>
             <span className={`status-chip chip-you chip-you-${you}`}>
-              You · <strong>{you}</strong>
+              {localMode ? 'Controlling' : 'You'} · <strong>{you}</strong>
             </span>
             <span className={`status-chip chip-cycle chip-${state.dayNight}`}>
               <span className="chip-cycle-mark" aria-hidden />
@@ -1327,7 +1633,7 @@ export default function App() {
         <div className="top-right">
           {you
             ? (() => {
-                const turnInfo = gameTurnInfo(state, you);
+                const turnInfo = gameTurnInfo(state, you, localMode);
                 if (!turnInfo) return null;
                 return (
                   <div
@@ -1338,7 +1644,9 @@ export default function App() {
                     <span className="turn-pill-label">{turnInfo.label}</span>
                     {turnInfo.detail ? <span className="turn-pill-phase">{turnInfo.detail}</span> : null}
                     {state.phase === 'playing' && state.check ? (
-                      <span className="turn-pill-check">{state.check} in check</span>
+                      <span className={`turn-pill-check ${state.check === you ? 'is-you' : ''}`}>
+                        {state.check === you ? 'You are in check!' : `${state.check} in check`}
+                      </span>
                     ) : null}
                   </div>
                 );
@@ -1349,6 +1657,9 @@ export default function App() {
               {state.winner} wins ({state.winReason})
             </span>
           )}
+          <button type="button" className="exit-game-btn" onClick={exitToHome}>
+            {localMode ? 'Exit local' : 'Leave'}
+          </button>
         </div>
       </header>
 
@@ -1525,8 +1836,17 @@ export default function App() {
 
           <main className="board-wrap">
             <div className="board-stage">
-            <div className={`board ${flip ? 'flipped' : ''} ${state.phase === 'playing' ? (state.turn === you ? 'board-your-turn' : 'board-their-turn') : ''}`}>
-              {Array.from({ length: 10 }, (_, visualRow) =>
+            <div
+              className={[
+                'board',
+                flip ? 'flipped' : '',
+                state.phase === 'playing' ? (state.turn === you ? 'board-your-turn' : 'board-their-turn') : '',
+                state.phase === 'playing' && state.check === you ? 'board-in-check' : '',
+                checkAlert ? 'board-check-flash' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
+            >              {Array.from({ length: 10 }, (_, visualRow) =>
                 Array.from({ length: 10 }, (_, visualCol) => {
                   const row = flip ? 9 - visualRow : visualRow;
                   const col = flip ? 9 - visualCol : visualCol;
@@ -1552,6 +1872,8 @@ export default function App() {
                       p.pos.col === col,
                   );
                   const hasPigBuddy = Boolean(pigOnSquare) || Boolean(piece && pigHostIds.has(piece.id));
+                  const kingInCheck =
+                    Boolean(piece && piece.class === 'king' && state.check === piece.color);
                   const lastFrom =
                     !!state.lastMove &&
                     state.lastMove.from.row === row &&
@@ -1564,8 +1886,8 @@ export default function App() {
                   const sliding =
                     piece && moveAnim?.pieceId === piece.id
                       ? {
-                          dx: -moveAnim.deltaCol * BOARD_SQ_PX,
-                          dy: -moveAnim.deltaRow * BOARD_SQ_PX,
+                          dx: -moveAnim.deltaCol * moveAnim.sqPx,
+                          dy: -moveAnim.deltaRow * moveAnim.sqPx,
                           durationMs: moveAnim.durationMs,
                           phase: moveAnim.phase,
                         }
@@ -1586,6 +1908,7 @@ export default function App() {
                         lastFrom ? 'last-from' : '',
                         lastTo || lastPiece ? 'last-to' : '',
                         hasPigBuddy ? 'pig-buddy-sq' : '',
+                        kingInCheck ? 'king-in-check' : '',
                         moveHere ? 'move' : '',
                         moveHere && captureHere ? 'move-capture' : '',
                         moveHere && specialHere ? 'move-special' : '',
@@ -1725,6 +2048,7 @@ export default function App() {
                 }),
               )}
             </div>
+
             </div>
 
             <div className="ability-bar" aria-live="polite">
@@ -1738,7 +2062,7 @@ export default function App() {
                       title={a.hint}
                       onClick={() => {
                         if (a.passive) {
-                          if (a.id === 'bloodlust') {
+                          if (a.id === 'bloodlust' || a.id === 'identity_theft') {
                             setFocusSpecial(null);
                             setStatus(a.hint ?? a.name);
                             return;
@@ -1765,161 +2089,114 @@ export default function App() {
                 </button>
               ) : null}
             </div>
-          </main>
 
-          <aside className="side hand-side">
-            <h2>Your hand</h2>
-            <div
-              className={`hand ${
-                state.phase === 'playing' &&
-                ((state.turn === you && state.turnPhase === 'move') || !spellsUnlocked(state))
-                  ? 'hand-spell-locked'
-                  : ''
-              }`}
-            >
-              {you &&
-                state.players[you].hand.map((c) => {
-                  const meta = cardMeta(catalog, c.defId);
-                  const nightLocked = state.phase === 'playing' && !spellsUnlocked(state);
-                  const spellLocked =
-                    nightLocked ||
-                    (state.phase === 'playing' && state.turn === you && state.turnPhase === 'move');
-                  return (
+            <section className="hand-tray" aria-label="Your hand">
+              <div className="hand-fan-row">
+                <span className="hand-you-label">
+                  {localMode ? (you === 'white' ? 'White' : 'Black') : 'You'}
+                </span>
+                <div
+                  className={`hand hand-fan ${
+                    state.phase === 'playing' && !spellsUnlocked(state) ? 'hand-spell-locked' : ''
+                  }`}
+                >
+                  {you &&
+                    state.players[you].hand.map((c, i, arr) => {
+                      const meta = cardMeta(catalog, c.defId);
+                      const cardDef = CARD_REGISTRY[c.defId];
+                      const nightLocked = state.phase === 'playing' && !spellsUnlocked(state);
+                      const interruptCard = Boolean(cardDef?.playOnOpponentTurn);
+                      const spellLocked =
+                        nightLocked ||
+                        (state.phase === 'playing' &&
+                          !interruptCard &&
+                          ((state.turn === you && state.turnPhase === 'move') ||
+                            state.turn !== you));
+                      const mid = (arr.length - 1) / 2;
+                      return (
+                        <button
+                          key={c.instanceId}
+                          type="button"
+                          className={`card ${selectedCard === c.instanceId ? 'active' : ''} ${spellLocked ? 'card-dimmed' : ''}`}
+                          disabled={spellLocked}
+                          style={
+                            {
+                              '--fan-i': i,
+                              '--fan-mid': mid,
+                              '--fan-arc': Math.abs(i - mid),
+                            } as React.CSSProperties
+                          }
+                          title={
+                            nightLocked
+                              ? 'Spell cards unlock at the first night'
+                              : spellLocked
+                                ? state.turn !== you
+                                  ? 'Cannot cast this on the opponent’s turn'
+                                  : 'Spell phase skipped — cards available next turn'
+                                : meta?.name ?? c.defId
+                          }
+                          onClick={() => {
+                            if (spellLocked) return;
+                            setSelectedCard(c.instanceId);
+                            setPendingTargets([]);
+                            setSpellConfirm(null);
+                            clearBoardConfirm();
+                          }}
+                        >
+                          <img src={meta?.image ?? '/cards/Back_Of_Card.png'} alt={meta?.name ?? c.defId} />
+                          <span>{meta?.name ?? c.defId}</span>
+                        </button>
+                      );
+                    })}
+                </div>
+              </div>
+
+              {state.phase === 'playing' && (
+                <div className="row hand-actions">
+                  {spellsUnlocked(state) &&
+                    ((state.turn === you &&
+                      state.turnPhase === 'spell' &&
+                      state.players[you].spellsThisTurn < state.players[you].maxSpellsThisTurn) ||
+                      (selectedCard && activeCardDef?.playOnOpponentTurn)) && (
                     <button
-                      key={c.instanceId}
                       type="button"
-                      className={`card ${selectedCard === c.instanceId ? 'active' : ''} ${spellLocked ? 'card-dimmed' : ''}`}
-                      disabled={spellLocked}
-                      title={
-                        nightLocked
-                          ? 'Spell cards unlock at the first night'
-                          : spellLocked
-                            ? 'Spell phase skipped — cards available next turn'
-                            : undefined
-                      }
+                      className="primary"
+                      onClick={castCard}
+                      disabled={!selectedCard || !!spellConfirm}
+                    >
+                      Cast selected
+                    </button>
+                  )}
+                  {spellsUnlocked(state) && state.turn === you && state.turnPhase === 'spell' && (
+                    <button
+                      type="button"
                       onClick={() => {
-                        if (spellLocked) return;
-                        setSelectedCard(c.instanceId);
+                        send({ type: 'skip_spell' });
+                        setSelectedCard(null);
                         setPendingTargets([]);
                         setSpellConfirm(null);
                         clearBoardConfirm();
+                        setStatus('Spell phase skipped — move a piece.');
                       }}
                     >
-                      <img src={meta?.image ?? '/cards/Back_Of_Card.png'} alt={meta?.name ?? c.defId} />
-                      <span>{meta?.name ?? c.defId}</span>
-                      {meta?.description?.[0] && <small className="card-blurb">{meta.description[0]}</small>}
+                      Skip spell
                     </button>
-                  );
-                })}
-            </div>
-
-            {spellConfirm && (
-              <div className="spell-confirm" role="dialog" aria-label="Confirm spell">
-                <p className="spell-confirm-summary">{spellConfirm.summary}</p>
-                <div className="spell-confirm-actions">
-                  <button type="button" className="primary" onClick={confirmSpell}>
-                    Confirm
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const promptType = state.pendingPrompt?.type;
-                      if (promptType === 'gadget_choice' || promptType === 'ability_target') {
-                        cancelAbility();
-                        return;
-                      }
-                      setSpellConfirm(null);
-                      setFocusSpecial(null);
-                      clearBoardConfirm();
-                      setStatus('Canceled.');
-                    }}
-                  >
-                    Cancel
-                  </button>
+                  )}
                 </div>
-              </div>
-            )}
+              )}
 
-            {state.phase === 'playing' && (
-              <div className="row">
-                {spellsUnlocked(state) &&
-                  ((state.turn === you &&
-                    state.turnPhase === 'spell' &&
-                    state.players[you].spellsThisTurn < state.players[you].maxSpellsThisTurn) ||
-                    (selectedCard && activeCardDef?.playOnOpponentTurn && state.turn !== you)) && (
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={castCard}
-                    disabled={!selectedCard || !!spellConfirm}
-                  >
-                    Cast selected
-                  </button>
-                )}
-                {spellsUnlocked(state) && state.turn === you && state.turnPhase === 'spell' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      send({ type: 'skip_spell' });
-                      setSelectedCard(null);
-                      setPendingTargets([]);
-                      setSpellConfirm(null);
-                      clearBoardConfirm();
-                      setStatus('Spell phase skipped — move a piece.');
-                    }}
-                  >
-                    Skip spell
-                  </button>
-                )}
-              </div>
-            )}
-
-            {activeCardDef?.id === 'swap' && pendingTargets.length === 1 && canCastSpells && (
-              <div className="variant-grid">
-                {catalog?.pieces
-                  .filter((p) => {
-                    const target = state.pieces.find((x) => x.id === pendingTargets[0]);
-                    return target && p.class === target.class && p.id !== target.defId && p.class !== 'king' && p.class !== 'queen';
-                  })
-                  .map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => offerSpellConfirm([pendingTargets[0], p.id])}
-                    >
-                      <PieceIcon defId={p.id} color={you ?? 'white'} className="sm" />
-                      {p.name}
-                    </button>
-                  ))}
-              </div>
-            )}
-
-            {activeCardDef?.id === 'pawn_summon' &&
-              selectedCard &&
-              canCastSpells &&
-              !spellConfirm &&
-              pendingTargets.length % 2 === 0 && (
+              {activeCardDef?.id === 'swap' && pendingTargets.length === 1 && canCastSpells && (
                 <div className="variant-grid">
-                  <p className="hint">
-                    Choose pawn variant{' '}
-                    {Math.floor(pendingTargets.length / 2) + 1} of{' '}
-                    {Math.min(
-                      2,
-                      you ? state.players[you].graveyard.filter((g) => g.class === 'pawn').length : 0,
-                    )}
-                  </p>
                   {catalog?.pieces
-                    .filter((p) => p.class === 'pawn')
+                    .filter((p) => {
+                      const target = state.pieces.find((x) => x.id === pendingTargets[0]);
+                      return target && p.class === target.class && p.id !== target.defId && p.class !== 'king' && p.class !== 'queen';
+                    })
                     .map((p) => (
                       <button
                         key={p.id}
                         type="button"
-                        onClick={() => {
-                          setPendingTargets([...pendingTargets, p.id]);
-                          clearBoardConfirm();
-                          setSpellConfirm(null);
-                          setStatus(`Pick an empty allied square for ${p.name}`);
-                        }}
+                        onClick={() => offerSpellConfirm([pendingTargets[0], p.id])}
                       >
                         <PieceIcon defId={p.id} color={you ?? 'white'} className="sm" />
                         {p.name}
@@ -1928,65 +2205,88 @@ export default function App() {
                 </div>
               )}
 
-            {activeCardDef?.targeting === 'graveyard' &&
-              selectedCard &&
-              canCastSpells &&
-              !spellConfirm &&
-              pendingTargets.length === 0 &&
-              you && (
-                <div className="variant-grid">
-                  <p className="hint">Pick a fallen piece to revive</p>
-                  {state.players[you].graveyard.map((g, i) => (
-                    <button
-                      key={`${g.defId}-${i}`}
-                      type="button"
-                      onClick={() => {
-                        setPendingTargets([i]);
-                        clearBoardConfirm();
-                        setSpellConfirm(null);
-                        setStatus(
-                          `Revive ${pieceMeta(catalog, g.defId)?.name ?? g.defId}: pick an empty spawn square`,
-                        );
-                      }}
-                    >
-                      <PieceIcon defId={g.defId} color={you} className="sm" />
-                      {pieceMeta(catalog, g.defId)?.name ?? g.defId}
-                    </button>
-                  ))}
+              {activeCardDef?.id === 'pawn_summon' &&
+                selectedCard &&
+                canCastSpells &&
+                !spellConfirm &&
+                pendingTargets.length % 2 === 0 && (
+                  <div className="variant-grid">
+                    <p className="hint">
+                      Choose pawn variant{' '}
+                      {Math.floor(pendingTargets.length / 2) + 1} of{' '}
+                      {Math.min(
+                        2,
+                        you ? state.players[you].graveyard.filter((g) => g.class === 'pawn').length : 0,
+                      )}
+                    </p>
+                    {catalog?.pieces
+                      .filter((p) => p.class === 'pawn')
+                      .map((p) => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          onClick={() => {
+                            setPendingTargets([...pendingTargets, p.id]);
+                            clearBoardConfirm();
+                            setSpellConfirm(null);
+                            setStatus(`Pick an empty allied square for ${p.name}`);
+                          }}
+                        >
+                          <PieceIcon defId={p.id} color={you ?? 'white'} className="sm" />
+                          {p.name}
+                        </button>
+                      ))}
+                  </div>
+                )}
+
+              {activeCardDef?.targeting === 'graveyard' &&
+                selectedCard &&
+                canCastSpells &&
+                !spellConfirm &&
+                pendingTargets.length === 0 &&
+                you && (
+                  <div className="variant-grid">
+                    <p className="hint">Pick a fallen piece to revive</p>
+                    {state.players[you].graveyard.map((g, i) => (
+                      <button
+                        key={`${g.defId}-${i}`}
+                        type="button"
+                        onClick={() => {
+                          setPendingTargets([i]);
+                          clearBoardConfirm();
+                          setSpellConfirm(null);
+                          setStatus(
+                            `Revive ${pieceMeta(catalog, g.defId)?.name ?? g.defId}: pick an empty spawn square`,
+                          );
+                        }}
+                      >
+                        <PieceIcon defId={g.defId} color={you} className="sm" />
+                        {pieceMeta(catalog, g.defId)?.name ?? g.defId}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+              {activeCardDef && (
+                <div className="card-details">
+                  <h3>{activeCardDef.name}</h3>
+                  <ul>
+                    {activeCardDef.description.map((d) => (
+                      <li key={d}>{d}</li>
+                    ))}
+                  </ul>
                 </div>
               )}
 
-            {activeCardDef && (
-              <div className="card-details">
-                <h3>{activeCardDef.name}</h3>
-                <ul>
-                  {activeCardDef.description.map((d) => (
-                    <li key={d}>{d}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            <p className="hint">
-              Flow: spell (optional) → move one piece. Putting the opponent in check ends your turn immediately.
-            </p>
-          </aside>
+              <p className="hint hand-flow-hint">
+                Flow: spell (optional) → move one piece. Putting the opponent in check ends your turn immediately.
+              </p>
+            </section>
+          </main>
 
           <aside className="play-dock" aria-live="polite">
             <div className="play-dock-box">
-              <p className="play-dock-label">Messages</p>
-              <PlayPromptBanners
-                status={status}
-                error={error}
-                state={state}
-                you={you}
-                catalog={catalog}
-                gadgetKind={gadgetKind}
-                setGadgetKind={setGadgetKind}
-                setStatus={setStatus}
-                send={send}
-                cancelAbility={cancelAbility}
-              />
+              <p className="play-dock-label">Piece info</p>
               {you &&
                 state.turn === you &&
                 state.phase === 'playing' &&
@@ -1998,11 +2298,11 @@ export default function App() {
                     barrier while the pawn is selected will walk onto it (Barrier Phase).
                   </p>
                 )}
-              {!status && !error && !state.pendingPrompt && !spellConfirm && !inspectedPiece && (
+              {!inspectedPiece && (
                 <p className="play-dock-idle">
                   {knowledgeEnabled
-                    ? 'Prompts appear here. Hover a piece for details, or click to lock info.'
-                    : 'Prompts and confirmations appear here.'}
+                    ? 'Hover a piece for details, or click to lock info. Game prompts appear under the board.'
+                    : 'Game prompts and confirmations appear under the board.'}
                 </p>
               )}
               {knowledgeEnabled && inspectedPiece ? (
@@ -2017,6 +2317,8 @@ export default function App() {
                     gadgetUsed: inspectedPiece.gadgetUsed,
                     abilityCooldown: inspectedPiece.abilityCooldown,
                     bloodlust: inspectedPiece.bloodlust,
+                    identityLootDefId: inspectedPiece.identityLootDefId,
+                    copiedMoveDefId: inspectedPiece.copiedMoveDefId,
                     coOccupantId: inspectedPiece.coOccupantId,
                     hasPigBuddy: pigHostIds.has(inspectedPiece.id),
                     effects: inspectedPiece.effects,
@@ -2111,15 +2413,28 @@ function MatchCeremony({
   );
 }
 
-function TurnStrip({ state, you }: { state: GameState; you: Color | null }) {
-  const { mode, title, detail } = turnStripContent(state, you);
+function TurnStrip({
+  state,
+  you,
+  localMode = false,
+}: {
+  state: GameState;
+  you: Color | null;
+  localMode?: boolean;
+}) {
+  const { mode, title, detail } = turnStripContent(state, you, localMode);
+  const youInCheck = Boolean(you && state.phase === 'playing' && state.check === you);
   const check =
-    state.phase === 'playing' && state.check ? `${state.check} in check` : '';
+    state.phase === 'playing' && state.check
+      ? state.check === you
+        ? 'You are in check!'
+        : `${state.check} in check`
+      : '';
   const yoursDetail = [detail, check].filter(Boolean).join(' · ');
 
   return (
     <div
-      className={`turn-strip is-${mode}`}
+      className={`turn-strip is-${mode}${youInCheck ? ' is-check' : ''}`}
       role="status"
       aria-live="polite"
     >
@@ -2251,9 +2566,11 @@ function PieceInfoBody({
     gadgetUsed?: boolean;
     abilityCooldown?: number;
     bloodlust?: boolean;
+    identityLootDefId?: string;
+    copiedMoveDefId?: string;
     coOccupantId?: string;
     hasPigBuddy?: boolean;
-    effects?: Array<{ id?: string; kind: string; turnsRemaining?: number }>;
+    effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
 }) {
   const info = getPieceInfo(defId);
@@ -2331,6 +2648,10 @@ function PieceInfoBody({
             <span>Cooldown: {live.abilityCooldown}</span>
           )}
           {live.bloodlust && <span>Bloodlust</span>}
+          {live.copiedMoveDefId && <span>Moves as {live.copiedMoveDefId}</span>}
+          {!live.copiedMoveDefId && live.identityLootDefId && (
+            <span>Stored identity: {live.identityLootDefId}</span>
+          )}
           {live.coOccupantId && <span className="live-effect tone-buff">Pig Best Buddy</span>}
           {live.hasPigBuddy && <span className="live-effect tone-buff">Pig riding</span>}
           {live.effects?.map((e) => (
@@ -2360,9 +2681,11 @@ function PieceInfoTile({
     gadgetUsed?: boolean;
     abilityCooldown?: number;
     bloodlust?: boolean;
+    identityLootDefId?: string;
+    copiedMoveDefId?: string;
     coOccupantId?: string;
     hasPigBuddy?: boolean;
-    effects?: Array<{ id?: string; kind: string; turnsRemaining?: number }>;
+    effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
   locked?: boolean;
   docked?: boolean;
@@ -2476,7 +2799,7 @@ function OpeningMulliganOverlay({
         </div>
 
         <p className="opening-mulligan-footnote">
-          Opening hands cannot include Rally cards or duplicate spells.
+          Opening hands cannot include duplicate spells.
         </p>
       </div>
     </div>

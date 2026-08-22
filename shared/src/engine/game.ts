@@ -121,6 +121,7 @@ function emptyPlayer(color: Color, name: string): PlayerState {
     maxSpellsThisTurn: 1,
     openingRedrawUsed: false,
     skipTurns: 0,
+    bonusTurns: 0,
   };
 }
 
@@ -212,7 +213,7 @@ function finishDraftAndSetup(state: GameState): GameState {
   next.deck = buildDeck(next.rngSeed);
   for (const color of ['white', 'black'] as Color[]) {
     for (let i = 0; i < 3; i++) {
-      drawCard(next, color, { avoidRally: true, avoidDupes: true });
+      drawCard(next, color, { avoidDupes: true });
     }
   }
   next.pendingPrompt = { type: 'opening_mulligan', color: 'white' };
@@ -323,7 +324,7 @@ export function openingRedraw(state: GameState, color: Color, instanceId: string
   if (idx < 0) throw new Error('Card not in hand');
   const [card] = p.hand.splice(idx, 1);
   next.deck.unshift(card);
-  drawCard(next, color, { avoidRally: true, avoidDupes: true });
+  drawCard(next, color, { avoidDupes: true });
   p.openingRedrawUsed = true;
   log(next, `${color} redrew one opening card`);
   return next;
@@ -394,7 +395,7 @@ export function listMoves(state: GameState, pieceId: string): MoveOption[] {
     if (piece.defId !== 'pig') return false;
     return (
       isPigLShape(piece.pos, m.to, movementBonus(piece)) &&
-      isKnightLanding(piece, state, m.to, 2, 1, false)
+      isKnightLanding(piece, state, m.to, 2, 1, false, true)
     );
   });
 
@@ -453,6 +454,32 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       ready: !piece.gadgetUsed && (piece.disabledTurns ?? 0) <= 0,
       hint: 'Once per game: place Ice Floor, Spring Board, or Gnome Hole on an adjacent empty tile',
     });
+  }
+  if (piece.defId === 'scamman') {
+    const loot = piece.identityLootDefId;
+    const stolen = piece.copiedMoveDefId;
+    const lootName = loot ? PIECES[loot]?.name ?? loot : undefined;
+    const stolenName = stolen ? PIECES[stolen]?.name ?? stolen : undefined;
+    if (piece.identityTheftUsed) {
+      out.push({
+        id: 'identity_theft',
+        name: stolenName ? `Identity Theft (${stolenName})` : 'Identity Theft used',
+        ready: false,
+        passive: true,
+        hint: stolenName
+          ? `This Scamman permanently moves like a ${stolenName} (movement only).`
+          : 'Identity Theft has already been used.',
+      });
+    } else {
+      out.push({
+        id: 'identity_theft',
+        name: lootName ? `Identity Theft (${lootName})` : 'Identity Theft',
+        ready: Boolean(loot) && (piece.disabledTurns ?? 0) <= 0,
+        hint: lootName
+          ? `Once: permanently move like a ${lootName}. Uses your turn.`
+          : 'Capture a piece first. Then activate once, on a later turn, to steal that movement forever.',
+      });
+    }
   }
   if (piece.defId === 'wizard') {
     out.push({
@@ -585,6 +612,10 @@ export function useAbility(
     return finishGadgetDeploy(next, color, pieceId, payload.kind, payload.pos);
   }
 
+  if (abilityId === 'identity_theft') {
+    return finishIdentityTheft(next, color, pieceId);
+  }
+
   if (abilityId === 'enchant') {
     const targetId = targets as string | undefined;
     if (!targetId) {
@@ -693,6 +724,30 @@ function finishGadgetDeploy(
   piece.gadgetUsed = true;
   state.pendingPrompt = null;
   log(state, `${color} Gnome deployed ${kind}`);
+  if (isInCheck(state, opposite(color))) {
+    state.check = opposite(color);
+    return endTurn(state, color, true);
+  }
+  return endTurn(state, color, false);
+}
+
+function finishIdentityTheft(state: GameState, color: Color, pieceId: string): GameState {
+  const piece = state.pieces.find((p) => p.id === pieceId)!;
+  const loot = piece.identityLootDefId;
+  if (!loot) throw new Error('No captured identity to steal');
+  if (piece.identityTheftUsed) throw new Error('Identity Theft already used');
+  const stolenDef = getPieceDef(loot);
+  piece.copiedMoveDefId = loot;
+  piece.identityTheftUsed = true;
+  piece.identityLootDefId = undefined;
+  removeEffects(piece, 'identity_loot');
+  addEffect(piece, {
+    id: `idstolen_${piece.id}`,
+    kind: 'identity_stolen',
+    data: { defId: loot },
+  });
+  state.pendingPrompt = null;
+  log(state, `Scamman Identity Theft — now moves like ${stolenDef.name}`);
   if (isInCheck(state, opposite(color))) {
     state.check = opposite(color);
     return endTurn(state, color, true);
@@ -953,7 +1008,7 @@ export function applyMove(
     if (
       !sameCoord(ally.pos, to) ||
       !isPigLShape(piece.pos, to, movementBonus(piece)) ||
-      !isKnightLanding(piece, next, to, 2, 1, false)
+      !isKnightLanding(piece, next, to, 2, 1, false, true)
     ) {
       throw new Error('Best Buddy only works on a piece in the Pig’s L-move range (2×1)');
     }
@@ -965,18 +1020,14 @@ export function applyMove(
     log(next, `Pig Best Buddy with ${ally.defId}`);
   } else if (move.special === 'death_stare') {
     captured = pieceAt(next, to);
+    if (captureBestBuddyPair(next, to, color)) {
+      captured = undefined;
+    }
   } else {
     captured = pieceAt(next, to);
-    // pig co-occupy capture
-    if (captured) {
-      const pig = next.pieces.find(
-        (p) => p.defId === 'pig' && p.coOccupantId === captured!.id && sameCoord(p.pos, to),
-      );
-      if (pig) {
-        removePiece(next, pig, color);
-        (next.players[color] as PlayerState & { bonusTurns?: number }).bonusTurns =
-          ((next.players[color] as PlayerState & { bonusTurns?: number }).bonusTurns ?? 0) + 3;
-      }
+    // Capturing a Best Buddy square removes pig + host and grants bonus turns
+    if (captureBestBuddyPair(next, to, color)) {
+      captured = undefined;
     }
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     piece.pos = { ...to };
@@ -1057,6 +1108,17 @@ export function applyMove(
         if (home) piece.pos = home;
         log(next, `Reaper spent ${charges} charges (disabled ${disable} turns)`);
       }
+    }
+
+    if (piece.defId === 'scamman' && captured && !piece.identityTheftUsed) {
+      piece.identityLootDefId = captured.defId;
+      removeEffects(piece, 'identity_loot');
+      addEffect(piece, {
+        id: `idloot_${piece.id}`,
+        kind: 'identity_loot',
+        data: { defId: captured.defId },
+      });
+      log(next, `Scamman stored ${captured.defId} identity (activate Identity Theft to steal its movement)`);
     }
 
     if (piece.defId === 'snake') {
@@ -1196,6 +1258,52 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
   void isAlliedTerritory;
 }
 
+/**
+ * If a Best Buddy pair shares `at`, remove both and grant the Pig's owner 3 bonus turns.
+ * Returns true when a pair was resolved (caller should not also remove a single capture).
+ */
+function captureBestBuddyPair(state: GameState, at: Coord, byColor: Color): boolean {
+  const occupants = state.pieces.filter((p) => sameCoord(p.pos, at));
+  if (!occupants.length) return false;
+
+  let pig: PieceState | undefined;
+  let host: PieceState | undefined;
+
+  for (const p of occupants) {
+    if (p.defId === 'pig' && p.coOccupantId) {
+      const linked = state.pieces.find((x) => x.id === p.coOccupantId);
+      if (linked && sameCoord(linked.pos, at)) {
+        pig = p;
+        host = linked;
+        break;
+      }
+    }
+  }
+  if (!pig || !host) {
+    for (const p of occupants) {
+      const linkedPig = state.pieces.find(
+        (x) => x.defId === 'pig' && x.coOccupantId === p.id && sameCoord(x.pos, at),
+      );
+      if (linkedPig) {
+        pig = linkedPig;
+        host = p;
+        break;
+      }
+    }
+  }
+  if (!pig || !host || pig.id === host.id) return false;
+
+  const pigOwner = pig.color;
+  removePiece(state, pig, byColor);
+  // Host may already be gone if pig removal cascaded somehow; re-find
+  const stillHost = state.pieces.find((p) => p.id === host!.id);
+  if (stillHost) removePiece(state, stillHost, byColor);
+
+  state.players[pigOwner].bonusTurns = (state.players[pigOwner].bonusTurns ?? 0) + 3;
+  log(state, `Best Buddy pair captured — both fall (${pigOwner} gains +3 bonus turns)`);
+  return true;
+}
+
 export function skipSpell(state: GameState, color: Color): GameState {
   if (state.pendingPrompt) throw new Error(pendingPromptBusyMessage(state.pendingPrompt, color));
   if (state.turn !== color || state.turnPhase !== 'spell') throw new Error('Cannot skip spell now');
@@ -1224,13 +1332,14 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
     }
   }
   const isOppTurn = next.turn !== color;
+  const interrupt = Boolean(def.playOnOpponentTurn);
   if (!spellsUnlocked(next)) throw new Error('Spell cards cannot be used until the first night');
-  if (isOppTurn && !def.playOnOpponentTurn) throw new Error('Cannot play that on opponent turn');
-  if (!isOppTurn && next.turnPhase !== 'spell') {
-    throw new Error('Spell phase only');
-  }
-  if (!isOppTurn && player.spellsThisTurn >= player.maxSpellsThisTurn) {
-    throw new Error('Already cast a spell this turn');
+  if (isOppTurn && !interrupt) throw new Error('Cannot play that on opponent turn');
+  if (!interrupt) {
+    if (next.turnPhase !== 'spell') throw new Error('Spell phase only');
+    if (player.spellsThisTurn >= player.maxSpellsThisTurn) {
+      throw new Error('Already cast a spell this turn');
+    }
   }
 
   // Cannot cast abilities on enemy king — enforced per-card
@@ -1255,6 +1364,11 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
     return out;
   }
 
+  if (def.id === 'teleport') {
+    if (isInCheck(out, color)) throw new Error('Teleport cannot leave your king in check');
+    if (isInCheck(out, opposite(color))) throw new Error('Teleport cannot check the king');
+  }
+
   // Consume if still in hand (Rewind removes itself on the restored board)
   const outPlayer = out.players[color];
   const idx = outPlayer.hand.findIndex((c) => c.instanceId === instanceId);
@@ -1266,7 +1380,7 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
   outPlayer.lastPlayedCardDefId = def.id;
   log(out, `${color} played ${def.name}`);
 
-  // One spell per turn: leave spell phase when spent
+  // One spell per turn: leave spell phase when spent (interrupt cards on your turn still count)
   if (!isOppTurn && outPlayer.spellsThisTurn >= outPlayer.maxSpellsThisTurn) {
     out.turnPhase = 'move';
   }
@@ -1594,10 +1708,10 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
     nextColor = opposite(nextColor);
   }
 
-  // bonus turns from pig
-  const bonus = (next.players[color] as PlayerState & { bonusTurns?: number }).bonusTurns ?? 0;
-  if (bonus > 0 && !fromCheck) {
-    (next.players[color] as PlayerState & { bonusTurns?: number }).bonusTurns = bonus - 1;
+  // bonus turns from Best Buddy capture (always apply — even if check ended the turn early)
+  const bonus = next.players[color].bonusTurns ?? 0;
+  if (bonus > 0) {
+    next.players[color].bonusTurns = bonus - 1;
     nextColor = color;
     log(next, `${color} continues (Best Buddy bonus turn)`);
   }

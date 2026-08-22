@@ -280,7 +280,7 @@ registerCard({
 registerCard({
   id: 'rearrange',
   name: 'Rearrange',
-  description: ['Pick any 4 allied pieces.', 'Swap their positions however you like.'],
+  description: ['Pick any 4 allied pieces.', 'Their positions are shuffled at random among those squares.'],
   image: '/cards/Rearrange.png',
   targeting: 'multi_allied',
   targetCount: 4,
@@ -371,9 +371,8 @@ registerCard({
   id: 'rally',
   name: 'Rally',
   description: [
-    'Cancel the opponent\'s last played card / an active opponent effect.',
-    'Can be used on opponent\'s turn.',
-    'Also: if opponent has ≤1/4 army left, can cancel an active effect they have in play.',
+    'Cancel the opponent\'s last played card (and its lasting effects).',
+    'Can be cast on either player\'s turn, even outside the spell phase.',
   ],
   image: '/cards/Rally.png',
   tags: ['rally', 'instant'],
@@ -381,40 +380,60 @@ registerCard({
   targeting: 'none',
   play: (ctx) => {
     const enemy = opposite(ctx.player);
-    // cancel last enemy active spell
-    const spells = ctx.state.players[enemy].activeSpells;
-    if (spells.length) {
-      const removed = spells.pop()!;
-      log(ctx.state, `Rally canceled ${removed.defId}`);
-    } else {
-      // strip a recent effect tagged from enemy cards on pieces
-      for (const p of ctx.state.pieces) {
-        const idx = p.effects.findIndex((e) => e.sourceCardId && e.sourceCardId !== 'rally');
-        if (idx >= 0 && p.color === ctx.player) {
-          // cancel harmful? Prefer cancel enemy-sourced effects on anyone
+    const lastId = ctx.state.players[enemy].lastPlayedCardDefId;
+    let canceled = false;
+
+    if (lastId) {
+      const spells = ctx.state.players[enemy].activeSpells;
+      for (let i = spells.length - 1; i >= 0; i--) {
+        if (spells[i].defId === lastId) {
+          spells.splice(i, 1);
+          canceled = true;
         }
       }
       for (const p of ctx.state.pieces) {
         const before = p.effects.length;
-        p.effects = p.effects.filter((e) => {
-          // remove effects that enemy likely applied recently
-          return !(e.sourceCardId && ['pause', 'fortify', 'mathematical', 'echo', 'enchant', 'blink', 'recall'].includes(e.sourceCardId) && p.color !== enemy);
-        });
-        // simpler: remove non-permanent effects from enemy pieces that are buffs, and debuffs from allies
+        p.effects = p.effects.filter((e) => e.sourceCardId !== lastId);
+        if (p.effects.length < before) canceled = true;
       }
-      // Practical: remove one timed effect from any piece owned by enemy (buff) or applied as control
-      outer: for (const p of ctx.state.pieces) {
-        for (let i = 0; i < p.effects.length; i++) {
-          const e = p.effects[i];
-          if (e.turnsRemaining != null && e.sourceCardId) {
-            p.effects.splice(i, 1);
-            log(ctx.state, `Rally canceled effect ${e.kind}`);
-            break outer;
-          }
+      if (lastId === 'blink') {
+        const before = ctx.state.tokens.length;
+        ctx.state.tokens = ctx.state.tokens.filter((t) => !(t.kind === 'blink' && t.owner === enemy));
+        if (ctx.state.tokens.length < before) canceled = true;
+      }
+      if (lastId === 'portal') {
+        const before = ctx.state.tokens.length;
+        ctx.state.tokens = ctx.state.tokens.filter((t) => !(t.kind === 'portal' && t.owner === enemy));
+        if (ctx.state.tokens.length < before) canceled = true;
+      }
+      ctx.state.players[enemy].lastPlayedCardDefId = undefined;
+      if (canceled) {
+        log(ctx.state, `Rally canceled ${lastId}`);
+        return { state: ctx.state, done: true };
+      }
+      // Instant with no lasting footprint — still "cancels" the last card record
+      log(ctx.state, `Rally canceled ${lastId} (no lasting effects left)`);
+      return { state: ctx.state, done: true };
+    }
+
+    // Fallback: cancel newest active spell, else one sourced timed effect
+    const spells = ctx.state.players[enemy].activeSpells;
+    if (spells.length) {
+      const removed = spells.pop()!;
+      log(ctx.state, `Rally canceled ${removed.defId}`);
+      return { state: ctx.state, done: true };
+    }
+    for (const p of ctx.state.pieces) {
+      for (let i = 0; i < p.effects.length; i++) {
+        const e = p.effects[i];
+        if (e.sourceCardId && e.sourceCardId !== 'rally') {
+          p.effects.splice(i, 1);
+          log(ctx.state, `Rally canceled effect ${e.kind}`);
+          return { state: ctx.state, done: true };
         }
       }
     }
-    return { state: ctx.state, done: true };
+    throw new Error('Nothing to cancel with Rally');
   },
 });
 
@@ -435,10 +454,7 @@ registerCard({
       throw new Error('Piece must be allied and in allied territory');
     }
     const to = targets[1] as Coord;
-    if (Math.max(Math.abs(to.row - piece.pos.row), Math.abs(to.col - piece.pos.col)) !== 2) {
-      // any direction exactly 2 - allow orthogonal or diagonal chebyshev or manhattan?
-      // "two spaces into any direction" => one direction vector of length 2
-    }
+    if (!inBounds(to)) throw new Error('Destination off the board');
     const dr = to.row - piece.pos.row;
     const dc = to.col - piece.pos.col;
     if (!((Math.abs(dr) === 2 && dc === 0) || (Math.abs(dc) === 2 && dr === 0) || (Math.abs(dr) === 2 && Math.abs(dc) === 2))) {

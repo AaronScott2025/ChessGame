@@ -5,22 +5,13 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
 import {
-  applyMove,
   availableAbilities,
-  chooseFirstPicker,
   createLobbyState,
-  draftPick,
   getDraftOptions,
   listMoves,
-  openingKeep,
-  openingRedraw,
-  playCard,
   publicState,
-  cancelPrompt,
-  resolvePrompt,
-  skipSpell,
   startDraft,
-  useAbility,
+  applyClientAction,
   type ClientAction,
   type Color,
   type GameState,
@@ -164,7 +155,7 @@ io.on('connection', (socket) => {
       const room = getRoom(payload.code);
       const color = colorOf(room, socket.id);
       if (!color) throw new Error('Not a player in this room');
-      room.state = reduce(room.state, color, payload.action);
+      room.state = applyClientAction(room.state, color, payload.action);
       ack?.({ ok: true });
       emitRoom(room);
       // also send legal moves for current player piece selections via separate event if needed
@@ -211,42 +202,6 @@ io.on('connection', (socket) => {
     }
   });
 });
-
-function reduce(state: GameState, color: Color, action: ClientAction): GameState {
-  switch (action.type) {
-    case 'set_name':
-      state.players[color].name = action.name;
-      return state;
-    case 'choose_first_picker':
-      if (color !== 'black') throw new Error('Only Black chooses');
-      return chooseFirstPicker(state, action.whitePicksFirst);
-    case 'draft_pick':
-      return draftPick(state, color, action.defId);
-    case 'opening_keep':
-      return openingKeep(state, color);
-    case 'opening_redraw':
-      return openingRedraw(state, color, action.instanceId);
-    case 'skip_spell':
-      return skipSpell(state, color);
-    case 'play_card':
-      return playCard(state, color, action.instanceId, action.targets ?? []);
-    case 'resolve_prompt':
-      return resolvePrompt(state, color, action.payload);
-    case 'move':
-      return applyMove(state, color, action.pieceId, action.to, action.meta);
-    case 'use_ability':
-      return useAbility(state, color, action.pieceId, action.abilityId, action.targets);
-    case 'cancel_prompt':
-      return cancelPrompt(state, color);
-    case 'resign':
-      state.phase = 'ended';
-      state.winner = color === 'white' ? 'black' : 'white';
-      state.winReason = `${color} resigned`;
-      return state;
-    default:
-      throw new Error(`Unknown action: ${(action as { type?: string })?.type ?? 'undefined'}`);
-  }
-}
 
 const PORT = Number(process.env.PORT || 3001);
 httpServer.listen(PORT, () => {

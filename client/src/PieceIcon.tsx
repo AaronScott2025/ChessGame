@@ -1,28 +1,35 @@
 type Color = 'white' | 'black';
 
-const PIECE_IDS = new Set([
-  'pawn',
-  'nwap',
-  'rogue',
-  'enchanted_pawn',
-  'rook',
-  'stoneman',
-  'gnome',
-  'horse',
-  'snake',
-  'pig',
-  'bishop',
-  'scamman',
-  'wizard',
-  'queen',
-  'angel',
-  'ghost',
-  'reaper',
-  'prince_princess',
-  'demon',
-  'mimic',
-  'king',
-]);
+/** Maps piece defId → Chesspansion folder + PascalCase filename stem. */
+const PIECE_ART: Record<string, { folder: string; file: string }> = {
+  pawn: { folder: 'Pawns', file: 'Pawn' },
+  nwap: { folder: 'Pawns', file: 'Nwap' },
+  rogue: { folder: 'Pawns', file: 'Rogue' },
+  enchanted_pawn: { folder: 'Pawns', file: 'EnchantedPawn' },
+  rook: { folder: 'Rooks', file: 'Rook' },
+  stoneman: { folder: 'Rooks', file: 'Stoneman' },
+  gnome: { folder: 'Rooks', file: 'Gnome' },
+  horse: { folder: 'Knights', file: 'Horse' },
+  snake: { folder: 'Knights', file: 'Snake' },
+  pig: { folder: 'Knights', file: 'Pig' },
+  bishop: { folder: 'Bishops', file: 'Bishop' },
+  scamman: { folder: 'Bishops', file: 'Scamman' },
+  wizard: { folder: 'Bishops', file: 'Wizard' },
+  queen: { folder: 'Queens', file: 'Queen' },
+  angel: { folder: 'Queens', file: 'Angel' },
+  ghost: { folder: 'Queens', file: 'Ghost' },
+  reaper: { folder: 'Queens', file: 'Reaper' },
+  prince_princess: { folder: 'Wildcards', file: 'PrincePrincess' },
+  demon: { folder: 'Wildcards', file: 'Demon' },
+  mimic: { folder: 'Wildcards', file: 'Mimic' },
+  king: { folder: 'Kings', file: 'King' },
+};
+
+export function pieceArtSrc(defId: string, color: Color): string {
+  const art = PIECE_ART[defId] ?? PIECE_ART.pawn;
+  const tone = color === 'white' ? 'White' : 'Black';
+  return `/Chesspansion/${art.folder}/${art.file}${tone}.png`;
+}
 
 export function PieceIcon({
   defId,
@@ -35,18 +42,16 @@ export function PieceIcon({
   className?: string;
   title?: string;
 }) {
-  const id = PIECE_IDS.has(defId) ? defId : 'pawn';
-  const src = `/pieces/${id}_mask.png`;
+  const id = PIECE_ART[defId] ? defId : 'pawn';
+  const src = pieceArtSrc(id, color);
   return (
     <span
-      className={`piece-icon ${color} ${className}`.trim()}
+      className={`piece-icon piece-icon-art ${color} ${className}`.trim()}
       role={title ? 'img' : undefined}
       aria-label={title ?? id}
       title={title}
-      style={{
-        WebkitMaskImage: `url(${src})`,
-        maskImage: `url(${src})`,
-      }}
-    />
+    >
+      <img src={src} alt="" draggable={false} />
+    </span>
   );
 }

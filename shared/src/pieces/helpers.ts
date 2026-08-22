@@ -92,6 +92,24 @@ export function areaMoves(
   return moves;
 }
 
+/** True if any square on a king-step path between `from` and `to` (excluding endpoints) is blocked. */
+export function chebyshevPathBlocked(from: Coord, to: Coord, state: GameState): boolean {
+  let r = from.row;
+  let c = from.col;
+  for (let n = 0; n < 20; n++) {
+    const stepR = Math.sign(to.row - r);
+    const stepC = Math.sign(to.col - c);
+    if (stepR === 0 && stepC === 0) return false;
+    r += stepR;
+    c += stepC;
+    if (r === to.row && c === to.col) return false;
+    const pos = { row: r, col: c };
+    if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, pos))) return true;
+    if (pieceAt(state, pos)) return true;
+  }
+  return false;
+}
+
 function dcMax(_r: number, _dr: number): number {
   return _r;
 }
@@ -102,9 +120,10 @@ export function knightMoves(
   long = 2,
   short = 1,
   canJump = true,
+  passThroughAllies = false,
 ): MoveOption[] {
   const moves: MoveOption[] = [];
-  for (const to of knightTargetCoords(piece, state, long, short, canJump)) {
+  for (const to of knightTargetCoords(piece, state, long, short, canJump, passThroughAllies)) {
     const opt = emptyOrEnemy(state, to, piece.color);
     if (opt) moves.push(opt);
   }
@@ -118,6 +137,7 @@ export function knightTargetCoords(
   long = 2,
   short = 1,
   canJump = true,
+  passThroughAllies = false,
 ): Coord[] {
   const targets: Coord[] = [];
   const bonus = movementBonus(piece);
@@ -144,8 +164,8 @@ export function knightTargetCoords(
         if (!canJump) {
           const occ = pieceAt(state, pos);
           if (!occ || occ.id === piece.id) return false;
-          // Non-jumping L movers can pass through allied tiles on the long leg.
-          if (occ.color === piece.color) return false;
+          // Pig-only: allies on the long leg do not block.
+          if (passThroughAllies && occ.color === piece.color) return false;
           return true;
         }
         return false;
@@ -179,8 +199,11 @@ export function isKnightLanding(
   long = 2,
   short = 1,
   canJump = false,
+  passThroughAllies = false,
 ): boolean {
-  return knightTargetCoords(piece, state, long, short, canJump).some((c) => sameCoord(c, to));
+  return knightTargetCoords(piece, state, long, short, canJump, passThroughAllies).some((c) =>
+    sameCoord(c, to),
+  );
 }
 
 /** True only for a Pig L (2×1, plus movement-bonus extra long). Does not allow teleports. */
