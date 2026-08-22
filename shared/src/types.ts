@@ -51,8 +51,10 @@ export interface PieceState {
   coOccupantId?: string;
   /** Gnome: gadget already deployed */
   gadgetUsed?: boolean;
-  /** Wizard enchant cooldown (owner turns remaining) */
+  /** Wizard Enchant cooldown (owner turns remaining) */
   abilityCooldown?: number;
+  /** Wizard Magic Be-gone uses spent (max 2). */
+  magicBegoneUsed?: number;
   /** Scamman: last captured piece type available to steal (once). */
   identityLootDefId?: string;
   /** Scamman: Identity Theft already used. */
@@ -99,6 +101,8 @@ export interface PlayerState {
   /** Extra turns earned (e.g. capturing a Best Buddy pair). */
   bonusTurns: number;
   lastPlayedCardDefId?: string;
+  /** Opponent Magic Be-gone: silenced until this cycleCount (cleared on day/night flip). */
+  magicDisabledUntilCycle?: number;
 }
 
 export interface DraftState {

@@ -11,7 +11,7 @@ import {
 } from '@shared/index.ts';
 import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
-import { spellsUnlocked } from '@shared/utils.ts';
+import { spellsUnlocked, isMagicDisabled } from '@shared/utils.ts';
 import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
 import {
   AudioToggles,
@@ -36,6 +36,7 @@ import {
 } from './AudioControl';
 import { PieceIcon } from './PieceIcon';
 import { getPieceInfo } from './pieceInfo';
+import { getObstacleInfo } from './obstacleInfo';
 import { RulesModal } from './RulesModal';
 import {
   effectLabel,
@@ -65,6 +66,7 @@ interface Piece {
   identityLootDefId?: string;
   identityTheftUsed?: boolean;
   copiedMoveDefId?: string;
+  magicBegoneUsed?: number;
 }
 
 interface AbilityInfo {
@@ -85,7 +87,7 @@ interface GameState {
   roomCode: string;
   phase: string;
   pieces: Piece[];
-  tokens: Array<{ id: string; kind: string; pos: Coord; owner: Color }>;
+  tokens: Array<{ id: string; kind: string; pos: Coord; owner: Color; turnsRemaining?: number }>;
   players: Record<
     Color,
     {
@@ -97,6 +99,7 @@ interface GameState {
       maxSpellsThisTurn: number;
       openingRedrawUsed: boolean;
       connected: boolean;
+      magicDisabledUntilCycle?: number;
     }
   >;
   turn: Color;
@@ -390,6 +393,8 @@ export default function App() {
   const [focusSpecial, setFocusSpecial] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState('Connect and create or join a room.');
+  const [messagesHidden, setMessagesHidden] = useState(false);
+  const [overlayPeek, setOverlayPeek] = useState(false);
   const prevTurnRef = useRef<string | null>(null);
   const skipMoveAnimRef = useRef(true);
   const lastMoveAnimKeyRef = useRef<string | null>(null);
@@ -520,6 +525,12 @@ export default function App() {
   }, [state?.draft?.lastPick, state?.draft?.pickingColor]);
 
   useEffect(() => {
+    if (!inspectedId?.startsWith('token:')) return;
+    const id = inspectedId.slice(6);
+    if (!state?.tokens.some((t) => t.id === id)) setInspectedId(null);
+  }, [state?.tokens, inspectedId]);
+
+  useEffect(() => {
     const lp = state?.draft?.lastPick;
     if (!lp) return;
     const key = `${lp.color}:${lp.pieceClass}:${lp.defId}`;
@@ -646,6 +657,18 @@ export default function App() {
     const t = window.setTimeout(() => setCheckAlert(false), 2400);
     return () => window.clearTimeout(t);
   }, [checkAlert]);
+
+  useEffect(() => {
+    setMessagesHidden(false);
+  }, [state?.pendingPrompt?.type, state?.pendingPrompt?.message, spellConfirm?.summary]);
+
+  useEffect(() => {
+    if (error) setMessagesHidden(false);
+  }, [error]);
+
+  useEffect(() => {
+    setOverlayPeek(false);
+  }, [state?.pendingPrompt?.type, state?.pendingPrompt?.drawnInstanceId]);
 
   useEffect(() => {
     if (!state) return;
@@ -934,7 +957,8 @@ export default function App() {
   }, [state, you]);
 
   const targetNeeded = activeCardDef?.targeting && activeCardDef.targeting !== 'none';
-  const canCastSpells = Boolean(state && spellsUnlocked(state));
+  const magicSilenced = Boolean(state && you && isMagicDisabled(state, you));
+  const canCastSpells = Boolean(state && spellsUnlocked(state) && !magicSilenced);
 
   const clearBoardConfirm = () => {
     setConfirmKey(null);
@@ -1348,11 +1372,16 @@ export default function App() {
       setMoves([]);
       setAbilities([]);
     } else {
+      const token = state.tokens.find((t) => t.pos.row === row && t.pos.col === col);
       setSelectedPiece(null);
       setMoves([]);
       setAbilities([]);
-      setInspectedId(null);
-      setHoveredId(null);
+      if (token) {
+        setInspectedId(`token:${token.id}`);
+      } else {
+        setInspectedId(null);
+        setHoveredId(null);
+      }
     }
   };
 
@@ -1393,13 +1422,22 @@ export default function App() {
     setStatus(`Select target for ${activeCardDef.name} (${activeCardDef.targeting})`);
   };
 
-  const inspectedPiece = useMemo(() => {
-    if (!state) return null;
-    const id = inspectedId && !inspectedId.startsWith('draft:') ? inspectedId : null;
+  const { inspectedPiece, inspectedToken } = useMemo(() => {
+    if (!state) return { inspectedPiece: null, inspectedToken: null };
+    const lock = inspectedId && !inspectedId.startsWith('draft:') ? inspectedId : null;
     const hover = hoveredId && !hoveredId.startsWith('draft:') ? hoveredId : null;
-    const active = id ?? hover;
-    if (!active) return null;
-    return state.pieces.find((p) => p.id === active) ?? null;
+    const active = lock ?? hover;
+    if (!active) return { inspectedPiece: null, inspectedToken: null };
+    if (active.startsWith('token:')) {
+      return {
+        inspectedPiece: null,
+        inspectedToken: state.tokens.find((t) => t.id === active.slice(6)) ?? null,
+      };
+    }
+    return {
+      inspectedPiece: state.pieces.find((p) => p.id === active) ?? null,
+      inspectedToken: null,
+    };
   }, [state, inspectedId, hoveredId]);
 
   const infoLocked = Boolean(inspectedId && !inspectedId.startsWith('draft:'));
@@ -1504,7 +1542,7 @@ export default function App() {
           onDone={() => setCeremony(null)}
         />
       )}
-      {state.pendingPrompt?.type === 'discard_to_draw' && (
+      {state.pendingPrompt?.type === 'discard_to_draw' && !overlayPeek && (
         <DiscardToDrawOverlay
           key={state.pendingPrompt.drawnInstanceId}
           prompt={state.pendingPrompt}
@@ -1512,9 +1550,10 @@ export default function App() {
           state={state}
           catalog={catalog}
           onDiscard={(instanceId) => send({ type: 'resolve_prompt', payload: instanceId })}
+          onClose={() => setOverlayPeek(true)}
         />
       )}
-      {state.pendingPrompt?.type === 'opening_mulligan' && (
+      {state.pendingPrompt?.type === 'opening_mulligan' && !overlayPeek && (
         <OpeningMulliganOverlay
           key={state.players[state.pendingPrompt.color!].hand.map((c) => c.instanceId).join(',')}
           prompt={state.pendingPrompt}
@@ -1523,17 +1562,42 @@ export default function App() {
           catalog={catalog}
           onKeep={() => send({ type: 'opening_keep' })}
           onRedraw={(instanceId) => send({ type: 'opening_redraw', instanceId })}
+          onClose={() => setOverlayPeek(true)}
         />
       )}
       <TurnStrip state={state} you={you} localMode={localMode} />
       {checkAlert && (
         <div className="check-alert" role="alert" aria-live="assertive">
+          <button
+            type="button"
+            className="msg-dismiss"
+            aria-label="Dismiss check alert"
+            onClick={() => setCheckAlert(false)}
+          >
+            ×
+          </button>
           <span className="check-alert-mark" aria-hidden />
           <span className="check-alert-title">Check!</span>
           <span className="check-alert-sub">Your king is under attack</span>
         </div>
       )}
-      {(status || error || state.pendingPrompt || spellConfirm) && (
+      {(overlayPeek || messagesHidden) &&
+        (state.pendingPrompt || spellConfirm) && (
+          <button
+            type="button"
+            className="prompt-restore"
+            onClick={() => {
+              setMessagesHidden(false);
+              setOverlayPeek(false);
+            }}
+          >
+            Show message
+          </button>
+        )}
+      {!messagesHidden &&
+        state.pendingPrompt?.type !== 'discard_to_draw' &&
+        state.pendingPrompt?.type !== 'opening_mulligan' &&
+        (status || error || state.pendingPrompt || spellConfirm) && (
         <div
           key={[
             status,
@@ -1553,9 +1617,23 @@ export default function App() {
           role="status"
           aria-live="assertive"
         >
-          <p className="board-prompt-float-label">
-            {error ? 'Error' : spellConfirm || confirmKey ? 'Confirm' : state.pendingPrompt ? 'Action needed' : 'Message'}
-          </p>
+          <div className="board-prompt-float-head">
+            <p className="board-prompt-float-label">
+              {error ? 'Error' : spellConfirm || confirmKey ? 'Confirm' : state.pendingPrompt ? 'Action needed' : 'Message'}
+            </p>
+            <button
+              type="button"
+              className="msg-dismiss"
+              aria-label="Close message"
+              onClick={() => {
+                setMessagesHidden(true);
+                setError(null);
+                setStatus('');
+              }}
+            >
+              ×
+            </button>
+          </div>
           <PlayPromptBanners
             status={status}
             error={error}
@@ -1675,6 +1753,8 @@ export default function App() {
           setStatus={setStatus}
           send={send}
           cancelAbility={cancelAbility}
+          onDismissStatus={() => setStatus('')}
+          onDismissError={() => setError(null)}
         />
       )}
 
@@ -1894,7 +1974,8 @@ export default function App() {
                       : null;
                   const showingInfo =
                     (piece && piece.id === inspectedId) ||
-                    (piece && !infoLocked && piece.id === hoveredId);
+                    (piece && !infoLocked && piece.id === hoveredId) ||
+                    toks.some((t) => inspectedId === `token:${t.id}` || (!infoLocked && hoveredId === `token:${t.id}`));
                   return (
                     <button
                       key={`${row}-${col}`}
@@ -1905,6 +1986,8 @@ export default function App() {
                         selected ? 'selected' : '',
                         piece && piece.id === inspectedId ? 'inspected' : '',
                         piece && !infoLocked && piece.id === hoveredId ? 'info-hover' : '',
+                        toks.some((t) => inspectedId === `token:${t.id}`) ? 'inspected' : '',
+                        toks.some((t) => !infoLocked && hoveredId === `token:${t.id}`) ? 'info-hover' : '',
                         lastFrom ? 'last-from' : '',
                         lastTo || lastPiece ? 'last-to' : '',
                         hasPigBuddy ? 'pig-buddy-sq' : '',
@@ -1924,9 +2007,14 @@ export default function App() {
                       onClick={() => onSquareClick(row, col)}
                       onMouseEnter={() => {
                         if (piece) setHoveredId(piece.id);
+                        else if (toks[0]) setHoveredId(`token:${toks[0].id}`);
                       }}
                       onMouseLeave={() => {
-                        setHoveredId((h) => (piece && h === piece.id ? null : h));
+                        setHoveredId((h) => {
+                          if (piece && h === piece.id) return null;
+                          if (toks[0] && h === `token:${toks[0].id}`) return null;
+                          return h;
+                        });
                       }}
                       title={
                         confirmKey === key || confirmKey === (piece ? `piece:${piece.id}` : '')
@@ -1937,11 +2025,13 @@ export default function App() {
                               ? 'Last move'
                               : piece
                                 ? 'Hover for info · click to lock'
-                                : undefined
+                                : toks.length
+                                  ? 'Hover for obstacle info · click to lock'
+                                  : undefined
                       }
                     >
                       {toks.map((t) => (
-                        <span key={t.id} className={`token ${t.kind}`} title={t.kind} />
+                        <span key={t.id} className={`token ${t.kind}`} title={getObstacleInfo(t.kind).name} />
                       ))}
                       {piece && (
                         <span
@@ -2097,7 +2187,7 @@ export default function App() {
                 </span>
                 <div
                   className={`hand hand-fan ${
-                    state.phase === 'playing' && !spellsUnlocked(state) ? 'hand-spell-locked' : ''
+                    state.phase === 'playing' && (!spellsUnlocked(state) || magicSilenced) ? 'hand-spell-locked' : ''
                   }`}
                 >
                   {you &&
@@ -2105,9 +2195,11 @@ export default function App() {
                       const meta = cardMeta(catalog, c.defId);
                       const cardDef = CARD_REGISTRY[c.defId];
                       const nightLocked = state.phase === 'playing' && !spellsUnlocked(state);
+                      const silenced = state.phase === 'playing' && magicSilenced;
                       const interruptCard = Boolean(cardDef?.playOnOpponentTurn);
                       const spellLocked =
                         nightLocked ||
+                        silenced ||
                         (state.phase === 'playing' &&
                           !interruptCard &&
                           ((state.turn === you && state.turnPhase === 'move') ||
@@ -2129,7 +2221,9 @@ export default function App() {
                           title={
                             nightLocked
                               ? 'Spell cards unlock at the first night'
-                              : spellLocked
+                              : silenced
+                                ? 'Magic is silenced (Magic Be-gone)'
+                                : spellLocked
                                 ? state.turn !== you
                                   ? 'Cannot cast this on the opponent’s turn'
                                   : 'Spell phase skipped — cards available next turn'
@@ -2183,6 +2277,12 @@ export default function App() {
                     </button>
                   )}
                 </div>
+              )}
+
+              {magicSilenced && (
+                <p className="hint">
+                  Magic Be-gone: your spells and magical abilities are silenced until the day/night cycle changes.
+                </p>
               )}
 
               {activeCardDef?.id === 'swap' && pendingTargets.length === 1 && canCastSpells && (
@@ -2286,7 +2386,7 @@ export default function App() {
 
           <aside className="play-dock" aria-live="polite">
             <div className="play-dock-box">
-              <p className="play-dock-label">Piece info</p>
+              <p className="play-dock-label">Info</p>
               {you &&
                 state.turn === you &&
                 state.phase === 'playing' &&
@@ -2294,14 +2394,14 @@ export default function App() {
                 state.tokens.some((t) => t.kind === 'barrier' && t.owner === you) &&
                 !state.pendingPrompt && (
                   <p className="hint barrier-hint">
-                    To relocate a barrier, select an Enchanted Pawn and press <strong>Barrier Shift</strong>. Clicking a
+                    To relocate a barrier, select a Crystalite and press <strong>Barrier Shift</strong>. Clicking a
                     barrier while the pawn is selected will walk onto it (Barrier Phase).
                   </p>
                 )}
-              {!inspectedPiece && (
+              {!inspectedPiece && !inspectedToken && (
                 <p className="play-dock-idle">
                   {knowledgeEnabled
-                    ? 'Hover a piece for details, or click to lock info. Game prompts appear under the board.'
+                    ? 'Hover a piece or obstacle for details, or click to lock info. Game prompts appear under the board.'
                     : 'Game prompts and confirmations appear under the board.'}
                 </p>
               )}
@@ -2316,6 +2416,7 @@ export default function App() {
                     ritualTurns: inspectedPiece.ritualTurns,
                     gadgetUsed: inspectedPiece.gadgetUsed,
                     abilityCooldown: inspectedPiece.abilityCooldown,
+                    magicBegoneUsed: inspectedPiece.magicBegoneUsed,
                     bloodlust: inspectedPiece.bloodlust,
                     identityLootDefId: inspectedPiece.identityLootDefId,
                     copiedMoveDefId: inspectedPiece.copiedMoveDefId,
@@ -2323,6 +2424,17 @@ export default function App() {
                     hasPigBuddy: pigHostIds.has(inspectedPiece.id),
                     effects: inspectedPiece.effects,
                   }}
+                  onClose={() => {
+                    setInspectedId(null);
+                    setHoveredId(null);
+                  }}
+                />
+              ) : knowledgeEnabled && inspectedToken ? (
+                <ObstacleInfoTile
+                  kind={inspectedToken.kind}
+                  owner={inspectedToken.owner}
+                  turnsRemaining={inspectedToken.turnsRemaining}
+                  locked={infoLocked}
                   onClose={() => {
                     setInspectedId(null);
                     setHoveredId(null);
@@ -2565,6 +2677,7 @@ function PieceInfoBody({
     ritualTurns?: number;
     gadgetUsed?: boolean;
     abilityCooldown?: number;
+    magicBegoneUsed?: number;
     bloodlust?: boolean;
     identityLootDefId?: string;
     copiedMoveDefId?: string;
@@ -2644,6 +2757,9 @@ function PieceInfoBody({
           {live.charges != null && <span>Charges: {live.charges}</span>}
           {live.ritualTurns != null && live.ritualTurns > 0 && <span>Ritual: {live.ritualTurns}</span>}
           {live.gadgetUsed && <span>Gadget used</span>}
+          {live.magicBegoneUsed != null && live.magicBegoneUsed > 0 && (
+            <span>Magic Be-gone: {live.magicBegoneUsed}/2 used</span>
+          )}
           {live.abilityCooldown != null && live.abilityCooldown > 0 && (
             <span>Cooldown: {live.abilityCooldown}</span>
           )}
@@ -2680,6 +2796,7 @@ function PieceInfoTile({
     ritualTurns?: number;
     gadgetUsed?: boolean;
     abilityCooldown?: number;
+    magicBegoneUsed?: number;
     bloodlust?: boolean;
     identityLootDefId?: string;
     copiedMoveDefId?: string;
@@ -2709,6 +2826,78 @@ function PieceInfoTile({
   );
 }
 
+function ObstacleInfoTile({
+  kind,
+  owner,
+  turnsRemaining,
+  locked = false,
+  onClose,
+}: {
+  kind: string;
+  owner: Color;
+  turnsRemaining?: number;
+  locked?: boolean;
+  onClose: () => void;
+}) {
+  const info = getObstacleInfo(kind);
+  return (
+    <aside
+      className={`piece-info-tile ${owner} ${locked ? 'is-locked' : 'is-hover'} is-docked`}
+      aria-live="polite"
+    >
+      <button type="button" className="piece-info-close" onClick={onClose} aria-label="Close obstacle info">
+        ×
+      </button>
+      {locked ? (
+        <p className="piece-info-lock-badge">Locked</p>
+      ) : (
+        <p className="piece-info-lock-badge hover">Hover · click obstacle to lock</p>
+      )}
+      <div className="piece-info-head">
+        <div className="piece-info-icon-wrap">
+          <span className={`token-swatch token ${kind}`} aria-hidden />
+        </div>
+        <div>
+          <p className="piece-info-class">{info.category}</p>
+          <h2>{info.name}</h2>
+          <p className="obstacle-owner">{owner === 'white' ? 'White' : 'Black'} token</p>
+        </div>
+      </div>
+      <section>
+        <h3>How it works</h3>
+        <ul>
+          {info.how.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      </section>
+      {info.notes && info.notes.length > 0 && (
+        <section>
+          <h3>Notes</h3>
+          <ul>
+            {info.notes.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {turnsRemaining != null && turnsRemaining > 0 && (
+        <div className="piece-info-live">
+          <span>{turnsRemaining} turns left</span>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function OverlayClose({ onClose }: { onClose: () => void }) {
+  return (
+    <button type="button" className="msg-dismiss overlay-dismiss" aria-label="Look at the board" onClick={onClose}>
+      ×
+    </button>
+  );
+}
+
 function OpeningMulliganOverlay({
   prompt,
   you,
@@ -2716,6 +2905,7 @@ function OpeningMulliganOverlay({
   catalog,
   onKeep,
   onRedraw,
+  onClose,
 }: {
   prompt: NonNullable<GameState['pendingPrompt']>;
   you: Color;
@@ -2723,6 +2913,7 @@ function OpeningMulliganOverlay({
   catalog: Catalog | null;
   onKeep: () => void;
   onRedraw: (instanceId: string) => void;
+  onClose: () => void;
 }) {
   const [picked, setPicked] = useState<string | null>(null);
   const chooser = prompt.color;
@@ -2732,6 +2923,7 @@ function OpeningMulliganOverlay({
     return (
       <div className="hand-limit-overlay opening-mulligan-overlay" role="dialog" aria-modal="true" aria-labelledby="opening-mulligan-title">
         <div className="hand-limit-panel opening-mulligan-panel">
+          <OverlayClose onClose={onClose} />
           <p className="hand-limit-eyebrow">Opening hand</p>
           <h2 id="opening-mulligan-title">Waiting for opponent</h2>
           <p className="opening-mulligan-lead">
@@ -2747,6 +2939,7 @@ function OpeningMulliganOverlay({
   return (
     <div className="hand-limit-overlay opening-mulligan-overlay" role="dialog" aria-modal="true" aria-labelledby="opening-mulligan-title">
       <div className="hand-limit-panel opening-mulligan-panel">
+        <OverlayClose onClose={onClose} />
         <header className="opening-mulligan-header">
           <p className="hand-limit-eyebrow">Opening hand</p>
           <h2 id="opening-mulligan-title">Review your cards</h2>
@@ -2812,12 +3005,14 @@ function DiscardToDrawOverlay({
   state,
   catalog,
   onDiscard,
+  onClose,
 }: {
   prompt: NonNullable<GameState['pendingPrompt']>;
   you: Color;
   state: GameState;
   catalog: Catalog | null;
   onDiscard: (instanceId: string) => void;
+  onClose: () => void;
 }) {
   const [picked, setPicked] = useState<string | null>(null);
   const chooser = prompt.color;
@@ -2825,6 +3020,7 @@ function DiscardToDrawOverlay({
     return (
       <div className="hand-limit-overlay" role="dialog" aria-modal="true" aria-labelledby="hand-limit-title">
         <div className="hand-limit-panel">
+          <OverlayClose onClose={onClose} />
           <p className="hand-limit-eyebrow">Hand full</p>
           <h2 id="hand-limit-title">Waiting for opponent</h2>
           <p className="hand-limit-copy">
@@ -2843,6 +3039,7 @@ function DiscardToDrawOverlay({
   return (
     <div className="hand-limit-overlay" role="dialog" aria-modal="true" aria-labelledby="hand-limit-title">
       <div className="hand-limit-panel">
+        <OverlayClose onClose={onClose} />
         <p className="hand-limit-eyebrow">Hand full</p>
         <h2 id="hand-limit-title">You drew a card</h2>
         <p className="hand-limit-copy">
@@ -2910,6 +3107,8 @@ function PlayPromptBanners({
   setStatus,
   send,
   cancelAbility,
+  onDismissStatus,
+  onDismissError,
 }: {
   status: string;
   error: string | null;
@@ -2921,11 +3120,31 @@ function PlayPromptBanners({
   setStatus: (msg: string) => void;
   send: (action: object) => void;
   cancelAbility: () => void;
+  onDismissStatus?: () => void;
+  onDismissError?: () => void;
 }) {
   return (
     <>
-      {status ? <div className="banner">{status}</div> : null}
-      {error && <div className="banner error">{error}</div>}
+      {status ? (
+        <div className="banner banner-dismissable">
+          <span>{status}</span>
+          {onDismissStatus ? (
+            <button type="button" className="msg-dismiss" aria-label="Close message" onClick={onDismissStatus}>
+              ×
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {error && (
+        <div className="banner error banner-dismissable">
+          <span>{error}</span>
+          {onDismissError ? (
+            <button type="button" className="msg-dismiss" aria-label="Close error" onClick={onDismissError}>
+              ×
+            </button>
+          ) : null}
+        </div>
+      )}
 
       {state.pendingPrompt?.type === 'promote' && state.pendingPrompt.color === you && (
         <div className="banner">
@@ -2952,10 +3171,10 @@ function PlayPromptBanners({
                 className={gadgetKind === kind ? 'primary' : ''}
                 onClick={() => {
                   setGadgetKind(kind);
-                  setStatus(`Selected ${kind} — click an adjacent empty square`);
+                  setStatus(`Selected ${getObstacleInfo(kind).name} — click an adjacent empty square`);
                 }}
               >
-                {kind.replace('_', ' ')}
+                {getObstacleInfo(kind).name}
               </button>
             ))}
             <button type="button" onClick={cancelAbility}>

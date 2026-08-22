@@ -76,15 +76,13 @@ export const PIECES: Record<string, PieceDefinition> = {
         const down = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col + dc }, p.color);
         if (down && !down.capture) moves.push(down);
       }
-      // First move: up to 2 tiles diagonally upwards (non-capture)
+      // First move: up to 2 tiles forward (non-capture), path must be clear
       if (!p.hasMoved) {
-        for (const dc of [-1, 1]) {
-          const one = { row: p.pos.row + dir, col: p.pos.col + dc };
-          if (inBounds(one) && !pieceAt(s, one)) moves.push({ to: one });
-          const two = { row: p.pos.row + dir * 2, col: p.pos.col + dc * 2 };
-          const mid = { row: p.pos.row + dir, col: p.pos.col + dc };
-          if (inBounds(two) && !pieceAt(s, mid) && !pieceAt(s, two)) moves.push({ to: two });
-        }
+        const mid = { row: p.pos.row + dir, col: p.pos.col };
+        const two = { row: p.pos.row + dir * 2, col: p.pos.col };
+        const blocked = (c: { row: number; col: number }) =>
+          pieceAt(s, c) || s.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, c));
+        if (inBounds(two) && !blocked(mid) && !blocked(two)) moves.push({ to: two });
       }
       // Captures: diagonally up, diagonally down, or vertically down
       for (const dc of [-1, 1]) {
@@ -100,10 +98,9 @@ export const PIECES: Record<string, PieceDefinition> = {
   },
   enchanted_pawn: {
     id: 'enchanted_pawn',
-    name: 'Enchanted Pawn',
+    name: 'Crystalite',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['rook', 'stoneman', 'gnome'],
     getMoves: (p, s) => {
       const moves = [];
       const bonus = movementBonus(p);
@@ -154,7 +151,7 @@ export const PIECES: Record<string, PieceDefinition> = {
   },
   stoneman: {
     id: 'stoneman',
-    name: 'Stoneman',
+    name: 'Golem',
     class: 'rook',
     symbol: '♜',
     getMoves: (p, s) => {
@@ -235,7 +232,7 @@ export const PIECES: Record<string, PieceDefinition> = {
   },
   scamman: {
     id: 'scamman',
-    name: 'TheScamMan',
+    name: 'Fleece',
     class: 'bishop',
     symbol: '♝',
     getMoves: (p, s) => {

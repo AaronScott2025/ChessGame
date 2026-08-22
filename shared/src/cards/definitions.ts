@@ -608,7 +608,7 @@ registerCard({
   name: 'Pawn Summon',
   description: [
     'Revive up to two pawns anywhere in allied territory.',
-    'For each revive, choose which pawn variant to place (Pawn, nwaP, Rogue, or Enchanted Pawn).',
+    'For each revive, choose which pawn variant to place (Pawn, nwaP, Rogue, or Crystalite).',
   ],
   image: '/cards/Pawn_Summon.png',
   targeting: 'empty_allied',

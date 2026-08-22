@@ -30,14 +30,14 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Pawn',
     movement: [
       'Moves 1 square forward, or 1 square diagonally backward.',
-      'First move may go up to 2 squares diagonally forward.',
+      'First move may go up to 2 squares forward.',
     ],
     abilities: ['Promote into Bishop or Rook variants at the far edge.'],
     misc: ['Captures diagonally forward, diagonally backward, or straight backward.'],
   },
   enchanted_pawn: {
     id: 'enchanted_pawn',
-    name: 'Enchanted Pawn',
+    name: 'Crystalite',
     classLabel: 'Pawn',
     movement: [
       'Moves 1 square orthogonally (any direction).',
@@ -47,7 +47,6 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Barrier Spell: starting army places barriers on the side frontline squares instead of those pawns.',
       'Barrier Phase: may occupy and pass through barrier tiles (click the highlighted square to walk onto it).',
       'Barrier Shift: press the Barrier Shift button, then choose a barrier and an empty allied square (uses your turn).',
-      'Promote into Rook variants at the far edge.',
     ],
     misc: ['Captures diagonally only.', 'Barriers cannot sit adjacent to each other.'],
   },
@@ -60,7 +59,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
   },
   stoneman: {
     id: 'stoneman',
-    name: 'Stoneman',
+    name: 'Golem',
     classLabel: 'Rook',
     movement: ['Moves up to 3 squares horizontally or vertically.'],
     abilities: [
@@ -75,8 +74,8 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves up to 2 squares horizontally or vertically.'],
     abilities: [
       'Gadget Deploy (once per game): place Ice Floor, Spring Board, or Gnome Hole on an adjacent empty tile.',
-      'Ice Floor: pieces that land there slide one more tile in their arrival direction.',
-      'Spring Board: bounce 2 tiles in a chosen direction (captures on landing).',
+      'Ice Floor: pieces that land there slide one more tile in their arrival direction (cannot slide onto or capture a king).',
+      'Spring Board: bounce 2 tiles in a chosen direction (captures on landing, except the king).',
       'Gnome Hole: allied pieces may travel to a gnome starting square.',
     ],
   },
@@ -118,7 +117,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
   },
   scamman: {
     id: 'scamman',
-    name: 'TheScamMan',
+    name: 'Fleece',
     classLabel: 'Bishop',
     movement: ['Moves 1 square diagonally.'],
     abilities: [
@@ -133,6 +132,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves up to 2 squares diagonally.'],
     abilities: [
       'Enchant: give an adjacent piece +1 movement for 2 turns (4-turn cooldown).',
+      'Magic Be-gone (2× per game): if both Wizards are alive, silence the opponent’s spells and magical abilities until the next day/night change (up to 5 turns). Uses your turn. Ends early if either Wizard dies.',
     ],
   },
   queen: {

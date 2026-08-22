@@ -27,6 +27,8 @@ import {
   shuffleInPlace,
   movementBonus,
   spellsUnlocked,
+  isMagicDisabled,
+  nextDayNightFlipCycle,
 } from '../utils.js';
 
 function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
@@ -451,7 +453,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
     out.push({
       id: 'gadget_deploy',
       name: 'Gadget Deploy',
-      ready: !piece.gadgetUsed && (piece.disabledTurns ?? 0) <= 0,
+      ready: !piece.gadgetUsed && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
       hint: 'Once per game: place Ice Floor, Spring Board, or Gnome Hole on an adjacent empty tile',
     });
   }
@@ -467,7 +469,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
         ready: false,
         passive: true,
         hint: stolenName
-          ? `This Scamman permanently moves like a ${stolenName} (movement only).`
+          ? `This Fleece permanently moves like a ${stolenName} (movement only).`
           : 'Identity Theft has already been used.',
       });
     } else {
@@ -485,8 +487,20 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
     out.push({
       id: 'enchant',
       name: 'Enchant',
-      ready: (piece.abilityCooldown ?? 0) <= 0 && (piece.disabledTurns ?? 0) <= 0,
+      ready: (piece.abilityCooldown ?? 0) <= 0 && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
       hint: '+1 movement to an adjacent piece for 2 turns (4-turn cooldown)',
+    });
+    const bothWizards =
+      state.pieces.some((p) => p.defId === 'wizard' && p.color === 'white') &&
+      state.pieces.some((p) => p.defId === 'wizard' && p.color === 'black');
+    const used = piece.magicBegoneUsed ?? 0;
+    out.push({
+      id: 'magic_begone',
+      name: 'Magic Be-gone',
+      ready: used < 2 && bothWizards && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
+      hint: bothWizards
+        ? `2× per game (${2 - used} left): silence the opponent's spells and magical abilities until the next day/night change (up to 5 turns). Both Wizards must be alive.`
+        : 'Requires both Wizards to be alive on the board.',
     });
   }
   if (piece.defId === 'angel') {
@@ -494,7 +508,8 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       (piece.reviveCount ?? 0) < 3 &&
       (piece.ritualTurns == null || piece.ritualTurns <= 0) &&
       state.lastMove?.pieceId !== piece.id &&
-      (piece.disabledTurns ?? 0) <= 0;
+      (piece.disabledTurns ?? 0) <= 0 &&
+      !isMagicDisabled(state, piece.color);
     out.push({
       id: 'revive',
       name: 'Revive Ritual',
@@ -507,7 +522,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
     out.push({
       id: 'barrier_shift',
       name: 'Barrier Shift',
-      ready: hasBarrier && (piece.disabledTurns ?? 0) <= 0,
+      ready: hasBarrier && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
       hint: 'Press this, then click a barrier and an empty allied square. Walking onto a barrier is a normal move (Barrier Phase).',
     });
   }
@@ -593,6 +608,10 @@ export function useAbility(
   const piece = next.pieces.find((p) => p.id === pieceId);
   if (!piece || piece.color !== color) throw new Error('Invalid piece');
   if ((piece.disabledTurns ?? 0) > 0) throw new Error('Piece is disabled');
+  if (isMagicDisabled(next, color) && abilityId !== 'identity_theft') {
+    const magical = ['enchant', 'magic_begone', 'gadget_deploy', 'revive', 'barrier_shift'];
+    if (magical.includes(abilityId)) throw new Error('Magic is silenced (Magic Be-gone)');
+  }
 
   const avail = availableAbilities(next, pieceId).find((a) => a.id === abilityId);
   if (!avail?.ready) throw new Error('Ability not available');
@@ -630,6 +649,10 @@ export function useAbility(
       return next;
     }
     return finishWizardEnchant(next, color, pieceId, targetId);
+  }
+
+  if (abilityId === 'magic_begone') {
+    return finishMagicBegone(next, color, pieceId);
   }
 
   if (abilityId === 'revive') {
@@ -747,7 +770,7 @@ function finishIdentityTheft(state: GameState, color: Color, pieceId: string): G
     data: { defId: loot },
   });
   state.pendingPrompt = null;
-  log(state, `Scamman Identity Theft — now moves like ${stolenDef.name}`);
+  log(state, `Fleece Identity Theft — now moves like ${stolenDef.name}`);
   if (isInCheck(state, opposite(color))) {
     state.check = opposite(color);
     return endTurn(state, color, true);
@@ -774,6 +797,49 @@ function finishWizardEnchant(state: GameState, color: Color, pieceId: string, ta
     return endTurn(state, color, true);
   }
   return endTurn(state, color, false);
+}
+
+function finishMagicBegone(state: GameState, color: Color, pieceId: string): GameState {
+  const wizard = state.pieces.find((p) => p.id === pieceId);
+  if (!wizard || wizard.defId !== 'wizard') throw new Error('Only a Wizard can use Magic Be-gone');
+  const bothWizards =
+    state.pieces.some((p) => p.defId === 'wizard' && p.color === 'white') &&
+    state.pieces.some((p) => p.defId === 'wizard' && p.color === 'black');
+  if (!bothWizards) throw new Error('Both Wizards must be alive');
+  const used = wizard.magicBegoneUsed ?? 0;
+  if (used >= 2) throw new Error('Magic Be-gone already used twice');
+
+  const enemy = opposite(color);
+  const until = nextDayNightFlipCycle(state.cycleCount);
+  state.players[enemy].magicDisabledUntilCycle = until;
+  wizard.magicBegoneUsed = used + 1;
+  const enemyKing = getKing(state, enemy);
+  if (enemyKing) {
+    removeEffects(enemyKing, 'magic_begone');
+    addEffect(enemyKing, {
+      id: `magic_begone_${enemy}`,
+      kind: 'magic_begone',
+      data: { untilCycle: until },
+    });
+  }
+  state.pendingPrompt = null;
+  log(
+    state,
+    `${color} Wizard used Magic Be-gone — ${enemy}'s magic is silenced until the next day/night change`,
+  );
+  if (isInCheck(state, enemy)) {
+    state.check = enemy;
+    return endTurn(state, color, true);
+  }
+  return endTurn(state, color, false);
+}
+
+function clearMagicBegone(state: GameState): void {
+  for (const c of ['white', 'black'] as Color[]) {
+    state.players[c].magicDisabledUntilCycle = undefined;
+    const king = getKing(state, c);
+    if (king) removeEffects(king, 'magic_begone');
+  }
 }
 
 function finishAngelReviveStart(state: GameState, color: Color, pieceId: string, defId: string): GameState {
@@ -846,7 +912,7 @@ function finishBarrierShift(
 ): GameState {
   const actor = state.pieces.find((p) => p.id === pieceId);
   if (!actor || actor.color !== color || actor.defId !== 'enchanted_pawn') {
-    throw new Error('Barrier Shift requires an Enchanted Pawn');
+    throw new Error('Barrier Shift requires a Crystalite');
   }
   const token = state.tokens.find((t) => t.kind === 'barrier' && t.owner === color && sameCoord(t.pos, from));
   if (!token) throw new Error('No barrier there');
@@ -884,7 +950,7 @@ function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, 
       if (state.tokens.some((x) => x.kind === 'barrier' && sameCoord(x.pos, slide))) continue;
       const occ = pieceAt(state, slide);
       if (occ) {
-        if (occ.color === piece.color) continue;
+        if (occ.color === piece.color || gadgetCannotCapture(occ)) continue;
         removePiece(state, occ, color);
       }
       if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
@@ -1046,7 +1112,7 @@ export function applyMove(
     if (captured.defId === 'scamman' && piece.class !== 'pawn') {
       piece.defId = 'pawn';
       piece.class = 'pawn';
-      log(next, `${piece.id} was scammed into a pawn!`);
+      log(next, `${piece.id} was fleeced into a pawn!`);
     }
 
     // Demon convert
@@ -1118,7 +1184,7 @@ export function applyMove(
         kind: 'identity_loot',
         data: { defId: captured.defId },
       });
-      log(next, `Scamman stored ${captured.defId} identity (activate Identity Theft to steal its movement)`);
+      log(next, `Fleece stored ${captured.defId} identity (activate Identity Theft to steal its movement)`);
     }
 
     if (piece.defId === 'snake') {
@@ -1192,7 +1258,7 @@ export function applyMove(
 
   // Promotion
   const promoteRow = color === 'white' ? 0 : BOARD_SIZE - 1;
-  if (piece.class === 'pawn' && piece.pos.row === promoteRow) {
+  if (piece.class === 'pawn' && piece.defId !== 'enchanted_pawn' && piece.pos.row === promoteRow) {
     const opts = getPieceDef(piece.defId).promoteOptions ?? ['queen'];
     next.pendingPrompt = { type: 'promote', color, pieceId: piece.id, options: opts };
     log(next, `${color} pawn awaiting promotion`);
@@ -1238,6 +1304,11 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
   }
   state.pieces = state.pieces.filter((p) => p.id !== piece.id);
   state.players[piece.color].graveyard.push({ defId: piece.defId, class: piece.class });
+
+  if (piece.defId === 'wizard') {
+    clearMagicBegone(state);
+    log(state, 'A Wizard fell — Magic Be-gone silence ends');
+  }
 
   // prince princess true love
   if (piece.defId === 'prince_princess' && piece.linkedPieceId) {
@@ -1334,6 +1405,7 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
   const isOppTurn = next.turn !== color;
   const interrupt = Boolean(def.playOnOpponentTurn);
   if (!spellsUnlocked(next)) throw new Error('Spell cards cannot be used until the first night');
+  if (isMagicDisabled(next, color)) throw new Error('Magic is silenced (Magic Be-gone)');
   if (isOppTurn && !interrupt) throw new Error('Cannot play that on opponent turn');
   if (!interrupt) {
     if (next.turnPhase !== 'spell') throw new Error('Spell phase only');
@@ -1530,7 +1602,10 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (!orth && !diag) throw new Error('Bounce must be exactly 2 tiles in a chosen direction');
     if (!inBounds(dest)) throw new Error('Out of bounds');
     const occ = pieceAt(next, dest);
-    if (occ) removePiece(next, occ, color);
+    if (occ) {
+      if (gadgetCannotCapture(occ)) throw new Error('Cannot capture the king (or an invincible piece) with Spring Board');
+      removePiece(next, occ, color);
+    }
     if (endBestBuddy(next, piece, piece.pos)) log(next, 'Best Buddy ended');
     piece.pos = { ...dest };
     next.pendingPrompt = null;
@@ -1645,6 +1720,248 @@ function applyGambler(
   }
 }
 
+function gadgetCannotCapture(occ: PieceState): boolean {
+  return occ.class === 'king' || Boolean(hasEffect(occ, 'invincible') || hasEffect(occ, 'pause'));
+}
+
+function hasLegalBoardMoves(state: GameState, color: Color): boolean {
+  return state.pieces.some((p) => p.color === color && listMoves(state, p.id).length > 0);
+}
+
+function escapesCheck(trial: GameState, color: Color): boolean {
+  if (trial.phase === 'ended' && trial.winner !== color) return false;
+  if (!getKing(trial, color)) return false;
+  if (!isInCheck(trial, color)) return true;
+  return hasLegalBoardMoves(trial, color);
+}
+
+function combinations<T>(arr: T[], k: number): T[][] {
+  if (k <= 0) return [[]];
+  if (arr.length < k) return [];
+  const out: T[][] = [];
+  const rec = (start: number, acc: T[]) => {
+    if (acc.length === k) {
+      out.push([...acc]);
+      return;
+    }
+    for (let i = start; i <= arr.length - (k - acc.length); i++) {
+      acc.push(arr[i]);
+      rec(i + 1, acc);
+      acc.pop();
+    }
+  };
+  rec(0, []);
+  return out;
+}
+
+function tryApplyCard(state: GameState, color: Color, instanceId: string, targets: unknown[]): GameState | null {
+  try {
+    const next = cloneState(state);
+    const card = next.players[color].hand.find((c) => c.instanceId === instanceId);
+    if (!card) return null;
+    const def = getCardDef(card.defId);
+    const rng = () => 0.5;
+    const result = def.play({ state: next, player: color, card, rng }, targets);
+    if (!result.done) return null;
+    if (def.id === 'teleport' && isInCheck(result.state, color)) return null;
+    return result.state;
+  } catch {
+    return null;
+  }
+}
+
+function emptyCoords(state: GameState, pred?: (c: Coord) => boolean): Coord[] {
+  const out: Coord[] = [];
+  for (let row = 0; row < BOARD_SIZE; row++) {
+    for (let col = 0; col < BOARD_SIZE; col++) {
+      const c = { row, col };
+      if (pieceAt(state, c)) continue;
+      if (pred && !pred(c)) continue;
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+function cardHasSavingPlay(state: GameState, color: Color, instanceId: string, defId: string): boolean {
+  const allies = state.pieces.filter((p) => p.color === color);
+  const king = getKing(state, color);
+  const apply = (targets: unknown[]) => {
+    const trial = tryApplyCard(state, color, instanceId, targets);
+    return Boolean(trial && escapesCheck(trial, color));
+  };
+
+  if (defId === 'rewind') {
+    return apply([]);
+  }
+  if (defId === 'kingstead') {
+    return apply([]);
+  }
+  if (
+    defId === 'portal' ||
+    defId === 'speed_plus' ||
+    defId === 'doublecast' ||
+    defId === 'blind_gambit' ||
+    defId === 'rally' ||
+    defId === 'enchant'
+  ) {
+    return false;
+  }
+  if (defId === 'pocket_castle') {
+    return allies.some((p) => p.class !== 'king' && apply([p.id]));
+  }
+  if (defId === 'pause') {
+    return state.pieces.some((p) => p.class !== 'king' && apply([p.id]));
+  }
+  if (defId === 'refresh' || defId === 'repel') {
+    return state.pieces.some((p) => apply([p.id]));
+  }
+  if (defId === 'mathematical') {
+    return allies.some((p) => apply([p.id]));
+  }
+  if (defId === 'swap') {
+    for (const p of allies) {
+      if (p.class === 'king' || p.class === 'queen') continue;
+      for (const variant of VARIANTS_BY_CLASS[p.class] ?? []) {
+        if (variant === p.defId) continue;
+        if (apply([p.id, variant])) return true;
+      }
+    }
+    return false;
+  }
+  if (defId === 'teleport') {
+    const dirs = [
+      { row: 2, col: 0 },
+      { row: -2, col: 0 },
+      { row: 0, col: 2 },
+      { row: 0, col: -2 },
+      { row: 2, col: 2 },
+      { row: 2, col: -2 },
+      { row: -2, col: 2 },
+      { row: -2, col: -2 },
+    ];
+    for (const p of allies) {
+      if (!isAlliedTerritory(color, p.pos)) continue;
+      for (const d of dirs) {
+        const to = { row: p.pos.row + d.row, col: p.pos.col + d.col };
+        if (apply([p.id, to])) return true;
+      }
+    }
+    return false;
+  }
+  if (defId === 'rearrange') {
+    if (!king || allies.length < 4) return false;
+    const others = allies.filter((p) => p.id !== king.id);
+    for (const trio of combinations(others, 3)) {
+      const group = [king, ...trio];
+      const squares = group.map((p) => ({ ...p.pos }));
+      for (let ki = 0; ki < 4; ki++) {
+        const rest = squares.filter((_, j) => j !== ki);
+        const assignment: Record<string, Coord> = { [king.id]: squares[ki] };
+        trio.forEach((p, i) => {
+          assignment[p.id] = rest[i];
+        });
+        if (apply([...group.map((p) => p.id), assignment])) return true;
+      }
+    }
+    return false;
+  }
+  if (defId === 'revive') {
+    const gy = state.players[color].graveyard;
+    if (!gy.length) return false;
+    for (let idx = 0; idx < gy.length; idx++) {
+      for (const pos of emptyCoords(state)) {
+        if (apply([idx, pos])) return true;
+      }
+    }
+    return false;
+  }
+  if (defId === 'pawn_summon') {
+    const pawnSlots = state.players[color].graveyard.filter((g) => g.class === 'pawn').length;
+    if (pawnSlots < 1) return false;
+    const variants = VARIANTS_BY_CLASS.pawn;
+    const spots = emptyCoords(state, (c) => isAlliedTerritory(color, c));
+    const need = Math.min(2, pawnSlots);
+    for (const pos of spots) {
+      for (const def of variants) {
+        if (need === 1) {
+          if (apply([def, pos])) return true;
+        } else {
+          const pos2 = spots.find((s) => s.row !== pos.row || s.col !== pos.col);
+          if (pos2 && apply([def, pos, def, pos2])) return true;
+        }
+      }
+    }
+    return false;
+  }
+  if (defId === 'barrier') {
+    return emptyCoords(state, (c) => isAlliedTerritory(color, c)).some((pos) => apply([pos]));
+  }
+  if (defId === 'gamblers_gambit' || defId === 'gamblers_delight') {
+    const classes = [...new Set(state.pieces.filter((p) => p.color !== color && p.class !== 'king').map((p) => p.class))];
+    for (const cls of classes) {
+      const trial = cloneState(state);
+      try {
+        applyGambler(trial, defId, 8, color, cls);
+        if (escapesCheck(trial, color)) return true;
+      } catch {
+        /* ignore */
+      }
+    }
+    const queenTrial = cloneState(state);
+    try {
+      applyGambler(queenTrial, defId, 12, color, null);
+      if (escapesCheck(queenTrial, color)) return true;
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+
+  return apply([]);
+}
+
+function barrierShiftSaves(state: GameState, color: Color): boolean {
+  const canShift = state.pieces.some(
+    (p) => p.defId === 'enchanted_pawn' && p.color === color && (p.disabledTurns ?? 0) <= 0,
+  );
+  if (!canShift) return false;
+  const barriers = state.tokens.filter((t) => t.kind === 'barrier' && t.owner === color);
+  if (!barriers.length) return false;
+  const dests = emptyCoords(state, (c) => isAlliedTerritory(color, c));
+  for (const token of barriers) {
+    for (const to of dests) {
+      const trial = cloneState(state);
+      const tok = trial.tokens.find((t) => t.id === token.id);
+      if (!tok) continue;
+      if (pieceAt(trial, to) || trial.tokens.some((t) => sameCoord(t.pos, to) && t.id !== tok.id)) continue;
+      const old = { ...tok.pos };
+      tok.pos = { row: -10, col: -10 };
+      if (barriersAdjacent(trial, to)) {
+        tok.pos = old;
+        continue;
+      }
+      tok.pos = { ...to };
+      if (escapesCheck(trial, color)) return true;
+    }
+  }
+  return false;
+}
+
+function hasEscapeFromCheck(state: GameState, color: Color): boolean {
+  if (hasLegalBoardMoves(state, color)) return true;
+  if (!isMagicDisabled(state, color) && barrierShiftSaves(state, color)) return true;
+  if (!spellsUnlocked(state)) return false;
+  if (isMagicDisabled(state, color)) return false;
+  if (state.turnPhase !== 'spell') return false;
+  const player = state.players[color];
+  if (player.spellsThisTurn >= player.maxSpellsThisTurn) return false;
+  for (const card of player.hand) {
+    if (cardHasSavingPlay(state, color, card.instanceId, card.defId)) return true;
+  }
+  return false;
+}
+
 export function endTurn(state: GameState, color: Color, fromCheck: boolean): GameState {
   const next = state;
   tickEffectsOnTurnEnd(next, color);
@@ -1679,6 +1996,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
     if (next.cycleCount % 5 === 0) {
       next.dayNight = next.dayNight === 'day' ? 'night' : 'day';
       log(next, `It is now ${next.dayNight}`);
+      clearMagicBegone(next);
       if (next.dayNight === 'day') {
         for (const c of ['white', 'black'] as Color[]) {
           tryDrawWithHandLimit(next, c);
@@ -1717,16 +2035,15 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
   }
 
   next.turn = nextColor;
-  next.turnPhase = spellsUnlocked(next) ? 'spell' : 'move';
+  next.turnPhase = spellsUnlocked(next) && !isMagicDisabled(next, nextColor) ? 'spell' : 'move';
   next.players[nextColor].maxSpellsThisTurn = 1;
 
   pushSnapshot(next);
 
-  // checkmate-ish: if no moves and in check
+  // Checkmate only if the player has no legal move AND no spell/ability that can get out of check
   if (isInCheck(next, nextColor)) {
     next.check = nextColor;
-    const hasAny = next.pieces.some((p) => p.color === nextColor && listMoves(next, p.id).length > 0);
-    if (!hasAny) {
+    if (!hasEscapeFromCheck(next, nextColor)) {
       next.phase = 'ended';
       next.winner = opposite(nextColor);
       next.winReason = 'Checkmate';

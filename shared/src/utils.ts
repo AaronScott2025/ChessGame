@@ -213,6 +213,24 @@ export function spellsUnlocked(state: { cycleCount: number; dayNight: string }):
   return state.cycleCount >= 5 || state.dayNight === 'night';
 }
 
+export function nextDayNightFlipCycle(cycleCount: number): number {
+  const step = 5 - (cycleCount % 5);
+  return cycleCount + (step === 0 ? 5 : step);
+}
+
+/** True when Magic Be-gone has silenced this player's spells and magical abilities. */
+export function isMagicDisabled(state: {
+  cycleCount: number;
+  players: Record<string, { magicDisabledUntilCycle?: number }>;
+  pieces: Array<{ defId: string; color: string }>;
+}, color: string): boolean {
+  const until = state.players[color]?.magicDisabledUntilCycle;
+  if (until == null || state.cycleCount >= until) return false;
+  const whiteWizard = state.pieces.some((p) => p.defId === 'wizard' && p.color === 'white');
+  const blackWizard = state.pieces.some((p) => p.defId === 'wizard' && p.color === 'black');
+  return whiteWizard && blackWizard;
+}
+
 export function barriersAdjacent(state: GameState, pos: Coord): boolean {
   return state.tokens.some((t) => {
     if (t.kind !== 'barrier') return false;

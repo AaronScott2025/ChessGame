@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { PIECE_INFO, type PieceInfo } from './pieceInfo';
+import { getObstacleInfo, OBSTACLE_ORDER, type ObstacleInfo } from './obstacleInfo';
 
 const CLASS_SECTIONS: Array<{ title: string; ids: string[] }> = [
   { title: 'Pawns', ids: ['pawn', 'nwap', 'rogue', 'enchanted_pawn'] },
@@ -30,6 +31,37 @@ function formatNamedLine(line: string) {
     );
   }
   return line;
+}
+
+function ObstacleRulesCard({ obstacle }: { obstacle: ObstacleInfo }) {
+  return (
+    <article className="rules-piece" id={`rules-obstacle-${obstacle.id}`}>
+      <header className="rules-piece-head">
+        <h3>{obstacle.name}</h3>
+        <span className="rules-piece-class">{obstacle.category}</span>
+      </header>
+      <div className="rules-piece-body">
+        <section>
+          <h4>How it works</h4>
+          <ul>
+            {obstacle.how.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </section>
+        {obstacle.notes && obstacle.notes.length > 0 && (
+          <section>
+            <h4>Notes</h4>
+            <ul>
+              {obstacle.notes.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+          </section>
+        )}
+      </div>
+    </article>
+  );
 }
 
 function PieceRulesCard({ piece }: { piece: PieceInfo }) {
@@ -236,6 +268,19 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
               </li>
               <li>General chess rules still apply unless contradicted here.</li>
             </ul>
+          </section>
+
+          <section className="rules-page rules-class-section">
+            <h2>Obstacles &amp; tokens</h2>
+            <p>
+              These sit on the board independently of pieces. Hover or click one during a match to see the
+              same details in the info panel.
+            </p>
+            <div className="rules-piece-grid">
+              {OBSTACLE_ORDER.map((id) => (
+                <ObstacleRulesCard key={id} obstacle={getObstacleInfo(id)} />
+              ))}
+            </div>
           </section>
 
           {CLASS_SECTIONS.map((section) => (
