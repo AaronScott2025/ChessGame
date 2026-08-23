@@ -201,7 +201,12 @@ export function movementBonus(piece: PieceState): number {
 }
 
 export function isFrozen(piece: PieceState): boolean {
-  return Boolean(hasEffect(piece, 'frozen') || hasEffect(piece, 'immobilized') || hasEffect(piece, 'stunned'));
+  return Boolean(
+    hasEffect(piece, 'frozen') ||
+      hasEffect(piece, 'immobilized') ||
+      hasEffect(piece, 'webbed') ||
+      hasEffect(piece, 'stunned'),
+  );
 }
 
 export function isInvincible(piece: PieceState): boolean {
@@ -219,16 +224,47 @@ export function nextDayNightFlipCycle(cycleCount: number): number {
 }
 
 /** True when Magic Be-gone has silenced this player's spells and magical abilities. */
-export function isMagicDisabled(state: {
-  cycleCount: number;
-  players: Record<string, { magicDisabledUntilCycle?: number }>;
-  pieces: Array<{ defId: string; color: string }>;
-}, color: string): boolean {
+export function isMagicDisabled(
+  state: {
+    cycleCount: number;
+    players: Record<string, { magicDisabledUntilCycle?: number }>;
+  },
+  color: string,
+): boolean {
   const until = state.players[color]?.magicDisabledUntilCycle;
-  if (until == null || state.cycleCount >= until) return false;
-  const whiteWizard = state.pieces.some((p) => p.defId === 'wizard' && p.color === 'white');
-  const blackWizard = state.pieces.some((p) => p.defId === 'wizard' && p.color === 'black');
-  return whiteWizard && blackWizard;
+  return until != null && state.cycleCount < until;
+}
+
+export function reaperCapturesUntilRest(charges: number): number {
+  const c = Math.max(0, Math.min(5, Math.floor(charges)));
+  return 6 - c;
+}
+
+/** Night Chebyshev radius from Blood Tokens. 1 token → 1; every 3 tokens after that +1; cap 5. */
+export function vampireNightRadius(tokens: number): number {
+  if (tokens < 1) return 0;
+  return Math.min(5, 1 + Math.floor((tokens - 1) / 3));
+}
+
+export function ownWizards(
+  state: { pieces: Array<{ defId: string; color: string; magicBegoneUsed?: number }> },
+  color: string,
+) {
+  return state.pieces.filter((p) => p.defId === 'wizard' && p.color === color);
+}
+
+export function bothOwnWizardsAlive(
+  state: { pieces: Array<{ defId: string; color: string }> },
+  color: string,
+): boolean {
+  return ownWizards(state, color).length >= 2;
+}
+
+export function magicBegoneUses(
+  state: { pieces: Array<{ defId: string; color: string; magicBegoneUsed?: number }> },
+  color: string,
+): number {
+  return ownWizards(state, color).reduce((n, p) => n + (p.magicBegoneUsed ?? 0), 0);
 }
 
 export function barriersAdjacent(state: GameState, pos: Coord): boolean {

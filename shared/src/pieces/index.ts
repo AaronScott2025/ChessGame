@@ -7,6 +7,7 @@ import {
   movementBonus,
   pieceAt,
   sameCoord,
+  vampireNightRadius,
 } from '../utils.js';
 import {
   areaMoves,
@@ -48,7 +49,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Pawn',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['queen', 'angel', 'ghost', 'reaper'],
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, false)),
   },
   nwap: {
@@ -93,6 +94,66 @@ export const PIECES: Record<string, PieceDefinition> = {
       }
       const capDown = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col }, p.color);
       if (capDown?.capture) moves.push(capDown);
+      return filterLegal(p, s, moves);
+    },
+  },
+  leapfrog: {
+    id: 'leapfrog',
+    name: 'Leapfrog',
+    class: 'pawn',
+    symbol: '♟',
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'],
+    getMoves: (p, s) => {
+      const moves = [];
+      const dir = p.color === 'white' ? -1 : 1;
+      const fwd = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col }, p.color);
+      if (fwd && !fwd.capture) moves.push(fwd);
+      for (const dc of [-1, 1]) {
+        const side = emptyOrEnemy(s, { row: p.pos.row, col: p.pos.col + dc }, p.color);
+        if (side?.capture) moves.push(side);
+      }
+      for (const d of ALL8) {
+        const mid = { row: p.pos.row + d.row, col: p.pos.col + d.col };
+        const to = { row: p.pos.row + d.row * 2, col: p.pos.col + d.col * 2 };
+        if (!inBounds(mid) || !inBounds(to)) continue;
+        const ally = pieceAt(s, mid);
+        if (!ally || ally.color !== p.color || ally.id === p.id) continue;
+        const land = emptyOrEnemy(s, to, p.color);
+        if (land) moves.push(land);
+      }
+      return filterLegal(p, s, moves);
+    },
+  },
+  spider: {
+    id: 'spider',
+    name: 'Spider',
+    class: 'pawn',
+    symbol: '♟',
+    getMoves: (p, s) => {
+      const moves = [];
+      const dir = p.color === 'white' ? -1 : 1;
+      const blocked = (c: { row: number; col: number }) =>
+        pieceAt(s, c) || s.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, c));
+      const fwd = { row: p.pos.row + dir, col: p.pos.col };
+      if (inBounds(fwd) && !blocked(fwd)) moves.push({ to: fwd });
+      if (!p.hasMoved) {
+        const two = { row: p.pos.row + dir * 2, col: p.pos.col };
+        if (inBounds(fwd) && !blocked(fwd) && inBounds(two) && !blocked(two)) {
+          moves.push({ to: two });
+        }
+        for (const dc of [-1, 1]) {
+          const diag = { row: p.pos.row + dir, col: p.pos.col + dc };
+          if (inBounds(diag) && !blocked(diag)) moves.push({ to: diag });
+          const diagTwo = { row: p.pos.row + dir * 2, col: p.pos.col + dc * 2 };
+          if (inBounds(diag) && !blocked(diag) && inBounds(diagTwo) && !blocked(diagTwo)) {
+            moves.push({ to: diagTwo });
+          }
+        }
+      }
+      for (const dc of [-1, 1]) {
+        const cap = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col + dc }, p.color);
+        if (cap?.capture) moves.push(cap);
+      }
       return filterLegal(p, s, moves);
     },
   },
@@ -323,6 +384,30 @@ export const PIECES: Record<string, PieceDefinition> = {
       return filterLegal(p, s, moves);
     },
   },
+  snail: {
+    id: 'snail',
+    name: 'Snail',
+    class: 'queen',
+    symbol: '♛',
+    getMoves: (p, s) => {
+      if (p.defId === 'snail' && (p.charges ?? 0) <= 0) return [];
+      return filterLegal(p, s, areaMoves(p, s, 1));
+    },
+  },
+  vampire: {
+    id: 'vampire',
+    name: 'Vampire',
+    class: 'queen',
+    symbol: '♛',
+    getMoves: (p, s) => {
+      if (s.dayNight !== 'night') {
+        return filterLegal(p, s, rayMoves(p, s, ORTH, 1));
+      }
+      const radius = vampireNightRadius(p.charges ?? 0);
+      if (radius <= 0) return filterLegal(p, s, rayMoves(p, s, ORTH, 1));
+      return filterLegal(p, s, areaMoves(p, s, radius));
+    },
+  },
   prince_princess: {
     id: 'prince_princess',
     name: 'Prince & Princess',
@@ -378,6 +463,23 @@ export const PIECES: Record<string, PieceDefinition> = {
       return filterLegal(p, s, copied);
     },
   },
+  gambler: {
+    id: 'gambler',
+    name: 'Gambler',
+    class: 'wildcard',
+    symbol: '♟',
+    getMoves: (p, s) => {
+      if (s.dayNight === 'night') {
+        return filterLegal(p, s, rayMoves(p, s, DIAG, 1));
+      }
+      const styleId = p.gamblerStyleDefId;
+      if (!styleId || styleId === 'gambler' || !PIECES[styleId]) {
+        return filterLegal(p, s, areaMoves(p, s, 1));
+      }
+      const copied = PIECES[styleId].getMoves(p, s).filter((m) => !m.special);
+      return filterLegal(p, s, copied);
+    },
+  },
   king: {
     id: 'king',
     name: 'King',
@@ -397,12 +499,12 @@ export const PIECES: Record<string, PieceDefinition> = {
 };
 
 export const VARIANTS_BY_CLASS: Record<string, string[]> = {
-  pawn: ['pawn', 'nwap', 'rogue', 'enchanted_pawn'],
+  pawn: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'],
   rook: ['rook', 'stoneman', 'gnome'],
   knight: ['horse', 'snake', 'pig'],
   bishop: ['bishop', 'scamman', 'wizard'],
-  wildcard: ['prince_princess', 'demon', 'mimic'],
-  queen: ['queen', 'angel', 'ghost', 'reaper'],
+  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler'],
+  queen: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'],
   king: ['king'],
 };
 
@@ -419,4 +521,31 @@ export function getPieceDef(id: string): PieceDefinition {
   const def = PIECES[id];
   if (!def) throw new Error(`Unknown piece: ${id}`);
   return def;
+}
+
+export function rollGamblerStyles(state: GameState, rng: () => number, onlyUnrolled = false): string[] {
+  const logs: string[] = [];
+  const gamblers = state.pieces.filter((p) => p.defId === 'gambler');
+  const taken = new Set(
+    onlyUnrolled
+      ? gamblers.map((g) => g.gamblerStyleDefId).filter((id): id is string => Boolean(id))
+      : [],
+  );
+  for (const g of gamblers) {
+    if (onlyUnrolled && g.gamblerStyleDefId) continue;
+    const exclude = new Set(taken);
+    if (g.gamblerPrevStyleDefId) exclude.add(g.gamblerPrevStyleDefId);
+    let pool = Object.keys(PIECES).filter((id) => id !== 'gambler' && !exclude.has(id));
+    if (!pool.length) {
+      pool = Object.keys(PIECES).filter((id) => id !== 'gambler' && id !== g.gamblerPrevStyleDefId);
+    }
+    if (!pool.length) pool = Object.keys(PIECES).filter((id) => id !== 'gambler');
+    const pick = pool[Math.floor(rng() * pool.length)]!;
+    g.gamblerPrevStyleDefId = g.gamblerStyleDefId;
+    g.gamblerStyleDefId = pick;
+    taken.add(pick);
+    const styleName = PIECES[pick]?.name ?? pick;
+    logs.push(`${g.color} Gambler rolled ${styleName} movement`);
+  }
+  return logs;
 }

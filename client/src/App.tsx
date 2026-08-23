@@ -11,7 +11,7 @@ import {
 } from '@shared/index.ts';
 import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
-import { spellsUnlocked, isMagicDisabled } from '@shared/utils.ts';
+import { spellsUnlocked, isMagicDisabled, reaperCapturesUntilRest, vampireNightRadius } from '@shared/utils.ts';
 import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
 import {
   AudioToggles,
@@ -57,6 +57,8 @@ interface Piece {
   pos: Coord;
   effects: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   charges?: number;
+  reaperKills?: number;
+  gamblerStyleDefId?: string;
   gadgetUsed?: boolean;
   abilityCooldown?: number;
   ritualTurns?: number;
@@ -1848,6 +1850,7 @@ export default function App() {
                       <div className="variant-grid draft-grid draft-class-options">
                         {(VARIANTS_BY_CLASS[cls] ?? []).map((id) => {
                           const p = pieceMeta(catalog, id);
+                          const displayName = PIECES[id]?.name ?? p?.name ?? id;
                           const selected = draftInspectDefId === id;
                           const canPick = state.draft?.pickingColor === you;
                           return (
@@ -1874,10 +1877,10 @@ export default function App() {
                                 <PieceIcon
                                   defId={id}
                                   color={state.draft!.pickingColor}
-                                  title={p?.name}
+                                  title={displayName}
                                 />
                               </span>
-                              <span className="draft-tile-name">{p?.name ?? id}</span>
+                              <span className="draft-tile-name">{displayName}</span>
                             </button>
                           );
                         })}
@@ -1972,6 +1975,8 @@ export default function App() {
                           phase: moveAnim.phase,
                         }
                       : null;
+                  const vampRadius =
+                    piece?.defId === 'vampire' ? vampireNightRadius(piece.charges ?? 0) : 0;
                   const showingInfo =
                     (piece && piece.id === inspectedId) ||
                     (piece && !infoLocked && piece.id === hoveredId) ||
@@ -2003,6 +2008,8 @@ export default function App() {
                         gamblerTarget ? 'gambler-target' : '',
                         sliding ? 'sq-sliding' : '',
                         piece?.defId === 'reaper' && (piece.charges ?? 0) > 0 ? 'sq-reaper-fx' : '',
+                        vampRadius > 0 ? 'sq-vampire-fx' : '',
+                        piece?.defId === 'gambler' ? `sq-gambler sq-gambler-${state.dayNight}` : '',
                       ].join(' ')}
                       onClick={() => onSquareClick(row, col)}
                       onMouseEnter={() => {
@@ -2042,6 +2049,8 @@ export default function App() {
                               ? ` reaper-charged reaper-charged-${Math.min(piece.charges ?? 0, 5)}`
                               : ''
                           }${
+                            vampRadius > 0 ? ` vampire-blood vampire-blood-${vampRadius}` : ''
+                          }${
                             (piece.effects ?? []).some((e) => effectTone(e.kind) === 'debuff')
                               ? ' has-debuff'
                               : (piece.effects ?? []).length
@@ -2049,7 +2058,9 @@ export default function App() {
                                 : ''
                           }`}
                           style={
-                            sliding || (piece.defId === 'reaper' && (piece.charges ?? 0) > 0)
+                            sliding ||
+                            (piece.defId === 'reaper' && (piece.charges ?? 0) > 0) ||
+                            vampRadius > 0
                               ? ({
                                   ...(sliding
                                     ? {
@@ -2061,6 +2072,7 @@ export default function App() {
                                   ...(piece.defId === 'reaper' && (piece.charges ?? 0) > 0
                                     ? { '--reaper-c': Math.min(piece.charges ?? 0, 5) }
                                     : {}),
+                                  ...(vampRadius > 0 ? { '--vamp-r': vampRadius } : {}),
                                 } as React.CSSProperties)
                               : undefined
                           }
@@ -2075,8 +2087,18 @@ export default function App() {
                           }}
                           title={[
                             meta?.name ?? piece.defId,
+                            piece.defId === 'gambler'
+                              ? state.dayNight === 'night'
+                                ? 'Night: 1 diagonal'
+                                : piece.gamblerStyleDefId
+                                  ? `Moves as ${PIECES[piece.gamblerStyleDefId]?.name ?? piece.gamblerStyleDefId}`
+                                  : 'Waiting on a roll'
+                              : null,
                             piece.defId === 'reaper' && (piece.charges ?? 0) > 0
                               ? `${piece.charges} charge${piece.charges === 1 ? '' : 's'}`
+                              : null,
+                            piece.defId === 'vampire' && vampRadius > 0
+                              ? `Blood aura ${vampRadius}×${vampRadius}`
                               : null,
                             hasPigBuddy ? 'Pig Best Buddy sharing this tile' : null,
                             ...visibleBoardEffects(piece.effects ?? []).map(formatEffectTitle),
@@ -2085,11 +2107,44 @@ export default function App() {
                             .join(' · ')}
                         >
                           <PieceIcon defId={piece.defId} color={piece.color} title={meta?.name ?? piece.defId} />
+                          {piece.defId === 'gambler' && (
+                            <span
+                              className={`gambler-style ${state.dayNight === 'night' ? 'is-night' : 'is-day'}`}
+                              title={
+                                state.dayNight === 'night'
+                                  ? 'Night movement: 1 square diagonally'
+                                  : piece.gamblerStyleDefId
+                                    ? `Day movement: ${PIECES[piece.gamblerStyleDefId]?.name ?? piece.gamblerStyleDefId}`
+                                    : 'No style rolled yet'
+                              }
+                            >
+                              {state.dayNight === 'night' ? (
+                                <i className="gambler-night-mark" aria-hidden>
+                                  ◆
+                                </i>
+                              ) : piece.gamblerStyleDefId ? (
+                                <PieceIcon
+                                  defId={piece.gamblerStyleDefId}
+                                  color={piece.color}
+                                  className="sm"
+                                  title={PIECES[piece.gamblerStyleDefId]?.name}
+                                />
+                              ) : (
+                                <i className="gambler-night-mark" aria-hidden>
+                                  ?
+                                </i>
+                              )}
+                            </span>
+                          )}
+                          {(piece.effects ?? []).some((e) => e.kind === 'webbed') && (
+                            <img className="web-overlay" src="/overlays/web.svg" alt="" draggable={false} />
+                          )}
                           {hasPigBuddy && (
                             <i className="pig-buddy" title="Pig is Best Buddy on this piece">
                               <PieceIcon defId="pig" color={piece.color} className="sm" title="Pig buddy" />
                             </i>
                           )}
+                          {vampRadius > 0 && <VampireBloodAura radius={vampRadius} />}
                           {piece.defId === 'reaper' && (piece.charges ?? 0) > 0 ? (
                             <ReaperChargeFx charges={piece.charges ?? 0} />
                           ) : piece.charges != null && piece.charges > 0 ? (
@@ -2413,6 +2468,8 @@ export default function App() {
                   docked
                   live={{
                     charges: inspectedPiece.charges,
+                    reaperKills: inspectedPiece.reaperKills,
+                    gamblerStyleDefId: inspectedPiece.gamblerStyleDefId,
                     ritualTurns: inspectedPiece.ritualTurns,
                     gadgetUsed: inspectedPiece.gadgetUsed,
                     abilityCooldown: inspectedPiece.abilityCooldown,
@@ -2578,6 +2635,17 @@ function TurnStrip({
   );
 }
 
+function VampireBloodAura({ radius }: { radius: number }) {
+  const shown = Math.max(0, Math.min(5, radius));
+  if (shown <= 0) return null;
+  return (
+    <span className="vampire-blood-fx" aria-hidden>
+      <i className="vampire-aura" />
+      <i className="vampire-aura-ring" />
+    </span>
+  );
+}
+
 function ReaperChargeFx({ charges }: { charges: number }) {
   const shown = Math.max(0, Math.min(5, charges));
   if (shown <= 0) return null;
@@ -2674,6 +2742,8 @@ function PieceInfoBody({
   color: Color;
   live?: {
     charges?: number;
+    reaperKills?: number;
+    gamblerStyleDefId?: string;
     ritualTurns?: number;
     gadgetUsed?: boolean;
     abilityCooldown?: number;
@@ -2754,7 +2824,28 @@ function PieceInfoBody({
 
       {live && (
         <div className="piece-info-live">
-          {live.charges != null && <span>Charges: {live.charges}</span>}
+          {live.charges != null && defId !== 'vampire' && <span>Charges: {live.charges}</span>}
+          {defId === 'vampire' && (
+            <span>
+              Blood Tokens: {live.charges ?? 0}
+              {vampireNightRadius(live.charges ?? 0) > 0
+                ? ` · Night ${vampireNightRadius(live.charges ?? 0)}×${vampireNightRadius(live.charges ?? 0)}`
+                : ' · Night: 1 orthogonal'}
+            </span>
+          )}
+          {defId === 'gambler' && (
+            <span>
+              Day style:{' '}
+              {live.gamblerStyleDefId
+                ? PIECES[live.gamblerStyleDefId]?.name ?? live.gamblerStyleDefId
+                : 'unrolled'}
+            </span>
+          )}
+          {defId === 'reaper' && live.charges != null && live.charges > 0 && (
+            <span>
+              Harvest: {live.reaperKills ?? 0}/{reaperCapturesUntilRest(live.charges)} captures until rest
+            </span>
+          )}
           {live.ritualTurns != null && live.ritualTurns > 0 && <span>Ritual: {live.ritualTurns}</span>}
           {live.gadgetUsed && <span>Gadget used</span>}
           {live.magicBegoneUsed != null && live.magicBegoneUsed > 0 && (
@@ -2793,6 +2884,8 @@ function PieceInfoTile({
   color: Color;
   live?: {
     charges?: number;
+    reaperKills?: number;
+    gamblerStyleDefId?: string;
     ritualTurns?: number;
     gadgetUsed?: boolean;
     abilityCooldown?: number;

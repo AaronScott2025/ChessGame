@@ -3,12 +3,12 @@ import { PIECE_INFO, type PieceInfo } from './pieceInfo';
 import { getObstacleInfo, OBSTACLE_ORDER, type ObstacleInfo } from './obstacleInfo';
 
 const CLASS_SECTIONS: Array<{ title: string; ids: string[] }> = [
-  { title: 'Pawns', ids: ['pawn', 'nwap', 'rogue', 'enchanted_pawn'] },
+  { title: 'Pawns', ids: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'] },
   { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome'] },
   { title: 'Knights', ids: ['horse', 'snake', 'pig'] },
   { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard'] },
-  { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper'] },
-  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic'] },
+  { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'] },
+  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler'] },
   { title: 'King', ids: ['king'] },
 ];
 

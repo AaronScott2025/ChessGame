@@ -29,6 +29,7 @@ export const EFFECT_META: Record<string, EffectMeta> = {
   converted: { label: 'Cnv', name: 'Converted', tone: 'neutral' },
   soul_locked: { label: 'Soul', name: 'Soul Locked', tone: 'neutral' },
   immobilized: { label: 'Imm', name: 'Immobilized', tone: 'debuff' },
+  webbed: { label: 'Imm', name: 'Immovable', tone: 'debuff' },
   wizard_enchant: { label: 'Wiz', name: 'Wizard enchant', tone: 'buff' },
   magic_begone: { label: 'Mbg', name: 'Magic silenced', tone: 'debuff' },
   identity_loot: { label: 'ID', name: 'Identity stored', tone: 'neutral' },

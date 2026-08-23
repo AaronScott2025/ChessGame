@@ -2356,7 +2356,8 @@ html.fx-off .turn-pill-check.is-you {
 }
 
 .sq.sq-sliding,
-.sq.sq-reaper-fx {
+.sq.sq-reaper-fx,
+.sq.sq-vampire-fx {
   overflow: visible;
   z-index: 11;
 }
@@ -2530,6 +2531,77 @@ html.fx-off .turn-pill-check.is-you {
   color: #f5d76e;
 }
 
+.vampire-blood-fx {
+  position: absolute;
+  inset: -38%;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.vampire-aura {
+  position: absolute;
+  inset: 6%;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(255, 40, 50, calc(0.16 + 0.1 * var(--vamp-r, 1))) 0%,
+    rgba(160, 0, 18, calc(0.14 + 0.08 * var(--vamp-r, 1))) 38%,
+    transparent 72%
+  );
+  box-shadow:
+    0 0 calc(8px + 7px * var(--vamp-r, 1)) calc(2px + 2px * var(--vamp-r, 1))
+      rgba(220, 16, 32, calc(0.28 + 0.12 * var(--vamp-r, 1))),
+    0 0 calc(20px + 10px * var(--vamp-r, 1)) rgba(90, 0, 8, calc(0.22 + 0.1 * var(--vamp-r, 1)));
+  animation: vampire-aura-pulse calc(2.8s - 0.28s * var(--vamp-r, 1)) ease-in-out infinite;
+}
+
+.vampire-aura-ring {
+  position: absolute;
+  inset: calc(18% - 3% * var(--vamp-r, 1));
+  border-radius: 50%;
+  border: calc(1px + 0.6px * var(--vamp-r, 1)) solid
+    rgba(255, 70, 80, calc(0.22 + 0.12 * var(--vamp-r, 1)));
+  box-shadow: 0 0 calc(6px + 4px * var(--vamp-r, 1)) rgba(255, 30, 40, calc(0.2 + 0.1 * var(--vamp-r, 1)));
+  animation: vampire-ring-pulse calc(2.8s - 0.28s * var(--vamp-r, 1)) ease-in-out infinite;
+}
+
+.piece.vampire-blood .piece-icon {
+  filter: drop-shadow(0 0 calc(4px + 3px * var(--vamp-r, 1)) rgba(255, 40, 50, calc(0.45 + 0.12 * var(--vamp-r, 1))));
+}
+
+.piece.vampire-blood-5 .vampire-aura {
+  background: radial-gradient(
+    circle,
+    rgba(255, 70, 70, 0.55) 0%,
+    rgba(180, 0, 20, 0.42) 36%,
+    transparent 70%
+  );
+}
+
+@keyframes vampire-aura-pulse {
+  0%,
+  100% {
+    opacity: 0.72;
+    transform: scale(calc(0.92 + 0.02 * var(--vamp-r, 1)));
+  }
+  50% {
+    opacity: 1;
+    transform: scale(calc(1.04 + 0.06 * var(--vamp-r, 1)));
+  }
+}
+
+@keyframes vampire-ring-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 0.95;
+    transform: scale(calc(1.08 + 0.04 * var(--vamp-r, 1)));
+  }
+}
+
 .reaper-charge-fx {
   position: absolute;
   inset: -28%;
@@ -2622,9 +2694,70 @@ html.fx-off .turn-pill-check.is-you {
   padding: 1px;
 }
 
+.piece .web-overlay {
+  position: absolute;
+  inset: -6%;
+  width: 112%;
+  height: 112%;
+  object-fit: contain;
+  pointer-events: none;
+  z-index: 4;
+  opacity: 0.92;
+  filter: drop-shadow(0 0 4px rgba(180, 230, 255, 0.45));
+}
+
 .piece .pig-buddy .piece-icon {
   width: 100%;
   height: 100%;
+}
+
+.sq.sq-gambler {
+  box-shadow: inset 0 0 0 2px rgba(232, 196, 92, 0.55);
+}
+
+.sq.sq-gambler-night {
+  box-shadow: inset 0 0 0 2px rgba(168, 140, 255, 0.7);
+}
+
+.piece .gambler-style {
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  z-index: 5;
+  width: 48%;
+  min-width: 1.35rem;
+  height: 48%;
+  min-height: 1.35rem;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: rgba(10, 8, 16, 0.92);
+  border: 2px solid rgba(232, 196, 92, 0.95);
+  box-shadow:
+    0 0 10px rgba(232, 196, 92, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.piece .gambler-style.is-night {
+  border-color: rgba(186, 164, 255, 0.95);
+  box-shadow:
+    0 0 12px rgba(150, 120, 255, 0.55),
+    0 2px 6px rgba(0, 0, 0, 0.55);
+}
+
+.piece .gambler-style .piece-icon {
+  width: 92%;
+  height: 92%;
+}
+
+.piece .gambler-night-mark {
+  font-style: normal;
+  font-size: 0.95rem;
+  line-height: 1;
+  color: #e8d6ff;
+  text-shadow: 0 0 8px rgba(180, 140, 255, 0.9);
 }
 
 .sq.pig-buddy-sq {

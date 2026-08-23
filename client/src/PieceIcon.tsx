@@ -6,6 +6,8 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   nwap: { folder: 'Pawns', file: 'Nwap' },
   rogue: { folder: 'Pawns', file: 'Rogue' },
   enchanted_pawn: { folder: 'Pawns', file: 'EnchantedPawn' },
+  leapfrog: { folder: 'Pawns', file: 'Leapfrog' },
+  spider: { folder: 'Pawns', file: 'Spider' },
   rook: { folder: 'Rooks', file: 'Rook' },
   stoneman: { folder: 'Rooks', file: 'Stoneman' },
   gnome: { folder: 'Rooks', file: 'Gnome' },
@@ -19,9 +21,12 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   angel: { folder: 'Queens', file: 'Angel' },
   ghost: { folder: 'Queens', file: 'Ghost' },
   reaper: { folder: 'Queens', file: 'Reaper' },
+  snail: { folder: 'Queens', file: 'Snail' },
+  vampire: { folder: 'Queens', file: 'Vampire' },
   prince_princess: { folder: 'Wildcards', file: 'PrincePrincess' },
   demon: { folder: 'Wildcards', file: 'Demon' },
   mimic: { folder: 'Wildcards', file: 'Mimic' },
+  gambler: { folder: 'Wildcards', file: 'Gambler' },
   king: { folder: 'Kings', file: 'King' },
 };
 

@@ -43,6 +43,8 @@ export interface PieceState {
   /** Prince/Princess pair link */
   linkedPieceId?: string;
   charges?: number;
+  /** Reaper: captures since last rest. */
+  reaperKills?: number;
   disabledTurns?: number;
   reviveCount?: number;
   ritualTurns?: number;
@@ -61,6 +63,10 @@ export interface PieceState {
   identityTheftUsed?: boolean;
   /** Scamman: permanently use this piece definition's movement. */
   copiedMoveDefId?: string;
+  /** Gambler: movement style rolled for this day. */
+  gamblerStyleDefId?: string;
+  /** Gambler: yesterday's style (cannot repeat). */
+  gamblerPrevStyleDefId?: string;
 }
 
 export interface TokenState {

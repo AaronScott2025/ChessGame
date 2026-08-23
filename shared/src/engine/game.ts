@@ -1,6 +1,6 @@
 import type { Color, Coord, GameState, PendingPrompt, PieceClass, PieceState, PlayerState } from '../types.js';
 import { BOARD_SIZE, MAX_HAND } from '../types.js';
-import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS } from '../pieces/index.js';
+import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS, rollGamblerStyles } from '../pieces/index.js';
 import type { MoveOption } from '../pieces/helpers.js';
 import { isKnightLanding, isPigLShape } from '../pieces/helpers.js';
 import { buildDeck, discardCard, drawCard, getCardDef } from '../cards/index.js';
@@ -29,6 +29,9 @@ import {
   spellsUnlocked,
   isMagicDisabled,
   nextDayNightFlipCycle,
+  bothOwnWizardsAlive,
+  magicBegoneUses,
+  reaperCapturesUntilRest,
 } from '../utils.js';
 
 function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
@@ -203,6 +206,13 @@ export function draftPick(state: GameState, color: Color, defId: string): GameSt
   return next;
 }
 
+function initialCharges(defId: string): number | undefined {
+  if (defId === 'reaper') return 0;
+  if (defId === 'snail') return 8;
+  if (defId === 'vampire') return 0;
+  return undefined;
+}
+
 function armyDraftComplete(army: Partial<Record<PieceClass, string>>): boolean {
   return DRAFT_ORDER.every((cls) => Boolean(army[cls]));
 }
@@ -212,6 +222,8 @@ function finishDraftAndSetup(state: GameState): GameState {
   next.phase = 'opening_draw';
   next.draft = null;
   next.pieces = spawnArmies(next);
+  const spawnRng = mulberry32(next.rngSeed + 7919);
+  for (const line of rollGamblerStyles(next, spawnRng)) log(next, line);
   next.deck = buildDeck(next.rngSeed);
   for (const color of ['white', 'black'] as Color[]) {
     for (let i = 0; i < 3; i++) {
@@ -255,7 +267,7 @@ function spawnArmies(state: GameState): PieceState[] {
         hasMoved: false,
         startPos: { row: back, col },
         effects: [],
-        charges: defId === 'reaper' ? 0 : undefined,
+        charges: initialCharges(defId),
         reviveCount: defId === 'angel' ? 0 : undefined,
       };
       pieces.push(piece);
@@ -490,17 +502,15 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       ready: (piece.abilityCooldown ?? 0) <= 0 && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
       hint: '+1 movement to an adjacent piece for 2 turns (4-turn cooldown)',
     });
-    const bothWizards =
-      state.pieces.some((p) => p.defId === 'wizard' && p.color === 'white') &&
-      state.pieces.some((p) => p.defId === 'wizard' && p.color === 'black');
-    const used = piece.magicBegoneUsed ?? 0;
+    const bothWizards = bothOwnWizardsAlive(state, piece.color);
+    const used = magicBegoneUses(state, piece.color);
     out.push({
       id: 'magic_begone',
       name: 'Magic Be-gone',
       ready: used < 2 && bothWizards && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
       hint: bothWizards
-        ? `2× per game (${2 - used} left): silence the opponent's spells and magical abilities until the next day/night change (up to 5 turns). Both Wizards must be alive.`
-        : 'Requires both Wizards to be alive on the board.',
+        ? `2× per game (${2 - used} left): silence the opponent's spells and magical abilities until the next day/night change (up to 5 turns). Both of your Wizards must be alive.`
+        : 'Requires both of your Wizards to be alive.',
     });
   }
   if (piece.defId === 'angel') {
@@ -802,17 +812,14 @@ function finishWizardEnchant(state: GameState, color: Color, pieceId: string, ta
 function finishMagicBegone(state: GameState, color: Color, pieceId: string): GameState {
   const wizard = state.pieces.find((p) => p.id === pieceId);
   if (!wizard || wizard.defId !== 'wizard') throw new Error('Only a Wizard can use Magic Be-gone');
-  const bothWizards =
-    state.pieces.some((p) => p.defId === 'wizard' && p.color === 'white') &&
-    state.pieces.some((p) => p.defId === 'wizard' && p.color === 'black');
-  if (!bothWizards) throw new Error('Both Wizards must be alive');
-  const used = wizard.magicBegoneUsed ?? 0;
+  if (!bothOwnWizardsAlive(state, color)) throw new Error('Both of your Wizards must be alive');
+  const used = magicBegoneUses(state, color);
   if (used >= 2) throw new Error('Magic Be-gone already used twice');
 
   const enemy = opposite(color);
   const until = nextDayNightFlipCycle(state.cycleCount);
   state.players[enemy].magicDisabledUntilCycle = until;
-  wizard.magicBegoneUsed = used + 1;
+  wizard.magicBegoneUsed = (wizard.magicBegoneUsed ?? 0) + 1;
   const enemyKing = getKing(state, enemy);
   if (enemyKing) {
     removeEffects(enemyKing, 'magic_begone');
@@ -892,7 +899,7 @@ function completeAngelRevive(state: GameState, angel: PieceState): void {
     hasMoved: false,
     startPos: spot,
     effects: [],
-    charges: entry.defId === 'reaper' ? 0 : undefined,
+    charges: initialCharges(entry.defId),
     reviveCount: entry.defId === 'angel' ? 0 : undefined,
   });
   angel.reviveCount = (angel.reviveCount ?? 0) + 1;
@@ -1135,10 +1142,9 @@ export function applyMove(
       const victimSnapshot = { ...captured };
       removePiece(next, captured, color);
 
-      // Reaper charge consume on capture
-      if (piece.defId === 'reaper' && (piece.charges ?? 0) > 0) {
+      // Reaper: soul lock / shatterer, then rest after inverse-charge captures
+      if (piece.defId === 'reaper') {
         const charges = piece.charges ?? 0;
-        // Soul Lock (3+): night capture revives victim as ally on reaper start
         if (charges >= 3 && next.dayNight === 'night') {
           const spot = nearestEmptyAround(next, piece.startPos);
           if (spot) {
@@ -1152,27 +1158,30 @@ export function applyMove(
               hasMoved: false,
               startPos: spot,
               effects: [{ id: `sl_${Date.now()}`, kind: 'soul_locked' }],
+              charges: initialCharges(victimSnapshot.defId),
             });
-            // remove from enemy graveyard if present
             const egy = next.players[opposite(color)].graveyard;
             const gi = egy.findIndex((g) => g.defId === victimSnapshot.defId);
             if (gi >= 0) egy.splice(gi, 1);
             log(next, 'Soul Lock — captive joins your ranks');
           }
         }
-        // World Shatterer (5+): wipe class at night
         if (charges >= 5 && next.dayNight === 'night') {
           const cls = victimSnapshot.class;
           const victims = next.pieces.filter((p) => p.color !== color && p.class === cls);
           for (const v of [...victims]) removePiece(next, v, color);
           log(next, `World Shatterer — ${cls}s annihilated`);
         }
-        const disable = Math.floor(charges * 2.5);
-        piece.charges = 0;
-        piece.disabledTurns = disable;
-        const home = nearestEmptyAround(next, piece.startPos);
-        if (home) piece.pos = home;
-        log(next, `Reaper spent ${charges} charges (disabled ${disable} turns)`);
+        piece.reaperKills = (piece.reaperKills ?? 0) + 1;
+        const needed = reaperCapturesUntilRest(charges);
+        if (charges > 0 && piece.reaperKills >= needed) {
+          const disable = Math.floor(charges * 2.5);
+          piece.reaperKills = 0;
+          piece.disabledTurns = disable;
+          const home = nearestEmptyAround(next, piece.startPos);
+          if (home) piece.pos = home;
+          log(next, `Reaper harvested ${needed} captures — returns home (disabled ${disable} turns)`);
+        }
       }
     }
 
@@ -1195,6 +1204,29 @@ export function applyMove(
     const def = getPieceDef(piece.defId);
     if (def.onCapture && captured) {
       def.onCapture(piece, captured, next);
+    }
+
+    if (piece.defId === 'vampire' && captured) {
+      piece.charges = (piece.charges ?? 0) + 1;
+      log(next, `Vampire gains a Blood Token (${piece.charges})`);
+    }
+
+    if (piece.defId === 'snail' && captured) {
+      const variant = captured.defId;
+      const extras = next.pieces.filter(
+        (p) => p.defId === variant && p.color !== color && p.class !== 'king',
+      );
+      for (const v of extras) {
+        removePiece(next, v, color);
+      }
+      if (extras.length) {
+        log(next, `Snail capture — all enemy ${variant}s are wiped out`);
+      }
+    }
+
+    if (captured?.defId === 'spider' && next.pieces.some((p) => p.id === piece.id)) {
+      addEffect(piece, { id: `web_${piece.id}_${Date.now()}`, kind: 'webbed', turnsRemaining: 2 });
+      log(next, `${piece.defId} is caught in a web (Immovable)`);
     }
   } else if (piece.defId === 'snake' && piece.bloodlust) {
     piece.bloodlust = false;
@@ -1236,6 +1268,17 @@ export function applyMove(
     ...(copiedDefId ? { copiedDefId } : {}),
   } as GameState['lastMove'];
 
+  if (
+    piece.defId === 'snail' &&
+    next.pieces.some((p) => p.id === piece.id)
+  ) {
+    piece.charges = Math.max(0, (piece.charges ?? 8) - 1);
+    if ((piece.charges ?? 0) <= 0) {
+      addEffect(piece, { id: `snail_imm_${piece.id}`, kind: 'immobilized' });
+      log(next, 'The Snail has used all 8 tiles and is immobilized');
+    }
+  }
+
   // Echo
   const echo = hasEffect(piece, 'echo_armed');
   if (echo) {
@@ -1258,7 +1301,12 @@ export function applyMove(
 
   // Promotion
   const promoteRow = color === 'white' ? 0 : BOARD_SIZE - 1;
-  if (piece.class === 'pawn' && piece.defId !== 'enchanted_pawn' && piece.pos.row === promoteRow) {
+  if (
+    piece.class === 'pawn' &&
+    piece.defId !== 'enchanted_pawn' &&
+    piece.defId !== 'spider' &&
+    piece.pos.row === promoteRow
+  ) {
     const opts = getPieceDef(piece.defId).promoteOptions ?? ['queen'];
     next.pendingPrompt = { type: 'promote', color, pieceId: piece.id, options: opts };
     log(next, `${color} pawn awaiting promotion`);
@@ -1305,8 +1353,11 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
   state.pieces = state.pieces.filter((p) => p.id !== piece.id);
   state.players[piece.color].graveyard.push({ defId: piece.defId, class: piece.class });
 
-  if (piece.defId === 'wizard') {
-    clearMagicBegone(state);
+  if (piece.defId === 'wizard' && !bothOwnWizardsAlive(state, piece.color)) {
+    const enemy = opposite(piece.color);
+    state.players[enemy].magicDisabledUntilCycle = undefined;
+    const king = getKing(state, enemy);
+    if (king) removeEffects(king, 'magic_begone');
     log(state, 'A Wizard fell — Magic Be-gone silence ends');
   }
 
@@ -1497,6 +1548,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     const def = getPieceDef(defId);
     piece.defId = def.id;
     piece.class = def.class;
+    piece.charges = initialCharges(def.id);
     next.pendingPrompt = null;
     if (isInCheck(next, opposite(color))) return endTurn(next, color, true);
     return endTurn(next, color, false);
@@ -2002,6 +2054,8 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
           tryDrawWithHandLimit(next, c);
         }
         log(next, 'New day — both players draw 1');
+        const dayRng = mulberry32(next.rngSeed + next.cycleCount * 9973 + 42);
+        for (const line of rollGamblerStyles(next, dayRng)) log(next, line);
       }
       // reaper gains charge at night if alive; ghosts unlock permanently
       if (next.dayNight === 'night') {

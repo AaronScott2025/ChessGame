@@ -13,8 +13,9 @@ import {
   pieceAt,
   removeEffects,
   sameCoord,
+  mulberry32,
 } from '../utils.js';
-import { getPieceDef } from '../pieces/index.js';
+import { getPieceDef, rollGamblerStyles } from '../pieces/index.js';
 import { registerCard, requirePiece } from './registry.js';
 
 function uid(prefix: string) {
@@ -48,7 +49,10 @@ function applyVariantSwap(state: GameState, piece: PieceState, newDefId: string)
     p.defId = def.id;
     p.class = def.class;
     p.linkedPieceId = undefined;
-    if (def.id === 'reaper') p.charges = p.charges ?? 0;
+    if (def.id === 'snail') p.charges = 8;
+    else if (def.id === 'reaper') p.charges = p.charges ?? 0;
+    else if (def.id === 'vampire') p.charges = 0;
+    else p.charges = undefined;
     if (def.id !== 'snake') p.bloodlust = undefined;
     p.pos = { row: -99, col: -99 };
   }
@@ -58,6 +62,10 @@ function applyVariantSwap(state: GameState, piece: PieceState, newDefId: string)
   if (def.id === 'prince_princess' && subjects.length >= 2) {
     subjects[0].linkedPieceId = subjects[1].id;
     subjects[1].linkedPieceId = subjects[0].id;
+  }
+  if (def.id === 'gambler') {
+    const rng = mulberry32((state.rngSeed ?? 1) + state.cycleCount * 9973 + state.turnCount * 13);
+    for (const line of rollGamblerStyles(state, rng, true)) log(state, line);
   }
   log(state, `Swapped ${fromName} → ${def.name}`);
 }

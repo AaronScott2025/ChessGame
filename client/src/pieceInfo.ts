@@ -35,6 +35,33 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     abilities: ['Promote into Bishop or Rook variants at the far edge.'],
     misc: ['Captures diagonally forward, diagonally backward, or straight backward.'],
   },
+  leapfrog: {
+    id: 'leapfrog',
+    name: 'Leapfrog',
+    classLabel: 'Pawn',
+    movement: ['Moves 1 square forward (cannot capture that way).'],
+    abilities: [
+      'Leap: jump over one adjacent allied piece in any direction, landing on the square beyond if it is a legal destination.',
+      'Promote into a Queen or Queen variant at the far edge.',
+    ],
+    misc: [
+      'Captures one square horizontally.',
+      'May also capture on the square landed on after a Leap.',
+    ],
+  },
+  spider: {
+    id: 'spider',
+    name: 'Spider',
+    classLabel: 'Pawn',
+    movement: [
+      'Moves 1 square forward (cannot capture that way).',
+      'First move may go 2 squares forward, or 1–2 squares diagonally forward.',
+    ],
+    abilities: [
+      'Web: if captured, the capturing piece is webbed for 1 turn (cannot move).',
+    ],
+    misc: ['Captures diagonally forward only.', 'Does not promote at the far edge.'],
+  },
   enchanted_pawn: {
     id: 'enchanted_pawn',
     name: 'Crystalite',
@@ -132,7 +159,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves up to 2 squares diagonally.'],
     abilities: [
       'Enchant: give an adjacent piece +1 movement for 2 turns (4-turn cooldown).',
-      'Magic Be-gone (2× per game): if both Wizards are alive, silence the opponent’s spells and magical abilities until the next day/night change (up to 5 turns). Uses your turn. Ends early if either Wizard dies.',
+      'Magic Be-gone (2× per game): if both of your Wizards are alive, silence the opponent’s spells and magical abilities until the next day/night change (up to 5 turns). Uses your turn. Ends early if either of your Wizards dies.',
     ],
   },
   queen: {
@@ -177,8 +204,30 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       '3+: Soul Lock — night captures may revive the victim as an ally on the Reaper’s start square.',
       '4+: Death Stare — capture in a 2×2 area without moving.',
       '5+: World Shatterer — night captures also remove all enemy pieces of that class.',
-      'After spending charges on a capture: return home and disable for floor(charges × 2.5) turns.',
+      'After capturing the inverse of your charge count (1 charge → 5 captures, 5 charges → 1 capture): return home and disable for floor(charges × 2.5) turns.',
     ],
+  },
+  snail: {
+    id: 'snail',
+    name: 'Snail',
+    classLabel: 'Queen',
+    movement: ['Moves 1 tile in any direction.'],
+    abilities: [
+      'Trail: may move a maximum of 8 tiles per game. After that, it is immobilized permanently.',
+      'If this piece captures, every enemy piece of that same variant is also removed (for example, capturing a Pawn takes all enemy Pawns).',
+    ],
+  },
+  vampire: {
+    id: 'vampire',
+    name: 'Vampire',
+    classLabel: 'Queen',
+    movement: [
+      'Day: moves 1 tile orthogonally.',
+      'Night with no Blood Tokens: still 1 tile orthogonally.',
+      '1 Blood Token: at night, moves anywhere in a 1×1 Chebyshev area.',
+      'Every 3rd Blood Token after the first adds 1 tile of night radius, up to a 5×5 area.',
+    ],
+    abilities: ['Gains 1 Blood Token each time it captures a piece (day or night).'],
   },
   prince_princess: {
     id: 'prince_princess',
@@ -216,6 +265,20 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     ],
     misc: ['If the opponent’s last piece was a Mimic, copy what that Mimic copied.'],
   },
+  gambler: {
+    id: 'gambler',
+    name: 'Gambler',
+    classLabel: 'Wildcard',
+    movement: [
+      'Each day, randomly copies the movement of some piece in the game (not its abilities).',
+      'At night, moves 1 square diagonally only.',
+    ],
+    abilities: [],
+    misc: [
+      'Both Gamblers cannot share the same movement style at the same time.',
+      'Cannot roll the same movement style two days in a row.',
+    ],
+  },
   king: {
     id: 'king',
     name: 'King',
@@ -230,7 +293,7 @@ export function getPieceInfo(defId: string): PieceInfo {
   return (
     PIECE_INFO[defId] ?? {
       id: defId,
-      name: defId,
+      name: defId.replace(/(^|_)([a-z])/g, (_, sep, ch) => (sep ? ' ' : '') + ch.toUpperCase()),
       classLabel: 'Unknown',
       movement: ['No details available.'],
       abilities: [],
