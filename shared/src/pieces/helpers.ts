@@ -31,12 +31,22 @@ export interface PieceDefinition {
   promoteOptions?: string[];
 }
 
-export function emptyOrEnemy(state: GameState, pos: Coord, color: Color): MoveOption | null {
+export function fortifyBlocksCapture(attacker: PieceState, victim: PieceState): boolean {
+  return hasEffect(victim, 'fortify') && (attacker.class === 'pawn' || attacker.class === 'knight');
+}
+
+export function emptyOrEnemy(
+  state: GameState,
+  pos: Coord,
+  color: Color,
+  attacker?: PieceState,
+): MoveOption | null {
   if (!inBounds(pos)) return null;
   if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, pos))) return null;
   const occ = pieceAt(state, pos);
   if (!occ) return { to: pos };
   if (occ.color !== color && !hasEffect(occ, 'invincible') && !hasEffect(occ, 'pause')) {
+    if (attacker && fortifyBlocksCapture(attacker, occ)) return null;
     return { to: pos, capture: true };
   }
   return null;
@@ -64,7 +74,12 @@ export function rayMoves(
         moves.push({ to });
         continue;
       }
-      if (occ.color !== piece.color && !hasEffect(occ, 'invincible') && !hasEffect(occ, 'pause')) {
+      if (
+        occ.color !== piece.color &&
+        !hasEffect(occ, 'invincible') &&
+        !hasEffect(occ, 'pause') &&
+        !fortifyBlocksCapture(piece, occ)
+      ) {
         moves.push({ to, capture: true });
       }
       if (!canJump) break;
@@ -85,7 +100,7 @@ export function areaMoves(
     for (let dc = -r; dc <= dcMax(r, dr); dc++) {
       if (!includeCenter && dr === 0 && dc === 0) continue;
       if (chebyshev({ row: 0, col: 0 }, { row: dr, col: dc }) > r) continue;
-      const opt = emptyOrEnemy(state, { row: piece.pos.row + dr, col: piece.pos.col + dc }, piece.color);
+      const opt = emptyOrEnemy(state, { row: piece.pos.row + dr, col: piece.pos.col + dc }, piece.color, piece);
       if (opt) moves.push(opt);
     }
   }
@@ -124,7 +139,7 @@ export function knightMoves(
 ): MoveOption[] {
   const moves: MoveOption[] = [];
   for (const to of knightTargetCoords(piece, state, long, short, canJump, passThroughAllies)) {
-    const opt = emptyOrEnemy(state, to, piece.color);
+    const opt = emptyOrEnemy(state, to, piece.color, piece);
     if (opt) moves.push(opt);
   }
   return moves;
@@ -242,7 +257,7 @@ export function standardPawnMoves(piece: PieceState, state: GameState, diagonalM
       }
     }
     // capture vertically
-    const cap = emptyOrEnemy(state, forward, piece.color);
+    const cap = emptyOrEnemy(state, forward, piece.color, piece);
     if (cap?.capture) moves.push(cap);
   } else {
     if (inBounds(forward) && !pieceAt(state, forward) && !state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, forward))) {
@@ -274,7 +289,7 @@ export function standardPawnMoves(piece: PieceState, state: GameState, diagonalM
     }
     for (const dc of [-1, 1]) {
       const to = { row: piece.pos.row + dir, col: piece.pos.col + dc };
-      const opt = emptyOrEnemy(state, to, piece.color);
+      const opt = emptyOrEnemy(state, to, piece.color, piece);
       if (opt?.capture) moves.push(opt);
     }
   }

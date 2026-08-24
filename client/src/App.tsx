@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { listMoves as engineListMoves, availableAbilities as engineAbilities } from '@shared/engine/game.ts';
 import {
@@ -11,7 +11,7 @@ import {
 } from '@shared/index.ts';
 import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
-import { spellsUnlocked, isMagicDisabled, reaperCapturesUntilRest, vampireNightRadius } from '@shared/utils.ts';
+import { spellsUnlocked, isMagicDisabled, reaperCapturesUntilRest, vampireNightRadius, opposite } from '@shared/utils.ts';
 import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
 import {
   AudioToggles,
@@ -20,6 +20,9 @@ import {
   playCardDrawSfx,
   playCaptureSfx,
   playCheckSfx,
+  beginCheckedTrack,
+  tickCheckedPlayerTurn,
+  stopCheckedTrack,
   playDayToNightSfx,
   playDraftOrderSfx,
   playDraftPickSfx,
@@ -408,6 +411,8 @@ export default function App() {
   const lastGraveCountsRef = useRef<{ white: number; black: number } | null>(null);
   const lastHandIdsRef = useRef<string[] | null>(null);
   const lastCheckRef = useRef<Color | null | 'unset'>('unset');
+  const lastTurnForCheckThemeRef = useRef<Color | null>(null);
+  const checkedThemeColorRef = useRef<Color | null>(null);
   const [checkAlert, setCheckAlert] = useState(false);
   const [moveAnim, setMoveAnim] = useState<{
     key: string;
@@ -600,6 +605,7 @@ export default function App() {
       lastGraveCountsRef.current = graves;
       lastHandIdsRef.current = handIds;
       lastCheckRef.current = state.check;
+      lastTurnForCheckThemeRef.current = state.turn;
       return;
     }
 
@@ -612,10 +618,24 @@ export default function App() {
     const prevCheck = lastCheckRef.current;
     if (prevCheck !== 'unset' && state.check === you && prevCheck !== you) {
       playCheckSfx();
+      beginCheckedTrack();
+      checkedThemeColorRef.current = you;
       setCheckAlert(true);
       setStatus('Check! Your king is under attack.');
     }
     lastCheckRef.current = state.check;
+
+    const prevTurn = lastTurnForCheckThemeRef.current;
+    const themeColor = checkedThemeColorRef.current;
+    if (themeColor && prevTurn === themeColor && state.turn !== themeColor) {
+      if (tickCheckedPlayerTurn() <= 0) checkedThemeColorRef.current = null;
+    }
+    lastTurnForCheckThemeRef.current = state.turn;
+
+    if (state.phase !== 'playing') {
+      stopCheckedTrack();
+      checkedThemeColorRef.current = null;
+    }
 
     if (head && head !== lastHistorySfxRef.current) {
       lastHistorySfxRef.current = head;
@@ -770,6 +790,8 @@ export default function App() {
         setStatus('Best Buddy ready — click an allied non-king on an L square, then Confirm');
       } else if (specials.has('death_stare')) {
         setStatus('Death Stare ready — click an enemy in range, then Confirm');
+      } else if (specials.has('archer_shot')) {
+        setStatus('Archer volley ready — click an enemy on an L, then Confirm');
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1264,9 +1286,13 @@ export default function App() {
                 ? 'Best Buddy'
                 : move.special === 'death_stare'
                   ? 'Death Stare'
-                  : move.special === 'castle_swap'
+                  : move.special === 'archer_shot'
+                    ? 'Archer volley'
+                    : move.special === 'castle_swap'
                     ? 'Castle'
-                    : move.capture
+                    : move.special === 'portal_travel'
+                      ? 'Portal'
+                      : move.capture
                       ? 'Capture'
                       : 'Move';
         const meta = move.special
@@ -2145,7 +2171,9 @@ export default function App() {
                             </i>
                           )}
                           {vampRadius > 0 && <VampireBloodAura radius={vampRadius} />}
-                          {piece.defId === 'reaper' && (piece.charges ?? 0) > 0 ? (
+                          {piece.defId === 'vampire' ? (
+                            <VampireBloodChargeFx tokens={piece.charges ?? 0} />
+                          ) : piece.defId === 'reaper' && (piece.charges ?? 0) > 0 ? (
                             <ReaperChargeFx charges={piece.charges ?? 0} />
                           ) : piece.charges != null && piece.charges > 0 ? (
                             <i className="charge">{piece.charges}</i>
@@ -2646,6 +2674,39 @@ function VampireBloodAura({ radius }: { radius: number }) {
   );
 }
 
+function VampireBloodChargeFx({ tokens }: { tokens: number }) {
+  const n = Math.max(0, tokens);
+  const fillId = `${useId().replace(/:/g, '')}vampDrop`;
+  return (
+    <span
+      className={`vampire-charge-fx${n <= 0 ? ' is-empty' : ''}${n >= 10 ? ' is-wide' : ''}`}
+      title={`${n} Blood Token${n === 1 ? '' : 's'}`}
+    >
+      <svg className="vampire-drop" viewBox="0 0 16 18" aria-hidden>
+        <defs>
+          <linearGradient id={fillId} x1="8" y1="1" x2="8" y2="17" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stopColor="#ff4d5a" />
+            <stop offset="55%" stopColor="#c01022" />
+            <stop offset="100%" stopColor="#6a0410" />
+          </linearGradient>
+        </defs>
+        <path
+          fill={`url(#${fillId})`}
+          stroke="#4a0008"
+          strokeWidth="0.7"
+          d="M8 1.1C8 1.1 2.2 8.2 2.2 12.1c0 3.1 2.5 5.2 5.8 5.2s5.8-2.1 5.8-5.2C13.8 8.2 8 1.1 8 1.1z"
+        />
+        <path
+          fill="#ffb3b8"
+          opacity="0.45"
+          d="M5.4 9.2c.4-1.4 1.3-2.8 2.2-4.2-.2 1.6-.2 3.2.3 4.6.4 1.1 0 2.2-.9 2.4-.9.2-1.7-.8-1.6-2.8z"
+        />
+      </svg>
+      <b className="vampire-charge-n">{n}</b>
+    </span>
+  );
+}
+
 function ReaperChargeFx({ charges }: { charges: number }) {
   const shown = Math.max(0, Math.min(5, charges));
   if (shown <= 0) return null;
@@ -2800,27 +2861,31 @@ function PieceInfoBody({
         </ul>
       </section>
 
-      {info.abilities.length > 0 && (
-        <section>
-          <h3>Abilities</h3>
+      <section>
+        <h3>Abilities</h3>
+        {info.abilities.length > 0 ? (
           <ul>
             {info.abilities.map((line) => (
               <li key={line}>{formatNamedLine(line)}</li>
             ))}
           </ul>
-        </section>
-      )}
+        ) : (
+          <p>None.</p>
+        )}
+      </section>
 
-      {info.misc && info.misc.length > 0 && (
-        <section>
-          <h3>Notes</h3>
+      <section>
+        <h3>Notes</h3>
+        {info.notes && info.notes.length > 0 ? (
           <ul>
-            {info.misc.map((line) => (
+            {info.notes.map((line) => (
               <li key={line}>{line}</li>
             ))}
           </ul>
-        </section>
-      )}
+        ) : (
+          <p>None.</p>
+        )}
+      </section>
 
       {live && (
         <div className="piece-info-live">
@@ -2828,9 +2893,7 @@ function PieceInfoBody({
           {defId === 'vampire' && (
             <span>
               Blood Tokens: {live.charges ?? 0}
-              {vampireNightRadius(live.charges ?? 0) > 0
-                ? ` · Night ${vampireNightRadius(live.charges ?? 0)}×${vampireNightRadius(live.charges ?? 0)}`
-                : ' · Night: 1 orthogonal'}
+              {` · Night ${vampireNightRadius(live.charges ?? 0)}×${vampireNightRadius(live.charges ?? 0)}`}
             </span>
           )}
           {defId === 'gambler' && (
@@ -3370,6 +3433,7 @@ function GamblerPrompt({
   prompt,
   you,
   state,
+  catalog,
   onResolve,
 }: {
   prompt: NonNullable<GameState['pendingPrompt']>;
@@ -3380,6 +3444,20 @@ function GamblerPrompt({
 }) {
   const roll = prompt.roll ?? 0;
   const cardPlayer = prompt.color ?? you;
+  const classes = ['pawn', 'rook', 'knight', 'bishop', 'wildcard', 'queen'];
+
+  const graveButtons = (color: Color) =>
+    state.players[color].graveyard.map((g, idx) => (
+      <button
+        key={`${g.defId}-${idx}`}
+        type="button"
+        onClick={() => onResolve({ class: g.class, idx, defId: g.defId })}
+      >
+        <PieceIcon defId={g.defId} color={color} className="sm" />{' '}
+        {pieceMeta(catalog, g.defId)?.name ?? g.defId}
+      </button>
+    ));
+
   if (roll <= 4 && you !== cardPlayer) {
     const filter =
       prompt.cardDefId === 'gamblers_gambit'
@@ -3404,9 +3482,31 @@ function GamblerPrompt({
       </div>
     );
   }
+
+  if (prompt.cardDefId === 'gamblers_gambit' && roll === 10) {
+    if (you !== opposite(cardPlayer)) {
+      return <div className="banner">{prompt.message}</div>;
+    }
+    const buttons = graveButtons(you);
+    return (
+      <div className="banner">
+        {prompt.message}
+        <span className="prompt-actions">
+          {buttons.length ? (
+            buttons
+          ) : (
+            <button type="button" className="primary" onClick={() => onResolve(null)}>
+              No fallen pieces — skip
+            </button>
+          )}
+        </span>
+      </div>
+    );
+  }
+
   if (prompt.color !== you) return <div className="banner">{prompt.message}</div>;
+
   if (roll >= 7 && roll <= 9) {
-    const classes = ['pawn', 'rook', 'knight', 'bishop', 'wildcard', 'queen'];
     return (
       <div className="banner">
         {prompt.message}
@@ -3420,6 +3520,48 @@ function GamblerPrompt({
       </div>
     );
   }
+
+  if (prompt.cardDefId === 'gamblers_delight' && roll >= 10 && roll <= 11) {
+    const gy = graveButtons(you);
+    return (
+      <div className="banner">
+        {prompt.message}
+        <span className="prompt-actions">
+          {gy}
+          {classes.map((c) => (
+            <button key={c} type="button" onClick={() => onResolve(c)}>
+              {c}
+            </button>
+          ))}
+          {gy.length === 0 &&
+            state.players[opposite(you)].graveyard.length === 0 && (
+              <button type="button" className="primary" onClick={() => onResolve(null)}>
+                Nothing to revive — skip
+              </button>
+            )}
+        </span>
+      </div>
+    );
+  }
+
+  if (prompt.cardDefId === 'gamblers_gambit' && roll === 11) {
+    const buttons = graveButtons(you);
+    return (
+      <div className="banner">
+        {prompt.message}
+        <span className="prompt-actions">
+          {buttons.length ? (
+            buttons
+          ) : (
+            <button type="button" className="primary" onClick={() => onResolve(null)}>
+              No fallen pieces — skip
+            </button>
+          )}
+        </span>
+      </div>
+    );
+  }
+
   if (roll <= 6 || roll >= 10) {
     return (
       <div className="banner">

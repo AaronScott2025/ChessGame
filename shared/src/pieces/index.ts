@@ -1,4 +1,4 @@
-import type { GameState, PieceClass, PieceState } from '../types.js';
+import type { Coord, GameState, PieceClass, PieceState } from '../types.js';
 import {
   clearOrthogonalLOS,
   hasEffect,
@@ -7,6 +7,7 @@ import {
   movementBonus,
   pieceAt,
   sameCoord,
+  chebyshev,
   vampireNightRadius,
 } from '../utils.js';
 import {
@@ -36,6 +37,132 @@ const DIAG: { row: number; col: number }[] = [
 ];
 const ALL8 = [...ORTH, ...DIAG];
 
+function coordKey(c: Coord): string {
+  return `${c.row},${c.col}`;
+}
+
+function wormPathClear(
+  state: GameState,
+  from: Coord,
+  dir: Coord,
+  hop: number,
+): Coord | null {
+  for (let i = 1; i < hop; i++) {
+    const mid = { row: from.row + dir.row * i, col: from.col + dir.col * i };
+    if (!inBounds(mid)) return null;
+    if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, mid))) return null;
+    if (pieceAt(state, mid)) return null;
+  }
+  const dest = { row: from.row + dir.row * hop, col: from.col + dir.col * hop };
+  if (!inBounds(dest)) return null;
+  if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, dest))) return null;
+  return dest;
+}
+
+function wormAlliesOrtho(state: GameState, pos: Coord, piece: PieceState): PieceState[] {
+  const allies: PieceState[] = [];
+  for (const d of ORTH) {
+    const n = { row: pos.row + d.row, col: pos.col + d.col };
+    if (!inBounds(n)) continue;
+    const occ = pieceAt(state, n);
+    if (occ && occ.color === piece.color && occ.id !== piece.id) allies.push(occ);
+  }
+  return allies;
+}
+
+/** Squares within `radius` of an ally (clear king-step path from that ally). */
+function wormBurrowFromAlly(
+  state: GameState,
+  ally: PieceState,
+  piece: PieceState,
+  radius: number,
+): NonNullable<ReturnType<typeof emptyOrEnemy>>[] {
+  const out: NonNullable<ReturnType<typeof emptyOrEnemy>>[] = [];
+  for (let dr = -radius; dr <= radius; dr++) {
+    for (let dc = -radius; dc <= radius; dc++) {
+      if (dr === 0 && dc === 0) continue;
+      if (chebyshev({ row: 0, col: 0 }, { row: dr, col: dc }) > radius) continue;
+      const dest = { row: ally.pos.row + dr, col: ally.pos.col + dc };
+      if (sameCoord(dest, piece.pos)) continue;
+      if (chebyshevPathBlocked(ally.pos, dest, state)) continue;
+      const opt = emptyOrEnemy(state, dest, piece.color, piece);
+      if (opt) out.push(opt);
+    }
+  }
+  return out;
+}
+
+function wormAlliesBeside(state: GameState, pos: Coord, piece: PieceState): PieceState[] {
+  const allies: PieceState[] = [];
+  for (const d of ALL8) {
+    const n = { row: pos.row + d.row, col: pos.col + d.col };
+    if (!inBounds(n)) continue;
+    const occ = pieceAt(state, n);
+    if (occ && occ.color === piece.color && occ.id !== piece.id) allies.push(occ);
+  }
+  return allies;
+}
+
+function wormAllyIsAhead(piece: PieceState, landing: Coord, ally: PieceState): boolean {
+  return piece.color === 'white' ? ally.pos.row < landing.row : ally.pos.row > landing.row;
+}
+
+/**
+ * 2 orthogonal, then Burrow: up to 2 from the first ally, then 1 from each
+ * further ally that sits ahead of a square you can already reach.
+ */
+function wormMoves(piece: PieceState, state: GameState): ReturnType<typeof emptyOrEnemy>[] {
+  const hop = 2 + movementBonus(piece);
+  const firstRadius = 2 + movementBonus(piece);
+  const chainRadius = 1 + movementBonus(piece);
+  const moves: NonNullable<ReturnType<typeof emptyOrEnemy>>[] = [];
+  const seenLand = new Set<string>();
+  const usedAllies = new Set<string>();
+  const allyQ: Array<{ ally: PieceState; radius: number }> = [];
+
+  const addMove = (opt: NonNullable<ReturnType<typeof emptyOrEnemy>>) => {
+    const k = coordKey(opt.to);
+    if (seenLand.has(k)) return false;
+    seenLand.add(k);
+    moves.push(opt);
+    return true;
+  };
+
+  const enqueueAlly = (ally: PieceState, radius: number) => {
+    if (usedAllies.has(ally.id)) return;
+    usedAllies.add(ally.id);
+    allyQ.push({ ally, radius });
+  };
+
+  const chainFromLanding = (landing: Coord, radius: number) => {
+    for (const ally of wormAlliesBeside(state, landing, piece)) {
+      if (wormAllyIsAhead(piece, landing, ally)) enqueueAlly(ally, radius);
+    }
+  };
+
+  for (const ally of wormAlliesOrtho(state, piece.pos, piece)) enqueueAlly(ally, firstRadius);
+
+  for (const d of ORTH) {
+    const dest = wormPathClear(state, piece.pos, d, hop);
+    if (!dest) continue;
+    const opt = emptyOrEnemy(state, dest, piece.color, piece);
+    if (!opt) continue;
+    addMove(opt);
+    if (!opt.capture) chainFromLanding(dest, firstRadius);
+  }
+
+  while (allyQ.length) {
+    const { ally, radius } = allyQ.shift()!;
+    const nextRadius = chainRadius;
+    for (const opt of wormBurrowFromAlly(state, ally, piece, radius)) {
+      addMove(opt);
+      if (!opt.capture) chainFromLanding(opt.to, nextRadius);
+    }
+  }
+
+  return moves;
+}
+
 function dayOnly(_p: PieceState, state: GameState) {
   return state.dayNight === 'day';
 }
@@ -57,7 +184,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'nwaP',
     class: 'pawn',
     symbol: '♙',
-    promoteOptions: ['horse', 'snake', 'pig', 'bishop', 'scamman', 'wizard', 'rook', 'stoneman', 'gnome', 'demon', 'mimic'],
+    promoteOptions: ['horse', 'snake', 'pig', 'archer', 'bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'demon', 'mimic'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, true)),
   },
   rogue: {
@@ -65,16 +192,16 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Rogue',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['bishop', 'scamman', 'wizard', 'rook', 'stoneman', 'gnome'],
+    promoteOptions: ['bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome'],
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
       // Move 1 square up (non-capture)
-      const up = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col }, p.color);
+      const up = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col }, p.color, p);
       if (up && !up.capture) moves.push(up);
       // Move 1 square diagonally down (left or right, non-capture)
       for (const dc of [-1, 1]) {
-        const down = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col + dc }, p.color);
+        const down = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col + dc }, p.color, p);
         if (down && !down.capture) moves.push(down);
       }
       // First move: up to 2 tiles forward (non-capture), path must be clear
@@ -87,12 +214,12 @@ export const PIECES: Record<string, PieceDefinition> = {
       }
       // Captures: diagonally up, diagonally down, or vertically down
       for (const dc of [-1, 1]) {
-        const capUp = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col + dc }, p.color);
+        const capUp = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col + dc }, p.color, p);
         if (capUp?.capture) moves.push(capUp);
-        const capDownDiag = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col + dc }, p.color);
+        const capDownDiag = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col + dc }, p.color, p);
         if (capDownDiag?.capture) moves.push(capDownDiag);
       }
-      const capDown = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col }, p.color);
+      const capDown = emptyOrEnemy(s, { row: p.pos.row - dir, col: p.pos.col }, p.color, p);
       if (capDown?.capture) moves.push(capDown);
       return filterLegal(p, s, moves);
     },
@@ -106,10 +233,10 @@ export const PIECES: Record<string, PieceDefinition> = {
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
-      const fwd = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col }, p.color);
+      const fwd = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col }, p.color, p);
       if (fwd && !fwd.capture) moves.push(fwd);
       for (const dc of [-1, 1]) {
-        const side = emptyOrEnemy(s, { row: p.pos.row, col: p.pos.col + dc }, p.color);
+        const side = emptyOrEnemy(s, { row: p.pos.row, col: p.pos.col + dc }, p.color, p);
         if (side?.capture) moves.push(side);
       }
       for (const d of ALL8) {
@@ -118,7 +245,7 @@ export const PIECES: Record<string, PieceDefinition> = {
         if (!inBounds(mid) || !inBounds(to)) continue;
         const ally = pieceAt(s, mid);
         if (!ally || ally.color !== p.color || ally.id === p.id) continue;
-        const land = emptyOrEnemy(s, to, p.color);
+        const land = emptyOrEnemy(s, to, p.color, p);
         if (land) moves.push(land);
       }
       return filterLegal(p, s, moves);
@@ -151,7 +278,7 @@ export const PIECES: Record<string, PieceDefinition> = {
         }
       }
       for (const dc of [-1, 1]) {
-        const cap = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col + dc }, p.color);
+        const cap = emptyOrEnemy(s, { row: p.pos.row + dir, col: p.pos.col + dc }, p.color, p);
         if (cap?.capture) moves.push(cap);
       }
       return filterLegal(p, s, moves);
@@ -284,6 +411,19 @@ export const PIECES: Record<string, PieceDefinition> = {
       return filterLegal(p, s, moves);
     },
   },
+  archer: {
+    id: 'archer',
+    name: 'Archer',
+    class: 'knight',
+    symbol: '♞',
+    getMoves: (p, s) => {
+      const step = areaMoves(p, s, 1).filter((m) => !m.capture);
+      const shots = knightMoves(p, s, 2, 1, true)
+        .filter((m) => m.capture)
+        .map((m) => ({ ...m, special: 'archer_shot' }));
+      return filterLegal(p, s, [...step, ...shots]);
+    },
+  },
   bishop: {
     id: 'bishop',
     name: 'Bishop',
@@ -314,6 +454,13 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'bishop',
     symbol: '♝',
     getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, DIAG, 2)),
+  },
+  worm: {
+    id: 'worm',
+    name: 'Worm',
+    class: 'bishop',
+    symbol: '♝',
+    getMoves: (p, s) => filterLegal(p, s, wormMoves(p, s)),
   },
   queen: {
     id: 'queen',
@@ -403,9 +550,7 @@ export const PIECES: Record<string, PieceDefinition> = {
       if (s.dayNight !== 'night') {
         return filterLegal(p, s, rayMoves(p, s, ORTH, 1));
       }
-      const radius = vampireNightRadius(p.charges ?? 0);
-      if (radius <= 0) return filterLegal(p, s, rayMoves(p, s, ORTH, 1));
-      return filterLegal(p, s, areaMoves(p, s, radius));
+      return filterLegal(p, s, areaMoves(p, s, vampireNightRadius(p.charges ?? 0)));
     },
   },
   prince_princess: {
@@ -501,8 +646,8 @@ export const PIECES: Record<string, PieceDefinition> = {
 export const VARIANTS_BY_CLASS: Record<string, string[]> = {
   pawn: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'],
   rook: ['rook', 'stoneman', 'gnome'],
-  knight: ['horse', 'snake', 'pig'],
-  bishop: ['bishop', 'scamman', 'wizard'],
+  knight: ['horse', 'snake', 'pig', 'archer'],
+  bishop: ['bishop', 'scamman', 'wizard', 'worm'],
   wildcard: ['prince_princess', 'demon', 'mimic', 'gambler'],
   queen: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'],
   king: ['king'],

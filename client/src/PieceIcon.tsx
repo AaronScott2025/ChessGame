@@ -14,9 +14,11 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   horse: { folder: 'Knights', file: 'Horse' },
   snake: { folder: 'Knights', file: 'Snake' },
   pig: { folder: 'Knights', file: 'Pig' },
+  archer: { folder: 'Knights', file: 'Archer' },
   bishop: { folder: 'Bishops', file: 'Bishop' },
   scamman: { folder: 'Bishops', file: 'Scamman' },
   wizard: { folder: 'Bishops', file: 'Wizard' },
+  worm: { folder: 'Bishops', file: 'Worm' },
   queen: { folder: 'Queens', file: 'Queen' },
   angel: { folder: 'Queens', file: 'Angel' },
   ghost: { folder: 'Queens', file: 'Ghost' },
@@ -51,7 +53,7 @@ export function PieceIcon({
   const src = pieceArtSrc(id, color);
   return (
     <span
-      className={`piece-icon piece-icon-art ${color} ${className}`.trim()}
+      className={`piece-icon piece-icon-art piece-art-${id} ${color} ${className}`.trim()}
       role={title ? 'img' : undefined}
       aria-label={title ?? id}
       title={title}

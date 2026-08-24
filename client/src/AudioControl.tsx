@@ -10,6 +10,7 @@
  * - sfxUi      → buttons outside the board
  * - sfxPiece   → board square / piece interactions
  * - sfxCardCast→ successfully casting a spell card
+ * - sfxChecked → loops while you were recently put in check (next 3 of your turns)
  * Draw / discard / day-night SFX are procedural (Web Audio) and need no files.
  */
 
@@ -22,6 +23,7 @@ export const AUDIO_FILES = {
   sfxUi: '/audio/sfx-ui.mp3',
   sfxPiece: '/audio/sfx-piece.mp3',
   sfxCardCast: '/audio/sfx-card-cast.mp3',
+  sfxChecked: '/audio/checked.mp3',
 } as const;
 
 export type MusicScene = 'menu' | 'game' | 'none';
@@ -92,6 +94,8 @@ type AudioEngine = {
   unlocked: boolean;
   menu: HTMLAudioElement | null;
   game: HTMLAudioElement | null;
+  checked: HTMLAudioElement | null;
+  checkedTurnsLeft: number;
 };
 
 const engine: AudioEngine = {
@@ -102,12 +106,71 @@ const engine: AudioEngine = {
   unlocked: false,
   menu: null,
   game: null,
+  checked: null,
+  checkedTurnsLeft: 0,
 };
 
+const CHECKED_VOLUME_SCALE = 1;
+
+function ensureCheckedTrack() {
+  if (!engine.checked) {
+    engine.checked = new Audio(AUDIO_FILES.sfxChecked);
+    engine.checked.loop = true;
+    engine.checked.preload = 'auto';
+  }
+}
+
+function checkedThemeWanted() {
+  return (
+    engine.checkedTurnsLeft > 0 &&
+    engine.musicEnabled &&
+    engine.unlocked &&
+    engine.musicVolume > 0 &&
+    engine.scene === 'game'
+  );
+}
+
 function applyMusicVolume() {
-  const vol = engine.musicEnabled ? engine.musicVolume : 0;
+  const vol = engine.musicVolume;
   if (engine.menu) engine.menu.volume = vol;
   if (engine.game) engine.game.volume = vol;
+  if (engine.checked) engine.checked.volume = vol * CHECKED_VOLUME_SCALE;
+}
+
+function syncCheckedTrack() {
+  ensureCheckedTrack();
+  applyMusicVolume();
+  const a = engine.checked;
+  if (!a) return;
+  if (!checkedThemeWanted()) {
+    a.pause();
+    return;
+  }
+  if (a.paused) safePlay(a);
+}
+
+/** Start or refresh the check theme: 3 of your turns. Does not restart if already playing. */
+export function beginCheckedTrack() {
+  engine.checkedTurnsLeft = 3;
+  unlockAudio();
+  syncMusic();
+}
+
+/** Call after the checked player finishes a turn. Returns remaining turns. */
+export function tickCheckedPlayerTurn(): number {
+  if (engine.checkedTurnsLeft <= 0) return 0;
+  engine.checkedTurnsLeft -= 1;
+  if (engine.checkedTurnsLeft <= 0) stopCheckedTrack();
+  return engine.checkedTurnsLeft;
+}
+
+export function stopCheckedTrack() {
+  engine.checkedTurnsLeft = 0;
+  if (engine.checked) {
+    engine.checked.pause();
+    engine.checked.currentTime = 0;
+  }
+  if (engine.scene === 'game') syncMusic();
 }
 
 function ensureTracks() {
@@ -145,13 +208,22 @@ function syncMusic() {
   if (!engine.musicEnabled || !engine.unlocked || engine.scene === 'none' || engine.musicVolume <= 0) {
     pauseTrack(engine.menu);
     pauseTrack(engine.game);
+    syncCheckedTrack();
+    return;
+  }
+  if (checkedThemeWanted()) {
+    pauseTrack(engine.menu);
+    pauseTrack(engine.game);
+    syncCheckedTrack();
     return;
   }
   if (engine.scene === 'menu') {
     pauseTrack(engine.game);
+    pauseTrack(engine.checked);
     safePlay(engine.menu);
   } else if (engine.scene === 'game') {
     pauseTrack(engine.menu);
+    pauseTrack(engine.checked);
     safePlay(engine.game);
   }
 }
@@ -165,6 +237,7 @@ export function unlockAudio() {
 function setMusicEnabled(enabled: boolean) {
   engine.musicEnabled = enabled;
   writeFlag(MUSIC_KEY, enabled);
+  if (enabled) engine.unlocked = true;
   syncMusic();
 }
 
@@ -183,12 +256,14 @@ function setMusicVolume(volume: number) {
   } else {
     pauseTrack(engine.menu);
     pauseTrack(engine.game);
+    syncCheckedTrack();
   }
 }
 
 export function setMusicScene(scene: MusicScene) {
   engine.scene = scene;
   syncMusic();
+  if (scene !== 'game') stopCheckedTrack();
 }
 
 export function playSfx(id: SfxId) {
@@ -468,7 +543,7 @@ export function playPieceLostSfx() {
   playTone(ctx, master, { type: 'triangle', freq: 240, endFreq: 90, start: t + 0.03, dur: 0.18, peak: 0.08 });
 }
 
-/** Sharp warning sting when your king is put in check. */
+/** One-shot retro sword slash when your king is put in check. */
 export function playCheckSfx() {
   if (!engine.sfxEnabled) return;
   unlockAudio();
@@ -479,28 +554,35 @@ export function playCheckSfx() {
   master.gain.value = 1;
   master.connect(ctx.destination);
 
-  // Two urgent rising hits, then a low held dissonance
-  playTone(ctx, master, { type: 'sawtooth', freq: 220, endFreq: 440, start: t, dur: 0.14, peak: 0.16 });
-  playTone(ctx, master, { type: 'square', freq: 330, endFreq: 520, start: t + 0.12, dur: 0.16, peak: 0.14 });
-  playTone(ctx, master, { type: 'triangle', freq: 185, endFreq: 110, start: t + 0.28, dur: 0.45, peak: 0.2 });
-  playTone(ctx, master, { type: 'sine', freq: 277, endFreq: 196, start: t + 0.3, dur: 0.4, peak: 0.1 });
-
+  // Blade whoosh — filtered noise sweeping down like an 8-bit slash
   const noise = ctx.createBufferSource();
-  noise.buffer = noiseBuffer(ctx, 0.35);
-  const filter = ctx.createBiquadFilter();
-  filter.type = 'bandpass';
-  filter.frequency.setValueAtTime(1200, t);
-  filter.frequency.exponentialRampToValueAtTime(400, t + 0.3);
-  filter.Q.value = 2.5;
+  noise.buffer = noiseBuffer(ctx, 0.22);
+  const hipass = ctx.createBiquadFilter();
+  hipass.type = 'highpass';
+  hipass.frequency.setValueAtTime(2800, t);
+  hipass.frequency.exponentialRampToValueAtTime(420, t + 0.16);
+  hipass.Q.value = 0.7;
+  const band = ctx.createBiquadFilter();
+  band.type = 'bandpass';
+  band.frequency.setValueAtTime(4200, t);
+  band.frequency.exponentialRampToValueAtTime(700, t + 0.18);
+  band.Q.value = 1.4;
   const nGain = ctx.createGain();
   nGain.gain.setValueAtTime(0.0001, t);
-  nGain.gain.linearRampToValueAtTime(0.08, t + 0.04);
-  nGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
-  noise.connect(filter);
-  filter.connect(nGain);
+  nGain.gain.linearRampToValueAtTime(0.38, t + 0.012);
+  nGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+  noise.connect(hipass);
+  hipass.connect(band);
+  band.connect(nGain);
   nGain.connect(master);
   noise.start(t);
-  noise.stop(t + 0.35);
+  noise.stop(t + 0.22);
+
+  // NES-style square dive (the "hit")
+  playTone(ctx, master, { type: 'square', freq: 1480, endFreq: 220, start: t, dur: 0.14, peak: 0.2 });
+  playTone(ctx, master, { type: 'square', freq: 980, endFreq: 140, start: t + 0.02, dur: 0.12, peak: 0.12 });
+  // Tiny metallic ping
+  playTone(ctx, master, { type: 'square', freq: 2480, endFreq: 1760, start: t + 0.04, dur: 0.06, peak: 0.09 });
 }
 
 /** Cool descending wash as day becomes night. */
@@ -744,17 +826,23 @@ export function useAudioSettings() {
   const [sfxEnabled, setSfx] = usePersistedFlag(SFX_KEY, true);
   const [musicVolume, setMusicVol] = useState(() => readVolume(MUSIC_VOL_KEY, DEFAULT_MUSIC_VOLUME));
 
-  useEffect(() => {
-    setMusicEnabled(musicEnabled);
-  }, [musicEnabled]);
+  const setMusicEnabledState = ((value: SetStateAction<boolean>) => {
+    const next = typeof value === 'function' ? value(musicEnabled) : value;
+    setMusic(next);
+    setMusicEnabled(next);
+  }) as Dispatch<SetStateAction<boolean>>;
 
-  useEffect(() => {
-    setSfxEnabled(sfxEnabled);
-  }, [sfxEnabled]);
+  const setSfxEnabledState = ((value: SetStateAction<boolean>) => {
+    const next = typeof value === 'function' ? value(sfxEnabled) : value;
+    setSfx(next);
+    setSfxEnabled(next);
+  }) as Dispatch<SetStateAction<boolean>>;
 
-  useEffect(() => {
-    setMusicVolume(musicVolume);
-  }, [musicVolume]);
+  const setMusicVolumeState = ((value: SetStateAction<number>) => {
+    const next = typeof value === 'function' ? value(musicVolume) : value;
+    setMusicVol(next);
+    setMusicVolume(next);
+  }) as Dispatch<SetStateAction<number>>;
 
   useEffect(() => {
     const unlock = () => unlockAudio();
@@ -770,9 +858,9 @@ export function useAudioSettings() {
     musicEnabled,
     sfxEnabled,
     musicVolume,
-    setMusicEnabled: setMusic as Dispatch<SetStateAction<boolean>>,
-    setSfxEnabled: setSfx as Dispatch<SetStateAction<boolean>>,
-    setMusicVolume: setMusicVol as Dispatch<SetStateAction<number>>,
+    setMusicEnabled: setMusicEnabledState,
+    setSfxEnabled: setSfxEnabledState,
+    setMusicVolume: setMusicVolumeState,
   };
 }
 

@@ -4,7 +4,7 @@ export interface PieceInfo {
   classLabel: string;
   movement: string[];
   abilities: string[];
-  misc?: string[];
+  notes?: string[];
 }
 
 export const PIECE_INFO: Record<string, PieceInfo> = {
@@ -14,7 +14,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Pawn',
     movement: ['Moves 1 square forward.', 'First move may go up to 2 squares forward.'],
     abilities: ['Promote into a Queen or Queen variant at the far edge.'],
-    misc: ['Captures diagonally forward only.'],
+    notes: ['Captures diagonally forward only.'],
   },
   nwap: {
     id: 'nwap',
@@ -22,7 +22,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Pawn',
     movement: ['Moves 1 square diagonally forward.', 'First move may go up to 2 squares diagonally forward.'],
     abilities: ['Promote into Horse, Bishop, Wildcard, or Rook variants at the far edge.'],
-    misc: ['Captures straight forward only (not diagonally).'],
+    notes: ['Captures straight forward only (not diagonally).'],
   },
   rogue: {
     id: 'rogue',
@@ -33,7 +33,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'First move may go up to 2 squares forward.',
     ],
     abilities: ['Promote into Bishop or Rook variants at the far edge.'],
-    misc: ['Captures diagonally forward, diagonally backward, or straight backward.'],
+    notes: ['Captures diagonally forward, diagonally backward, or straight backward.'],
   },
   leapfrog: {
     id: 'leapfrog',
@@ -44,7 +44,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Leap: jump over one adjacent allied piece in any direction, landing on the square beyond if it is a legal destination.',
       'Promote into a Queen or Queen variant at the far edge.',
     ],
-    misc: [
+    notes: [
       'Captures one square horizontally.',
       'May also capture on the square landed on after a Leap.',
     ],
@@ -60,7 +60,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     abilities: [
       'Web: if captured, the capturing piece is webbed for 1 turn (cannot move).',
     ],
-    misc: ['Captures diagonally forward only.', 'Does not promote at the far edge.'],
+    notes: ['Captures diagonally forward only.', 'Reaching the far edge takes the Spider (it does not promote).'],
   },
   enchanted_pawn: {
     id: 'enchanted_pawn',
@@ -75,7 +75,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Barrier Phase: may occupy and pass through barrier tiles (click the highlighted square to walk onto it).',
       'Barrier Shift: press the Barrier Shift button, then choose a barrier and an empty allied square (uses your turn).',
     ],
-    misc: ['Captures diagonally only.', 'Barriers cannot sit adjacent to each other.'],
+    notes: ['Captures diagonally only.', 'Barriers cannot sit adjacent to each other.'],
   },
   rook: {
     id: 'rook',
@@ -92,7 +92,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     abilities: [
       'Ancient Shuffle: while in allied territory, swap with an allied piece that has clear orthogonal line of sight (also in allied territory).',
     ],
-    misc: ['Allied territory is the first 5 rows from your side.'],
+    notes: ['Allied territory is the first 5 rows from your side.'],
   },
   gnome: {
     id: 'gnome',
@@ -133,7 +133,17 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Best Buddy: may share a tile with an allied non-king piece that sits on a normal L (2–1) landing (same path rules as movement — not a teleport).',
       'If that shared tile is captured, both pieces fall and the Pig’s owner gains 3 bonus turns.',
     ],
-    misc: ['Can only act during the day.'],
+    notes: ['Can only act during the day.'],
+  },
+  archer: {
+    id: 'archer',
+    name: 'Archer',
+    classLabel: 'Knight',
+    movement: ['Moves 1 tile in any direction (a 1×1 area). Cannot capture by stepping onto a piece.'],
+    abilities: [
+      'Volley: capture an enemy on any knight L (2×1) without moving. The shot jumps over pieces.',
+      'Steady Aim: if capturing a piece would apply a status effect to the Archer, ignore it.',
+    ],
   },
   bishop: {
     id: 'bishop',
@@ -162,6 +172,15 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Magic Be-gone (2× per game): if both of your Wizards are alive, silence the opponent’s spells and magical abilities until the next day/night change (up to 5 turns). Uses your turn. Ends early if either of your Wizards dies.',
     ],
   },
+  worm: {
+    id: 'worm',
+    name: 'Worm',
+    classLabel: 'Bishop',
+    movement: ['Moves exactly 2 squares orthogonally. The in-between square must be empty.'],
+    abilities: [
+      'Burrow: if an ally is beside the Worm or beside its 2-step landing, may go to any square up to 2 tiles from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
+    ],
+  },
   queen: {
     id: 'queen',
     name: 'Queen',
@@ -182,7 +201,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Revive: start a ritual lasting (10 − empty adjacent tiles) turns to revive a piece from your graveyard beside the Angel.',
       'Max 3 revives — then the Angel dies.',
     ],
-    misc: ['Cannot revive itself or other Angels.', 'You can revive then move later, but not move then revive the same turn.'],
+    notes: ['Cannot revive itself or other Angels.', 'You can revive then move later, but not move then revive the same turn.'],
   },
   ghost: {
     id: 'ghost',
@@ -190,7 +209,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Queen',
     movement: ['Moves to any tile in a 2×2 Chebyshev area around itself.'],
     abilities: ['Phase Walk: can move over pieces only during Night.'],
-    misc: ['Cannot move until the first night of the game.'],
+    notes: ['Cannot move until the first night of the game.'],
   },
   reaper: {
     id: 'reaper',
@@ -223,11 +242,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Queen',
     movement: [
       'Day: moves 1 tile orthogonally.',
-      'Night with no Blood Tokens: still 1 tile orthogonally.',
-      '1 Blood Token: at night, moves anywhere in a 1×1 Chebyshev area.',
-      'Every 3rd Blood Token after the first adds 1 tile of night radius, up to a 5×5 area.',
+      'Night: a 1×1 Chebyshev area at 0 Blood Tokens.',
+      'Every 3 Blood Tokens adds 1 tile of night radius (3 → 2×2), up to a 5×5 area.',
     ],
-    abilities: ['Gains 1 Blood Token each time it captures a piece (day or night).'],
+    abilities: ['Blood Token: gains 1 Blood Token each time it captures a piece (day or night).'],
   },
   prince_princess: {
     id: 'prince_princess',
@@ -241,7 +259,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Dance of Romance: moving one mirrors the other (horizontal directions reverse).',
       "True Love's Gambit: if one dies, the other falls too.",
     ],
-    misc: [
+    notes: [
       'If the piece you move has a clear straight-line path, its partner mirrors to the matching square even if other pieces stand in that partner’s way.',
       'The mirrored destination must still be on the board and cannot land on an allied piece.',
     ],
@@ -252,7 +270,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Wildcard',
     movement: ['Moves 1 tile in any direction.'],
     abilities: ['Soul Syphon: capturing an enemy converts it to your side.'],
-    misc: ['Cannot move during the day.'],
+    notes: ['Cannot move during the day.'],
   },
   mimic: {
     id: 'mimic',
@@ -263,18 +281,17 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Timeless Energy: ignores day/night restrictions of the copied piece.',
       'Does not copy special abilities (Best Buddy, Ancient Shuffle, Swap of Fates, Death Stare, castling, etc.).',
     ],
-    misc: ['If the opponent’s last piece was a Mimic, copy what that Mimic copied.'],
+    notes: ['If the opponent’s last piece was a Mimic, copy what that Mimic copied.'],
   },
   gambler: {
     id: 'gambler',
     name: 'Gambler',
     classLabel: 'Wildcard',
-    movement: [
-      'Each day, randomly copies the movement of some piece in the game (not its abilities).',
-      'At night, moves 1 square diagonally only.',
+    movement: ['At night, moves 1 square diagonally only.'],
+    abilities: [
+      'Lucky Draw: each day, randomly copies the movement of some piece in the game (not its abilities).',
     ],
-    abilities: [],
-    misc: [
+    notes: [
       'Both Gamblers cannot share the same movement style at the same time.',
       'Cannot roll the same movement style two days in a row.',
     ],
@@ -284,8 +301,8 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     name: 'King',
     classLabel: 'King',
     movement: ['Moves 1 tile in any direction (more if under speed effects).'],
-    abilities: [],
-    misc: ['Losing the King ends the game.'],
+    abilities: ['Castle: swap with an adjacent Rook.'],
+    notes: ['Losing the King ends the game.'],
   },
 };
 

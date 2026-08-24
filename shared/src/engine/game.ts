@@ -36,7 +36,10 @@ import {
 
 function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
   const chooser =
-    prompt.type === 'gambler_choice' && prompt.roll <= 4 ? opposite(prompt.color) : prompt.color;
+    prompt.type === 'gambler_choice' &&
+    (prompt.roll <= 4 || (prompt.cardDefId === 'gamblers_gambit' && prompt.roll === 10))
+      ? opposite(prompt.color)
+      : prompt.color;
   const yours = chooser === color;
 
   switch (prompt.type) {
@@ -67,6 +70,16 @@ function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
         return yours
           ? `Choose a piece type to immobilize first (${cardName})`
           : `Waiting for opponent to choose a piece type (${cardName})`;
+      }
+      if (prompt.cardDefId === 'gamblers_delight' && prompt.roll >= 10 && prompt.roll <= 11) {
+        return yours
+          ? `Choose a class (or a fallen piece) to revive first (${cardName})`
+          : `Waiting for opponent to choose a revive class (${cardName})`;
+      }
+      if (prompt.cardDefId === 'gamblers_gambit' && (prompt.roll === 10 || prompt.roll === 11)) {
+        return yours
+          ? `Choose a fallen piece to revive first (${cardName})`
+          : `Waiting for a revive choice (${cardName})`;
       }
       return yours
         ? `Confirm the ${cardName} result first`
@@ -387,6 +400,60 @@ export function isInCheck(state: GameState, color: Color): boolean {
   return isSquareAttacked(state, king.pos, opposite(color));
 }
 
+function assertOwnKingSafe(state: GameState, color: Color, action: string): void {
+  if (isInCheck(state, color)) {
+    throw new Error(`${action} is illegal — you are in check and it does not save your king`);
+  }
+}
+
+/** Abilities spend the turn. Illegal if you remain in check (e.g. Wizard Enchant while checked). */
+function concludeAbilityTurn(state: GameState, color: Color): GameState {
+  assertOwnKingSafe(state, color, 'That ability');
+  if (isInCheck(state, opposite(color))) {
+    state.check = opposite(color);
+    return endTurn(state, color, true);
+  }
+  return endTurn(state, color, false);
+}
+
+function portalExitAt(state: GameState, pos: Coord): Coord | null {
+  const entry = state.tokens.find((t) => t.kind === 'portal' && sameCoord(t.pos, pos));
+  if (!entry) return null;
+  const linkId = typeof entry.data?.link === 'string' ? entry.data.link : '';
+  const exit =
+    (linkId ? state.tokens.find((t) => t.id === linkId) : undefined) ??
+    state.tokens.find((t) => t.kind === 'portal' && t.id !== entry.id && t.owner === entry.owner);
+  if (!exit || sameCoord(exit.pos, pos)) return null;
+  return { ...exit.pos };
+}
+
+/** One hop A→B. Does not chain B→A. Returns captured occupant at the exit, if any. */
+function travelPortalOnce(state: GameState, piece: PieceState, color: Color): PieceState | undefined {
+  const dest = portalExitAt(state, piece.pos);
+  if (!dest) return undefined;
+  const occ = pieceAt(state, dest);
+  if (occ) {
+    if (occ.id === piece.id || occ.color === color) return undefined;
+    if (hasEffect(occ, 'invincible') || hasEffect(occ, 'pause')) return undefined;
+    if (hasEffect(occ, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) return undefined;
+  }
+  if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
+  piece.pos = { ...dest };
+  log(state, `${piece.defId} traveled through a portal`);
+  return occ && occ.color !== color ? occ : undefined;
+}
+
+function simulatePortalHop(state: GameState, piece: PieceState): void {
+  const dest = portalExitAt(state, piece.pos);
+  if (!dest) return;
+  const occ = pieceAt(state, dest);
+  if (occ) {
+    if (occ.id === piece.id || occ.color === piece.color) return;
+  }
+  if (occ) state.pieces = state.pieces.filter((p) => p.id !== occ.id);
+  piece.pos = { ...dest };
+}
+
 export function listMoves(state: GameState, pieceId: string): MoveOption[] {
   const piece = state.pieces.find((p) => p.id === pieceId);
   if (!piece) return [];
@@ -401,7 +468,14 @@ export function listMoves(state: GameState, pieceId: string): MoveOption[] {
     if (!pieceAt(state, tp)) moves.push({ to: tp, special: 'blink_return' });
   }
 
-  // Portal travel as extra destinations when standing on portal — handled after move in applyMove
+  // Portal: step onto one, emerge at the other (also allow using a portal you're standing on)
+  const portalExit = portalExitAt(state, piece.pos);
+  if (portalExit) {
+    const occ = pieceAt(state, portalExit);
+    if (!occ || occ.color !== piece.color) {
+      moves.push({ to: { ...portalExit }, capture: Boolean(occ), special: 'portal_travel' });
+    }
+  }
 
   // Never allow Best Buddy outside the Pig’s L range (guards stale / buggy piece lists)
   moves = moves.filter((m) => {
@@ -440,14 +514,28 @@ export function listMoves(state: GameState, pieceId: string): MoveOption[] {
       } else if (m.special === 'best_buddy') {
         tp.pos = { ...m.to };
         tp.coOccupantId = m.meta?.withId as string;
-      } else if (m.special === 'death_stare') {
+      } else if (m.special === 'death_stare' || m.special === 'archer_shot') {
         trial.pieces = trial.pieces.filter((p) => !(sameCoord(p.pos, m.to) && p.color !== tp.color));
+      } else if (m.special === 'portal_travel') {
+        const occ2 = pieceAt(trial, m.to);
+        if (occ2 && occ2.color !== tp.color) {
+          trial.pieces = trial.pieces.filter((p) => p.id !== occ2.id);
+        }
+        if (occ2 && occ2.color === tp.color) return false;
+        endBestBuddy(trial, tp, { ...tp.pos });
+        tp.pos = { ...m.to };
       } else if (m.special === 'ancient_shuffle' || m.special === 'swap_of_fates' || m.special === 'castle_swap') {
         // special without meta — illegal
         return false;
       } else {
-        endBestBuddy(trial, tp, { ...tp.pos });
+        const origin = { ...tp.pos };
+        endBestBuddy(trial, tp, origin);
         tp.pos = { ...m.to };
+        const linkedFromOrigin = portalExitAt(trial, origin);
+        // Walking from one portal onto its pair is already travel; don't hop back.
+        if (!linkedFromOrigin || !sameCoord(linkedFromOrigin, m.to)) {
+          simulatePortalHop(trial, tp);
+        }
       }
       return !isInCheck(trial, piece.color);
     } catch {
@@ -499,18 +587,31 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
     out.push({
       id: 'enchant',
       name: 'Enchant',
-      ready: (piece.abilityCooldown ?? 0) <= 0 && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
-      hint: '+1 movement to an adjacent piece for 2 turns (4-turn cooldown)',
+      ready:
+        (piece.abilityCooldown ?? 0) <= 0 &&
+        (piece.disabledTurns ?? 0) <= 0 &&
+        !isMagicDisabled(state, piece.color) &&
+        !isInCheck(state, piece.color),
+      hint: isInCheck(state, piece.color)
+        ? 'Cannot Enchant while in check — you must save your king first'
+        : '+1 movement to an adjacent piece for 2 turns (4-turn cooldown)',
     });
     const bothWizards = bothOwnWizardsAlive(state, piece.color);
     const used = magicBegoneUses(state, piece.color);
     out.push({
       id: 'magic_begone',
       name: 'Magic Be-gone',
-      ready: used < 2 && bothWizards && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
-      hint: bothWizards
-        ? `2× per game (${2 - used} left): silence the opponent's spells and magical abilities until the next day/night change (up to 5 turns). Both of your Wizards must be alive.`
-        : 'Requires both of your Wizards to be alive.',
+      ready:
+        used < 2 &&
+        bothWizards &&
+        (piece.disabledTurns ?? 0) <= 0 &&
+        !isMagicDisabled(state, piece.color) &&
+        !isInCheck(state, piece.color),
+      hint: isInCheck(state, piece.color)
+        ? 'Cannot use Magic Be-gone while in check — you must save your king first'
+        : bothWizards
+          ? `2× per game (${2 - used} left): silence the opponent's spells and magical abilities until the next day/night change (up to 5 turns). Both of your Wizards must be alive.`
+          : 'Requires both of your Wizards to be alive.',
     });
   }
   if (piece.defId === 'angel') {
@@ -757,11 +858,7 @@ function finishGadgetDeploy(
   piece.gadgetUsed = true;
   state.pendingPrompt = null;
   log(state, `${color} Gnome deployed ${kind}`);
-  if (isInCheck(state, opposite(color))) {
-    state.check = opposite(color);
-    return endTurn(state, color, true);
-  }
-  return endTurn(state, color, false);
+  return concludeAbilityTurn(state, color);
 }
 
 function finishIdentityTheft(state: GameState, color: Color, pieceId: string): GameState {
@@ -781,11 +878,7 @@ function finishIdentityTheft(state: GameState, color: Color, pieceId: string): G
   });
   state.pendingPrompt = null;
   log(state, `Fleece Identity Theft — now moves like ${stolenDef.name}`);
-  if (isInCheck(state, opposite(color))) {
-    state.check = opposite(color);
-    return endTurn(state, color, true);
-  }
-  return endTurn(state, color, false);
+  return concludeAbilityTurn(state, color);
 }
 
 function finishWizardEnchant(state: GameState, color: Color, pieceId: string, targetId: string): GameState {
@@ -802,11 +895,7 @@ function finishWizardEnchant(state: GameState, color: Color, pieceId: string, ta
   wizard.abilityCooldown = 4;
   state.pendingPrompt = null;
   log(state, `Wizard enchanted ${target.defId} (+1 move, 2 turns)`);
-  if (isInCheck(state, opposite(color))) {
-    state.check = opposite(color);
-    return endTurn(state, color, true);
-  }
-  return endTurn(state, color, false);
+  return concludeAbilityTurn(state, color);
 }
 
 function finishMagicBegone(state: GameState, color: Color, pieceId: string): GameState {
@@ -834,11 +923,7 @@ function finishMagicBegone(state: GameState, color: Color, pieceId: string): Gam
     state,
     `${color} Wizard used Magic Be-gone — ${enemy}'s magic is silenced until the next day/night change`,
   );
-  if (isInCheck(state, enemy)) {
-    state.check = enemy;
-    return endTurn(state, color, true);
-  }
-  return endTurn(state, color, false);
+  return concludeAbilityTurn(state, color);
 }
 
 function clearMagicBegone(state: GameState): void {
@@ -864,11 +949,7 @@ function finishAngelReviveStart(state: GameState, color: Color, pieceId: string,
   state.pendingPrompt = null;
   log(state, `Angel began revive ritual for ${defId} (${duration} turns)`);
   // Revive consumes the turn (cannot move then revive; ritual start ends turn)
-  if (isInCheck(state, opposite(color))) {
-    state.check = opposite(color);
-    return endTurn(state, color, true);
-  }
-  return endTurn(state, color, false);
+  return concludeAbilityTurn(state, color);
 }
 
 function completeAngelRevive(state: GameState, angel: PieceState): void {
@@ -937,11 +1018,7 @@ function finishBarrierShift(
   token.pos = { ...to };
   state.pendingPrompt = null;
   log(state, `${color} shifted a barrier`);
-  if (isInCheck(state, opposite(color))) {
-    state.check = opposite(color);
-    return endTurn(state, color, true);
-  }
-  return endTurn(state, color, false);
+  return concludeAbilityTurn(state, color);
 }
 
 function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, to: Coord, color: Color): boolean {
@@ -1091,11 +1168,16 @@ export function applyMove(
     piece.pos = { ...ally.pos };
     piece.coOccupantId = ally.id;
     log(next, `Pig Best Buddy with ${ally.defId}`);
-  } else if (move.special === 'death_stare') {
+  } else if (move.special === 'death_stare' || move.special === 'archer_shot') {
     captured = pieceAt(next, to);
     if (captureBestBuddyPair(next, to, color)) {
       captured = undefined;
     }
+  } else if (move.special === 'portal_travel') {
+    const dest = portalExitAt(next, piece.pos);
+    if (!dest || !sameCoord(dest, to)) throw new Error('Invalid portal travel');
+    captured = travelPortalOnce(next, piece, color);
+    if (!sameCoord(piece.pos, dest)) throw new Error('Portal exit is blocked');
   } else {
     captured = pieceAt(next, to);
     // Capturing a Best Buddy square removes pig + host and grants bonus turns
@@ -1104,6 +1186,18 @@ export function applyMove(
     }
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     piece.pos = { ...to };
+  }
+
+  if (
+    move.special !== 'death_stare' &&
+    move.special !== 'archer_shot' &&
+    move.special !== 'portal_travel'
+  ) {
+    const linkedFromOrigin = portalExitAt(next, from);
+    if (!linkedFromOrigin || !sameCoord(linkedFromOrigin, to)) {
+      const portalVictim = travelPortalOnce(next, piece, color);
+      if (portalVictim) captured = portalVictim;
+    }
   }
 
   if (captured && captured.color !== color) {
@@ -1141,6 +1235,9 @@ export function applyMove(
     } else {
       const victimSnapshot = { ...captured };
       removePiece(next, captured, color);
+      if (victimSnapshot.class === 'king' && isInCheck(next, color)) {
+        throw new Error('Cannot capture the king while remaining in check');
+      }
 
       // Reaper: soul lock / shatterer, then rest after inverse-charge captures
       if (piece.defId === 'reaper') {
@@ -1202,6 +1299,7 @@ export function applyMove(
     }
 
     const def = getPieceDef(piece.defId);
+    const effectsBeforeCapture = piece.defId === 'archer' ? [...(piece.effects ?? [])] : null;
     if (def.onCapture && captured) {
       def.onCapture(piece, captured, next);
     }
@@ -1227,6 +1325,15 @@ export function applyMove(
     if (captured?.defId === 'spider' && next.pieces.some((p) => p.id === piece.id)) {
       addEffect(piece, { id: `web_${piece.id}_${Date.now()}`, kind: 'webbed', turnsRemaining: 2 });
       log(next, `${piece.defId} is caught in a web (Immovable)`);
+    }
+
+    if (effectsBeforeCapture) {
+      const keep = new Set(effectsBeforeCapture.map((e) => e.id));
+      const extra = (piece.effects ?? []).filter((e) => !keep.has(e.id));
+      if (extra.length) {
+        piece.effects = effectsBeforeCapture;
+        log(next, 'Archer Steady Aim — capture status ignored');
+      }
     }
   } else if (piece.defId === 'snake' && piece.bloodlust) {
     piece.bloodlust = false;
@@ -1290,14 +1397,22 @@ export function applyMove(
     move.special !== 'castle_swap' &&
     move.special !== 'ancient_shuffle' &&
     move.special !== 'swap_of_fates' &&
-    move.special !== 'death_stare'
+    move.special !== 'death_stare' &&
+    move.special !== 'archer_shot'
   ) {
     const waiting = resolveGadgetLanding(next, piece, from, piece.pos, color);
     if (waiting) {
       log(next, `${color} triggered a gadget`);
-      return next;
+      retireSpidersAtFarEdge(next);
+      if (next.pendingPrompt && !next.pieces.some((p) => p.id === next.pendingPrompt!.pieceId)) {
+        next.pendingPrompt = null;
+      } else if (next.pieces.some((p) => p.id === piece.id)) {
+        return next;
+      }
     }
   }
+
+  retireSpidersAtFarEdge(next);
 
   // Promotion
   const promoteRow = color === 'white' ? 0 : BOARD_SIZE - 1;
@@ -1315,6 +1430,9 @@ export function applyMove(
 
   // Check ends turn immediately
   const enemy = opposite(color);
+  if (next.phase === 'playing' && isInCheck(next, color)) {
+    throw new Error('Illegal move — your king would remain in check');
+  }
   if (isInCheck(next, enemy)) {
     next.check = enemy;
     log(next, `${enemy} is in check — turn ends immediately`);
@@ -1338,6 +1456,18 @@ function addEchoOption(state: GameState, piece: PieceState, from: Coord, to: Coo
   piece.pos = echoTo;
   removeEffects(piece, 'echo_armed');
   log(state, `Echo repeated move for ${piece.defId}`);
+}
+
+function retireSpidersAtFarEdge(state: GameState): void {
+  const doomed = state.pieces.filter((p) => {
+    if (p.defId !== 'spider') return false;
+    const far = p.color === 'white' ? 0 : BOARD_SIZE - 1;
+    return p.pos.row === far;
+  });
+  for (const p of doomed) {
+    removePiece(state, p, opposite(p.color));
+    log(state, 'Spider reached the edge and is taken');
+  }
 }
 
 function removePiece(state: GameState, piece: PieceState, byColor: Color): void {
@@ -1503,6 +1633,10 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
   outPlayer.lastPlayedCardDefId = def.id;
   log(out, `${color} played ${def.name}`);
 
+  if (!isOppTurn) {
+    assertOwnKingSafe(out, color, 'That spell');
+  }
+
   // One spell per turn: leave spell phase when spent (interrupt cards on your turn still count)
   if (!isOppTurn && outPlayer.spellsThisTurn >= outPlayer.maxSpellsThisTurn) {
     out.turnPhase = 'move';
@@ -1564,7 +1698,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
   if (prompt.type === 'gambler_choice') {
     const cardPlayer = prompt.color;
     const roll = prompt.roll ?? 0;
-    if (roll <= 4) {
+    if (roll <= 4 || (prompt.cardDefId === 'gamblers_gambit' && roll === 10)) {
       if (color === cardPlayer) throw new Error('Waiting for opponent');
       if (color !== opposite(cardPlayer)) throw new Error('Not your prompt');
     } else if (color !== cardPlayer) {
@@ -1690,6 +1824,78 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
   return next;
 }
 
+function gamblerGraveIndex(payload: unknown): number | null {
+  if (typeof payload === 'number' && Number.isInteger(payload) && payload >= 0) return payload;
+  if (payload && typeof payload === 'object' && 'idx' in payload) {
+    const idx = (payload as { idx: unknown }).idx;
+    if (typeof idx === 'number' && Number.isInteger(idx) && idx >= 0) return idx;
+  }
+  return null;
+}
+
+function parseDelightRevive(
+  payload: unknown,
+): { cls: PieceClass; idx?: number } | null {
+  if (typeof payload === 'string' && payload) {
+    return { cls: payload as PieceClass };
+  }
+  if (payload && typeof payload === 'object' && 'class' in payload) {
+    const cls = (payload as { class: unknown }).class;
+    if (typeof cls !== 'string' || !cls) return null;
+    const idx = gamblerGraveIndex(payload);
+    return { cls: cls as PieceClass, idx: idx ?? undefined };
+  }
+  return null;
+}
+
+function spawnFallenPiece(state: GameState, color: Color, idx: number): void {
+  const gy = state.players[color].graveyard;
+  if (idx < 0 || idx >= gy.length) {
+    log(state, `${color} has no such fallen piece to revive`);
+    return;
+  }
+  const spot =
+    nearestEmptyAround(state, { row: backRow(color), col: 4 }) ??
+    nearestEmptyAround(state, { row: frontRow(color), col: 4 });
+  if (!spot) {
+    log(state, `${color} has no space to revive`);
+    return;
+  }
+  const [entry] = gy.splice(idx, 1);
+  const def = getPieceDef(entry.defId);
+  state.pieces.push({
+    id: `gamb_rev_${color}_${entry.defId}_${Date.now()}`,
+    defId: entry.defId,
+    class: def.class,
+    color,
+    pos: spot,
+    hasMoved: false,
+    startPos: spot,
+    effects: [],
+    charges: initialCharges(entry.defId),
+    reviveCount: entry.defId === 'angel' ? 0 : undefined,
+  });
+  log(state, `${color} revived ${def.name}`);
+}
+
+function spawnFallenByClass(
+  state: GameState,
+  color: Color,
+  cls: PieceClass,
+  preferredIdx?: number,
+): void {
+  const gy = state.players[color].graveyard;
+  let idx =
+    preferredIdx != null && gy[preferredIdx]?.class === cls
+      ? preferredIdx
+      : gy.findIndex((g) => g.class === cls);
+  if (idx < 0) {
+    log(state, `${color} has no fallen ${cls} to revive`);
+    return;
+  }
+  spawnFallenPiece(state, color, idx);
+}
+
 function applyGambler(
   state: GameState,
   cardDefId: string,
@@ -1713,9 +1919,11 @@ function applyGambler(
         }
       }
     } else if (roll === 10) {
-      // opponent revive — payload {idx, pos}
+      const idx = gamblerGraveIndex(payload);
+      if (idx != null) spawnFallenPiece(state, opposite(cardPlayer), idx);
     } else if (roll === 11) {
-      // self revive
+      const idx = gamblerGraveIndex(payload);
+      if (idx != null) spawnFallenPiece(state, cardPlayer, idx);
     } else if (roll === 12) {
       const spot = nearestEmptyAround(state, {
         row: frontRow(cardPlayer),
@@ -1752,6 +1960,12 @@ function applyGambler(
         if (p.class === cls && p.class !== 'king') {
           p.effects.push({ id: `imm_${p.id}`, kind: 'immobilized', turnsRemaining: 3 });
         }
+      }
+    } else if (roll === 10 || roll === 11) {
+      const pick = parseDelightRevive(payload);
+      if (pick) {
+        spawnFallenByClass(state, cardPlayer, pick.cls, pick.idx);
+        spawnFallenByClass(state, opposite(cardPlayer), pick.cls);
       }
     } else if (roll === 12) {
       const spot = nearestEmptyAround(state, { row: frontRow(cardPlayer), col: 5 });
@@ -1864,6 +2078,9 @@ function cardHasSavingPlay(state: GameState, color: Color, instanceId: string, d
   }
   if (defId === 'pause') {
     return state.pieces.some((p) => p.class !== 'king' && apply([p.id]));
+  }
+  if (defId === 'fortify') {
+    return allies.some((p) => apply([p.id]));
   }
   if (defId === 'refresh' || defId === 'repel') {
     return state.pieces.some((p) => apply([p.id]));
@@ -2015,6 +2232,7 @@ function hasEscapeFromCheck(state: GameState, color: Color): boolean {
 }
 
 export function endTurn(state: GameState, color: Color, fromCheck: boolean): GameState {
+  retireSpidersAtFarEdge(state);
   const next = state;
   tickEffectsOnTurnEnd(next, color);
 

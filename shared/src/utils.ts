@@ -240,10 +240,9 @@ export function reaperCapturesUntilRest(charges: number): number {
   return 6 - c;
 }
 
-/** Night Chebyshev radius from Blood Tokens. 1 token → 1; every 3 tokens after that +1; cap 5. */
+/** Night Chebyshev radius. 0 tokens → 1; every 3 tokens +1; cap 5. */
 export function vampireNightRadius(tokens: number): number {
-  if (tokens < 1) return 0;
-  return Math.min(5, 1 + Math.floor((tokens - 1) / 3));
+  return Math.min(5, 1 + Math.floor(Math.max(0, tokens) / 3));
 }
 
 export function ownWizards(

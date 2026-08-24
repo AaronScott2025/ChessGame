@@ -5,8 +5,8 @@ import { getObstacleInfo, OBSTACLE_ORDER, type ObstacleInfo } from './obstacleIn
 const CLASS_SECTIONS: Array<{ title: string; ids: string[] }> = [
   { title: 'Pawns', ids: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'] },
   { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome'] },
-  { title: 'Knights', ids: ['horse', 'snake', 'pig'] },
-  { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard'] },
+  { title: 'Knights', ids: ['horse', 'snake', 'pig', 'archer'] },
+  { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard', 'worm'] },
   { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'] },
   { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler'] },
   { title: 'King', ids: ['king'] },
@@ -80,26 +80,30 @@ function PieceRulesCard({ piece }: { piece: PieceInfo }) {
             ))}
           </ul>
         </section>
-        {piece.abilities.length > 0 && (
-          <section>
-            <h4>Abilities</h4>
+        <section>
+          <h4>Abilities</h4>
+          {piece.abilities.length > 0 ? (
             <ul>
               {piece.abilities.map((line) => (
                 <li key={line}>{formatNamedLine(line)}</li>
               ))}
             </ul>
-          </section>
-        )}
-        {piece.misc && piece.misc.length > 0 && (
-          <section>
-            <h4>Notes</h4>
+          ) : (
+            <p>None.</p>
+          )}
+        </section>
+        <section>
+          <h4>Notes</h4>
+          {piece.notes && piece.notes.length > 0 ? (
             <ul>
-              {piece.misc.map((line) => (
+              {piece.notes.map((line) => (
                 <li key={line}>{line}</li>
               ))}
             </ul>
-          </section>
-        )}
+          ) : (
+            <p>None.</p>
+          )}
+        </section>
       </div>
     </article>
   );
