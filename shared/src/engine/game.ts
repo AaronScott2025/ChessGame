@@ -1404,7 +1404,9 @@ export function applyMove(
     if (waiting) {
       log(next, `${color} triggered a gadget`);
       retireSpidersAtFarEdge(next);
-      if (next.pendingPrompt && !next.pieces.some((p) => p.id === next.pendingPrompt!.pieceId)) {
+      const promptPieceId =
+        next.pendingPrompt && 'pieceId' in next.pendingPrompt ? next.pendingPrompt.pieceId : undefined;
+      if (next.pendingPrompt && promptPieceId && !next.pieces.some((p) => p.id === promptPieceId)) {
         next.pendingPrompt = null;
       } else if (next.pieces.some((p) => p.id === piece.id)) {
         return next;

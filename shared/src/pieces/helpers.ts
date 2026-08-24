@@ -32,7 +32,7 @@ export interface PieceDefinition {
 }
 
 export function fortifyBlocksCapture(attacker: PieceState, victim: PieceState): boolean {
-  return hasEffect(victim, 'fortify') && (attacker.class === 'pawn' || attacker.class === 'knight');
+  return Boolean(hasEffect(victim, 'fortify')) && (attacker.class === 'pawn' || attacker.class === 'knight');
 }
 
 export function emptyOrEnemy(

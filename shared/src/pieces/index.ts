@@ -18,6 +18,7 @@ import {
   knightMoves,
   knightTargetCoords,
   isPigLShape,
+  type MoveOption,
   type PieceDefinition,
   rayMoves,
   standardPawnMoves,
@@ -111,7 +112,7 @@ function wormAllyIsAhead(piece: PieceState, landing: Coord, ally: PieceState): b
  * 2 orthogonal, then Burrow: up to 2 from the first ally, then 1 from each
  * further ally that sits ahead of a square you can already reach.
  */
-function wormMoves(piece: PieceState, state: GameState): ReturnType<typeof emptyOrEnemy>[] {
+function wormMoves(piece: PieceState, state: GameState): MoveOption[] {
   const hop = 2 + movementBonus(piece);
   const firstRadius = 2 + movementBonus(piece);
   const chainRadius = 1 + movementBonus(piece);
