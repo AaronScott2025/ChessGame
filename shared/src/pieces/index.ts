@@ -60,17 +60,6 @@ function wormPathClear(
   return dest;
 }
 
-function wormAlliesOrtho(state: GameState, pos: Coord, piece: PieceState): PieceState[] {
-  const allies: PieceState[] = [];
-  for (const d of ORTH) {
-    const n = { row: pos.row + d.row, col: pos.col + d.col };
-    if (!inBounds(n)) continue;
-    const occ = pieceAt(state, n);
-    if (occ && occ.color === piece.color && occ.id !== piece.id) allies.push(occ);
-  }
-  return allies;
-}
-
 /** Squares within `radius` of an ally (clear king-step path from that ally). */
 function wormBurrowFromAlly(
   state: GameState,
@@ -140,8 +129,6 @@ function wormMoves(piece: PieceState, state: GameState): MoveOption[] {
       if (wormAllyIsAhead(piece, landing, ally)) enqueueAlly(ally, radius);
     }
   };
-
-  for (const ally of wormAlliesOrtho(state, piece.pos, piece)) enqueueAlly(ally, firstRadius);
 
   for (const d of ORTH) {
     const dest = wormPathClear(state, piece.pos, d, hop);

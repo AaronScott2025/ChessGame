@@ -178,7 +178,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Bishop',
     movement: ['Moves exactly 2 squares orthogonally. The in-between square must be empty.'],
     abilities: [
-      'Burrow: if an ally is beside the Worm or beside its 2-step landing, may go to any square up to 2 tiles from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
+      'Burrow: after the 2-step, if an allied piece is ahead and adjacent to that landing, may go to any square up to 2 tiles from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
     ],
   },
   queen: {
