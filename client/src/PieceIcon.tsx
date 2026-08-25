@@ -20,6 +20,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   wizard: { folder: 'Bishops', file: 'Wizard' },
   worm: { folder: 'Bishops', file: 'Worm' },
   queen: { folder: 'Queens', file: 'Queen' },
+  spider_queen: { folder: 'Queens', file: 'SpiderQueen' },
   angel: { folder: 'Queens', file: 'Angel' },
   ghost: { folder: 'Queens', file: 'Ghost' },
   reaper: { folder: 'Queens', file: 'Reaper' },

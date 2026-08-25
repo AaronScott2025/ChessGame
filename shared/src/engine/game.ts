@@ -32,6 +32,9 @@ import {
   bothOwnWizardsAlive,
   magicBegoneUses,
   reaperCapturesUntilRest,
+  immuneToWeb,
+  firstWebOnPath,
+  webTokenAt,
 } from '../utils.js';
 
 function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
@@ -637,6 +640,15 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       hint: 'Press this, then click a barrier and an empty allied square. Walking onto a barrier is a normal move (Barrier Phase).',
     });
   }
+  if (piece.defId === 'spider_queen') {
+    out.push({
+      id: 'trail_of_webs',
+      name: 'Trail of Webs',
+      ready: true,
+      passive: true,
+      hint: 'After moving, leaves a 3-tile web row at the square it left (center, left, and right of travel). Skips allied tiles. Two rows max; the oldest vanishes. Pieces that move onto or through a web are stuck 3 turns. Kings and Spider Queens cannot be webbed.',
+    });
+  }
   if (piece.defId === 'reaper') {
     const charges = piece.charges ?? 0;
     if (charges >= 1) {
@@ -1039,6 +1051,7 @@ function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, 
       }
       if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
       piece.pos = slide;
+      snareInWeb(state, piece);
       log(state, `${piece.defId} slid on ice`);
     }
     if (t.kind === 'spring_board') {
@@ -1071,11 +1084,70 @@ function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, 
   return false;
 }
 
+function snareInWeb(state: GameState, piece: PieceState): void {
+  if (immuneToWeb(piece)) return;
+  if (!webTokenAt(state, piece.pos)) return;
+  removeEffects(piece, 'webbed');
+  addEffect(piece, { id: `web_${piece.id}_${Date.now()}`, kind: 'webbed', turnsRemaining: 3 });
+  log(state, `${getPieceDef(piece.defId).name} is caught in a web`);
+}
+
+function freePiecesNoLongerInWeb(state: GameState): void {
+  for (const p of state.pieces) {
+    if (!hasEffect(p, 'webbed')) continue;
+    if (!webTokenAt(state, p.pos)) removeEffects(p, 'webbed');
+  }
+}
+
+function removeWebRow(state: GameState, rowId: string): void {
+  state.tokens = state.tokens.filter((t) => !(t.kind === 'web' && t.data?.rowId === rowId));
+  freePiecesNoLongerInWeb(state);
+}
+
+function placeTrailOfWebs(state: GameState, queen: PieceState, from: Coord, to: Coord): void {
+  const dr = Math.sign(to.row - from.row);
+  const dc = Math.sign(to.col - from.col);
+  if (dr === 0 && dc === 0) return;
+  const tiles: Coord[] = [
+    { ...from },
+    { row: from.row - dc, col: from.col + dr },
+    { row: from.row + dc, col: from.col - dr },
+  ];
+  const rowId = `webrow_${queen.id}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const seq = Date.now() + Math.random();
+  for (const pos of tiles) {
+    if (!inBounds(pos)) continue;
+    const occ = pieceAt(state, pos);
+    if (occ && (occ.color === queen.color || immuneToWeb(occ))) continue;
+    state.tokens.push({
+      id: `web_${rowId}_${pos.row}_${pos.col}`,
+      kind: 'web',
+      pos: { ...pos },
+      owner: queen.color,
+      data: { rowId, queenId: queen.id, seq },
+    });
+    if (occ) snareInWeb(state, occ);
+  }
+  const rows = new Map<string, number>();
+  for (const t of state.tokens) {
+    if (t.kind !== 'web' || t.data?.queenId !== queen.id) continue;
+    const id = String(t.data?.rowId ?? '');
+    const s = Number(t.data?.seq ?? 0);
+    const prev = rows.get(id);
+    if (prev == null || s < prev) rows.set(id, s);
+  }
+  const ordered = [...rows.entries()].sort((a, b) => a[1] - b[1]);
+  while (ordered.length > 2) {
+    const oldest = ordered.shift();
+    if (oldest) removeWebRow(state, oldest[0]);
+  }
+}
+
 export function applyMove(
   state: GameState,
   color: Color,
   pieceId: string,
-  to: Coord,
+  requestedTo: Coord,
   meta?: Record<string, unknown>,
 ): GameState {
   if (state.phase !== 'playing') throw new Error('Not playing');
@@ -1092,6 +1164,7 @@ export function applyMove(
   }
   const piece = next.pieces.find((p) => p.id === pieceId);
   if (!piece || piece.color !== color) throw new Error('Invalid piece');
+  let to = { ...requestedTo };
   const legal = listMoves(next, pieceId);
   let move = legal.find((m) => sameCoord(m.to, to) && (!meta?.special || m.special === meta.special));
   if (!move && meta?.special) {
@@ -1104,6 +1177,25 @@ export function applyMove(
   }
 
   const from = { ...piece.pos };
+  const skipWebPath =
+    move.special === 'castle_swap' ||
+    move.special === 'ancient_shuffle' ||
+    move.special === 'swap_of_fates' ||
+    move.special === 'death_stare' ||
+    move.special === 'archer_shot' ||
+    move.special === 'best_buddy';
+  if (!skipWebPath) {
+    const hit = firstWebOnPath(next, from, to, piece);
+    if (hit && !sameCoord(hit, to)) {
+      to = { ...hit };
+      const occ = pieceAt(next, to);
+      move = {
+        to,
+        capture: Boolean(occ && occ.color !== color),
+      };
+      log(next, `${getPieceDef(piece.defId).name} is snared mid-path by a web`);
+    }
+  }
 
   // cancel recall if moves
   if (hasEffect(piece, 'recall')) removeEffects(piece, 'recall');
@@ -1322,7 +1414,7 @@ export function applyMove(
       }
     }
 
-    if (captured?.defId === 'spider' && next.pieces.some((p) => p.id === piece.id)) {
+    if (captured?.defId === 'spider' && next.pieces.some((p) => p.id === piece.id) && !immuneToWeb(piece)) {
       addEffect(piece, { id: `web_${piece.id}_${Date.now()}`, kind: 'webbed', turnsRemaining: 2 });
       log(next, `${piece.defId} is caught in a web (Immovable)`);
     }
@@ -1352,7 +1444,22 @@ export function applyMove(
       if (occ && occ.color === color) throw new Error('Mirror blocked');
       if (occ && occ.color !== color) removePiece(next, occ, color);
       other.pos = mirror;
+      snareInWeb(next, other);
     }
+  }
+
+  if (
+    move.special !== 'death_stare' &&
+    move.special !== 'archer_shot'
+  ) {
+    snareInWeb(next, piece);
+  }
+  if (
+    piece.defId === 'spider_queen' &&
+    move.special !== 'death_stare' &&
+    move.special !== 'archer_shot'
+  ) {
+    placeTrailOfWebs(next, piece, from, piece.pos);
   }
 
   // True love: if one dies both die — handled in removePiece
@@ -1390,6 +1497,7 @@ export function applyMove(
   const echo = hasEffect(piece, 'echo_armed');
   if (echo) {
     addEchoOption(next, piece, from, to);
+    snareInWeb(next, piece);
   }
 
   // Gadget tile effects (ice / spring / gnome hole)
@@ -1455,8 +1563,9 @@ function addEchoOption(state: GameState, piece: PieceState, from: Coord, to: Coo
   }
   // auto-apply echo non-capture
   if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
-  piece.pos = echoTo;
-  removeEffects(piece, 'echo_armed');
+      piece.pos = echoTo;
+      snareInWeb(state, piece);
+      removeEffects(piece, 'echo_armed');
   log(state, `Echo repeated move for ${piece.defId}`);
 }
 
@@ -1796,6 +1905,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     }
     if (endBestBuddy(next, piece, piece.pos)) log(next, 'Best Buddy ended');
     piece.pos = { ...dest };
+    snareInWeb(next, piece);
     next.pendingPrompt = null;
     log(next, 'Spring Board bounce!');
     if (isInCheck(next, opposite(color))) return endTurn(next, color, true);
@@ -1816,6 +1926,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (pieceAt(next, dest)) throw new Error('Occupied');
     if (endBestBuddy(next, piece, piece.pos)) log(next, 'Best Buddy ended');
     piece.pos = { ...dest };
+    snareInWeb(next, piece);
     next.pendingPrompt = null;
     log(next, 'Traveled through Gnome Hole');
     if (isInCheck(next, opposite(color))) return endTurn(next, color, true);
@@ -2425,6 +2536,7 @@ function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
     }
   }
   state.tokens = state.tokens.filter((t) => t.turnsRemaining == null || t.turnsRemaining > 0);
+  freePiecesNoLongerInWeb(state);
 }
 
 export function publicState(state: GameState, viewer: Color | null): GameState {

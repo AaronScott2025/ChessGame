@@ -3006,6 +3006,18 @@ html.fx-off .turn-pill-check.is-you {
   inset: 22%;
 }
 
+.token.web {
+  inset: 8%;
+  border-radius: 0;
+  opacity: 0.92;
+  background: transparent;
+  background-image: url('/overlays/web.svg');
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+  filter: drop-shadow(0 0 6px rgba(94, 239, 255, 0.45));
+}
+
 .ability-bar {
   display: flex;
   flex-wrap: wrap;

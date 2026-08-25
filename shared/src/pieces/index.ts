@@ -164,7 +164,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Pawn',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'],
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, false)),
   },
   nwap: {
@@ -217,7 +217,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Leapfrog',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'],
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
@@ -457,6 +457,13 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♛',
     getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ALL8, 10)),
   },
+  spider_queen: {
+    id: 'spider_queen',
+    name: 'Spider Queen',
+    class: 'queen',
+    symbol: '♛',
+    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ALL8, 4)),
+  },
   angel: {
     id: 'angel',
     name: 'Angel',
@@ -637,7 +644,7 @@ export const VARIANTS_BY_CLASS: Record<string, string[]> = {
   knight: ['horse', 'snake', 'pig', 'archer'],
   bishop: ['bishop', 'scamman', 'wizard', 'worm'],
   wildcard: ['prince_princess', 'demon', 'mimic', 'gambler'],
-  queen: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'],
+  queen: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
   king: ['king'],
 };
 

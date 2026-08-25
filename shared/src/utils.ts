@@ -272,3 +272,36 @@ export function barriersAdjacent(state: GameState, pos: Coord): boolean {
     return chebyshev(t.pos, pos) === 1;
   });
 }
+
+export function immuneToWeb(piece: PieceState): boolean {
+  return piece.class === 'king' || piece.defId === 'spider_queen';
+}
+
+export function webTokenAt(state: GameState, pos: Coord) {
+  return state.tokens.find((t) => t.kind === 'web' && sameCoord(t.pos, pos));
+}
+
+/** First empty-or-enemy web on a queen-style ray, else destination web for leaps. */
+export function firstWebOnPath(state: GameState, from: Coord, to: Coord, mover: PieceState): Coord | null {
+  if (immuneToWeb(mover)) return null;
+  const dr = Math.sign(to.row - from.row);
+  const dc = Math.sign(to.col - from.col);
+  const absR = Math.abs(to.row - from.row);
+  const absC = Math.abs(to.col - from.col);
+  const isRay = (dr === 0 || dc === 0 || absR === absC) && (absR > 0 || absC > 0);
+  const consider = (pos: Coord): boolean => {
+    if (!webTokenAt(state, pos)) return false;
+    const occ = pieceAt(state, pos);
+    if (!occ) return true;
+    return occ.color !== mover.color;
+  };
+  if (isRay) {
+    const steps = Math.max(absR, absC);
+    for (let i = 1; i <= steps; i++) {
+      const pos = { row: from.row + dr * i, col: from.col + dc * i };
+      if (consider(pos)) return pos;
+    }
+    return null;
+  }
+  return consider(to) ? to : null;
+}

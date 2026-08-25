@@ -188,6 +188,18 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves any number of squares in any direction (up to 10).'],
     abilities: [],
   },
+  spider_queen: {
+    id: 'spider_queen',
+    name: 'Spider Queen',
+    classLabel: 'Queen',
+    movement: ['Moves up to 4 squares in any direction (orthogonal or diagonal).'],
+    abilities: [
+      'Trail of Webs: after she leaves a square, a web is placed on that square and the tiles to her left and right of travel (horizontal move → above, origin, below).',
+      'Any piece that moves onto or through a web is stopped there and stuck for 3 turns, or until that web disappears.',
+      'She may have 2 web rows at once; placing a third removes the oldest row.',
+    ],
+    notes: ['Cannot web the Spider Queen or either King.', 'Webs are not placed on tiles occupied by allies.'],
+  },
   angel: {
     id: 'angel',
     name: 'Angel',

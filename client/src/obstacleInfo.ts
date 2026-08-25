@@ -81,6 +81,20 @@ export const OBSTACLE_INFO: Record<string, ObstacleInfo> = {
     ],
     notes: ['Only one Blink at a time per player. Another piece entering this square cancels it.'],
   },
+  web: {
+    id: 'web',
+    name: 'Web',
+    category: 'Spider Queen',
+    how: [
+      'Left by a Spider Queen’s Trail of Webs on the square she vacated plus the tiles to the left and right of her travel direction.',
+      'A piece that tries to move onto or through a web is stopped on that web and stuck for 3 turns (or until the web is gone).',
+    ],
+    notes: [
+      'Each Spider Queen may keep 2 web rows; a third row removes the oldest.',
+      'Kings and Spider Queens cannot be webbed, and webs are not placed on their squares.',
+      'Webs are not placed on tiles occupied by the Spider Queen’s allies.',
+    ],
+  },
 };
 
 export function getObstacleInfo(kind: string): ObstacleInfo {
@@ -94,4 +108,4 @@ export function getObstacleInfo(kind: string): ObstacleInfo {
   );
 }
 
-export const OBSTACLE_ORDER = ['barrier', 'ice_floor', 'spring_board', 'gnome_hole', 'portal', 'blink'] as const;
+export const OBSTACLE_ORDER = ['barrier', 'ice_floor', 'spring_board', 'gnome_hole', 'portal', 'blink', 'web'] as const;

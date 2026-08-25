@@ -7,7 +7,7 @@ const CLASS_SECTIONS: Array<{ title: string; ids: string[] }> = [
   { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome'] },
   { title: 'Knights', ids: ['horse', 'snake', 'pig', 'archer'] },
   { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard', 'worm'] },
-  { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire'] },
+  { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'] },
   { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler'] },
   { title: 'King', ids: ['king'] },
 ];
