@@ -58,7 +58,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'First move may go 2 squares forward, or 1–2 squares diagonally forward.',
     ],
     abilities: [
-      'Web: if captured, the capturing piece is webbed for 1 turn (cannot move).',
+      'Web: if captured in enemy territory, the capturing piece is webbed for 2 turns (cannot move).',
     ],
     notes: ['Captures diagonally forward only.', 'Reaching the far edge takes the Spider (it does not promote).'],
   },
@@ -106,6 +106,16 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Gnome Hole: allied pieces may travel to a gnome starting square.',
     ],
   },
+  yeti: {
+    id: 'yeti',
+    name: 'Yeti',
+    classLabel: 'Rook',
+    movement: ['Moves 1 square horizontally or vertically.'],
+    abilities: [
+      'Giga Stomp (once per game): stomp 3 tiles in any direction. Removes every allied and enemy piece in that line. The Yeti does not move. Kings are immune.',
+    ],
+    notes: ['Cannot be captured by any pawn variant.'],
+  },
   horse: {
     id: 'horse',
     name: 'Horse',
@@ -119,7 +129,8 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Knight',
     movement: ['Moves in an L shape (2 then 1). Cannot jump over pieces or barriers normally.'],
     abilities: [
-      'Bloodlust: after capturing, on the Snake’s next move it gains ±1 on an L-leg and can jump over pieces.',
+      'Bloodlust: after capturing, gain Bloodlust for 3 turns — can jump and use ±1 on an L-leg.',
+      'Bloodlust does not stack; capturing again while Bloodlust is active does not renew it.',
     ],
   },
   pig: {
@@ -178,7 +189,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Bishop',
     movement: ['Moves exactly 2 squares orthogonally. The in-between square must be empty.'],
     abilities: [
-      'Burrow: after the 2-step, if an allied piece is ahead and adjacent to that landing, may go to any square up to 2 tiles from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
+      'Burrow: after the 2-step, if an allied piece is ahead and adjacent to that landing, may go to any square up to 1 tile from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
     ],
   },
   queen: {
@@ -306,6 +317,24 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     notes: [
       'Both Gamblers cannot share the same movement style at the same time.',
       'Cannot roll the same movement style two days in a row.',
+    ],
+  },
+  timekeeper: {
+    id: 'timekeeper',
+    name: 'TimeKeeper',
+    classLabel: 'Wildcard',
+    movement: [
+      'Day: moves like a Bishop (any number of diagonal squares).',
+      'Night: moves like a Knight (L-shape, can jump).',
+    ],
+    abilities: [
+      'Temporal Shift (once): skip to the opposite phase, or revert the last day/night change. Affects day/night pieces; does not undo card draws.',
+      'Rewind (once): send any allied or enemy piece in clear line of sight back to its previous square (must be empty).',
+      'Chrono Recall (once per game): send any allied or enemy piece in clear line of sight back to its spawn square (must be empty).',
+    ],
+    notes: [
+      'Rewind and Chrono Recall cannot leave your King in check.',
+      'Line of sight is a straight unobstructed path in any direction.',
     ],
   },
   king: {

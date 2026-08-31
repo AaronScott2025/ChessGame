@@ -1,6 +1,7 @@
 import type { Coord, GameState, PieceClass, PieceState } from '../types.js';
 import {
   clearOrthogonalLOS,
+  hasBloodlust,
   hasEffect,
   inBounds,
   isAlliedTerritory,
@@ -98,12 +99,12 @@ function wormAllyIsAhead(piece: PieceState, landing: Coord, ally: PieceState): b
 }
 
 /**
- * 2 orthogonal, then Burrow: up to 2 from the first ally, then 1 from each
+ * 2 orthogonal, then Burrow: up to 1 from the first ally, then 1 from each
  * further ally that sits ahead of a square you can already reach.
  */
 function wormMoves(piece: PieceState, state: GameState): MoveOption[] {
   const hop = 2 + movementBonus(piece);
-  const firstRadius = 2 + movementBonus(piece);
+  const firstRadius = 1 + movementBonus(piece);
   const chainRadius = 1 + movementBonus(piece);
   const moves: NonNullable<ReturnType<typeof emptyOrEnemy>>[] = [];
   const seenLand = new Set<string>();
@@ -172,7 +173,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'nwaP',
     class: 'pawn',
     symbol: '♙',
-    promoteOptions: ['horse', 'snake', 'pig', 'archer', 'bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'demon', 'mimic'],
+    promoteOptions: ['horse', 'snake', 'pig', 'archer', 'bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti', 'demon', 'mimic'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, true)),
   },
   rogue: {
@@ -180,7 +181,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Rogue',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome'],
+    promoteOptions: ['bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti'],
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
@@ -354,6 +355,25 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♜',
     getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ORTH, 2)),
   },
+  yeti: {
+    id: 'yeti',
+    name: 'Yeti',
+    class: 'rook',
+    symbol: '♜',
+    getMoves: (p, s) => {
+      const moves = filterLegal(p, s, rayMoves(p, s, ORTH, 1));
+      if (!p.gigaStompUsed) {
+        for (const d of ALL8) {
+          for (let i = 1; i <= 3; i++) {
+            const to = { row: p.pos.row + d.row * i, col: p.pos.col + d.col * i };
+            if (!inBounds(to)) break;
+            moves.push({ to, special: 'giga_stomp', meta: { dir: d } });
+          }
+        }
+      }
+      return moves;
+    },
+  },
   horse: {
     id: 'horse',
     name: 'Horse',
@@ -367,18 +387,15 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'knight',
     symbol: '♞',
     getMoves: (p, s) => {
-      const jump = Boolean(p.bloodlust);
+      const jump = hasBloodlust(p);
       const moves = knightMoves(p, s, 2, 1, jump);
       // Bloodlust: +1/-1 on either leg of the L
-      if (p.bloodlust) {
+      if (hasBloodlust(p)) {
         moves.push(...knightMoves(p, s, 3, 1, true));
         moves.push(...knightMoves(p, s, 1, 1, true));
         moves.push(...knightMoves(p, s, 2, 2, true));
       }
       return filterLegal(p, s, moves);
-    },
-    onCapture: (attacker) => {
-      attacker.bloodlust = true;
     },
   },
   pig: {
@@ -620,6 +637,18 @@ export const PIECES: Record<string, PieceDefinition> = {
       return filterLegal(p, s, copied);
     },
   },
+  timekeeper: {
+    id: 'timekeeper',
+    name: 'TimeKeeper',
+    class: 'wildcard',
+    symbol: '♟',
+    getMoves: (p, s) => {
+      if (s.dayNight === 'day') {
+        return filterLegal(p, s, rayMoves(p, s, DIAG, 10));
+      }
+      return filterLegal(p, s, knightMoves(p, s, 2, 1, true));
+    },
+  },
   king: {
     id: 'king',
     name: 'King',
@@ -640,10 +669,10 @@ export const PIECES: Record<string, PieceDefinition> = {
 
 export const VARIANTS_BY_CLASS: Record<string, string[]> = {
   pawn: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'],
-  rook: ['rook', 'stoneman', 'gnome'],
+  rook: ['rook', 'stoneman', 'gnome', 'yeti'],
   knight: ['horse', 'snake', 'pig', 'archer'],
   bishop: ['bishop', 'scamman', 'wizard', 'worm'],
-  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler'],
+  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper'],
   queen: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
   king: ['king'],
 };

@@ -20,6 +20,7 @@ jobs = [
     ("PrincePrincessWhite.png", "Wildcards", "PrincePrincess"),
     ("DemonWhite.png", "Wildcards", "Demon"),
     ("MimicWhite.png", "Wildcards", "Mimic"),
+    ("TimeKeeperWhite.png", "Wildcards", "TimeKeeper"),
     ("KingWhite.png", "Kings", "King"),
 ]
 

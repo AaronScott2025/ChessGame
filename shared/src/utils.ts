@@ -1,6 +1,10 @@
 import type { Color, Coord, GameState, PieceState, StatusEffect } from './types.js';
 import { ALLIED_ROWS, BOARD_SIZE } from './types.js';
 
+export function hasBloodlust(piece: PieceState): boolean {
+  return (piece.bloodlustTurnsRemaining ?? 0) > 0;
+}
+
 export function cloneState<T>(state: T): T {
   return structuredClone(state);
 }
@@ -90,6 +94,26 @@ export function orthDir(from: Coord, to: Coord): Coord | null {
   if (dr !== 0 && dc !== 0) return null;
   if (dr === 0 && dc === 0) return null;
   return { row: dr, col: dc };
+}
+
+export function clearLineOfSight(state: GameState, from: Coord, to: Coord): boolean {
+  if (sameCoord(from, to)) return true;
+  const dr = Math.sign(to.row - from.row);
+  const dc = Math.sign(to.col - from.col);
+  if (dr === 0 && dc === 0) return false;
+  const rowDiff = Math.abs(to.row - from.row);
+  const colDiff = Math.abs(to.col - from.col);
+  if (from.row !== to.row && from.col !== to.col && rowDiff !== colDiff) return false;
+  let r = from.row + dr;
+  let c = from.col + dc;
+  while (r !== to.row || c !== to.col) {
+    const pos = { row: r, col: c };
+    if (pieceAt(state, pos)) return false;
+    if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, pos))) return false;
+    r += dr;
+    c += dc;
+  }
+  return true;
 }
 
 export function clearOrthogonalLOS(state: GameState, from: Coord, to: Coord): boolean {

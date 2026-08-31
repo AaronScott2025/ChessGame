@@ -4,11 +4,11 @@ import { getObstacleInfo, OBSTACLE_ORDER, type ObstacleInfo } from './obstacleIn
 
 const CLASS_SECTIONS: Array<{ title: string; ids: string[] }> = [
   { title: 'Pawns', ids: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'] },
-  { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome'] },
+  { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome', 'yeti'] },
   { title: 'Knights', ids: ['horse', 'snake', 'pig', 'archer'] },
   { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard', 'worm'] },
   { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'] },
-  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler'] },
+  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper'] },
   { title: 'King', ids: ['king'] },
 ];
 

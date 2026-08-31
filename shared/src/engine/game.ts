@@ -2,7 +2,7 @@ import type { Color, Coord, GameState, PendingPrompt, PieceClass, PieceState, Pl
 import { BOARD_SIZE, MAX_HAND } from '../types.js';
 import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS, rollGamblerStyles } from '../pieces/index.js';
 import type { MoveOption } from '../pieces/helpers.js';
-import { isKnightLanding, isPigLShape } from '../pieces/helpers.js';
+import { isKnightLanding, isPigLShape, yetiBlocksPawnCapture } from '../pieces/helpers.js';
 import { buildDeck, discardCard, drawCard, getCardDef } from '../cards/index.js';
 import {
   addEffect,
@@ -10,12 +10,14 @@ import {
   barriersAdjacent,
   chebyshev,
   cloneState,
+  clearLineOfSight,
   endBestBuddy,
   frontRow,
   getKing,
   hasEffect,
   inBounds,
   isAlliedTerritory,
+  hasBloodlust,
   log,
   mulberry32,
   nearestEmptyAdjacent,
@@ -419,6 +421,75 @@ function concludeAbilityTurn(state: GameState, color: Color): GameState {
   return endTurn(state, color, false);
 }
 
+function trackPreviousPos(piece: PieceState, from: Coord, to: Coord): void {
+  if (!sameCoord(from, to)) {
+    piece.previousPos = { ...from };
+  }
+}
+
+function applyDayNightSideEffects(state: GameState, entering: 'day' | 'night', drawCards: boolean): void {
+  clearMagicBegone(state);
+  if (entering === 'day') {
+    if (drawCards) {
+      for (const c of ['white', 'black'] as Color[]) {
+        tryDrawWithHandLimit(state, c);
+      }
+      log(state, 'New day — both players draw 1');
+    }
+    const dayRng = mulberry32(state.rngSeed + state.cycleCount * 9973 + 42);
+    for (const line of rollGamblerStyles(state, dayRng)) log(state, line);
+  }
+  if (entering === 'night') {
+    if (state.cycleCount === 5) log(state, 'First night — spell cards are now available');
+    for (const p of state.pieces) {
+      if (p.defId === 'reaper' && (p.disabledTurns ?? 0) <= 0) {
+        p.charges = (p.charges ?? 0) + 1;
+      }
+      if (p.defId === 'ghost' && !hasEffect(p, 'ghost_unlocked')) {
+        addEffect(p, { id: `ghost_unlock_${p.id}`, kind: 'ghost_unlocked' });
+      }
+    }
+  }
+}
+
+function flipDayNight(state: GameState, drawCards: boolean): 'day' | 'night' {
+  state.previousDayNight = state.dayNight;
+  state.dayNight = state.dayNight === 'day' ? 'night' : 'day';
+  log(state, `It is now ${state.dayNight}`);
+  applyDayNightSideEffects(state, state.dayNight, drawCards);
+  return state.dayNight;
+}
+
+function revertDayNight(state: GameState): void {
+  if (!state.previousDayNight) throw new Error('Nothing to revert');
+  const current = state.dayNight;
+  state.dayNight = state.previousDayNight;
+  state.previousDayNight = current;
+  log(state, `Time reverts — it is now ${state.dayNight}`);
+  applyDayNightSideEffects(state, state.dayNight, false);
+}
+
+function assertTimekeeperDisplacementSafe(
+  state: GameState,
+  color: Color,
+  target: PieceState,
+  dest: Coord,
+  action: string,
+): void {
+  const trial = cloneState(state);
+  const tp = trial.pieces.find((p) => p.id === target.id);
+  if (!tp) throw new Error('Target gone');
+  endBestBuddy(trial, tp, tp.pos);
+  tp.pos = { ...dest };
+  assertOwnKingSafe(trial, color, action);
+}
+
+function squareBlockedForDisplacement(state: GameState, pos: Coord): boolean {
+  if (!inBounds(pos)) return true;
+  if (pieceAt(state, pos)) return true;
+  return state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, pos));
+}
+
 function portalExitAt(state: GameState, pos: Coord): Coord | null {
   const entry = state.tokens.find((t) => t.kind === 'portal' && sameCoord(t.pos, pos));
   if (!entry) return null;
@@ -441,6 +512,7 @@ function travelPortalOnce(state: GameState, piece: PieceState, color: Color): Pi
     if (hasEffect(occ, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) return undefined;
   }
   if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
+  trackPreviousPos(piece, piece.pos, dest);
   piece.pos = { ...dest };
   log(state, `${piece.defId} traveled through a portal`);
   return occ && occ.color !== color ? occ : undefined;
@@ -519,6 +591,24 @@ export function listMoves(state: GameState, pieceId: string): MoveOption[] {
         tp.coOccupantId = m.meta?.withId as string;
       } else if (m.special === 'death_stare' || m.special === 'archer_shot') {
         trial.pieces = trial.pieces.filter((p) => !(sameCoord(p.pos, m.to) && p.color !== tp.color));
+      } else if (m.special === 'giga_stomp') {
+        const dr = Math.sign(m.to.row - tp.pos.row);
+        const dc = Math.sign(m.to.col - tp.pos.col);
+        for (let i = 1; i <= 3; i++) {
+          const pos = { row: tp.pos.row + dr * i, col: tp.pos.col + dc * i };
+          if (!inBounds(pos)) break;
+          const occ = pieceAt(trial, pos);
+          if (
+            occ &&
+            occ.class !== 'king' &&
+            occ.id !== tp.id &&
+            !hasEffect(occ, 'invincible') &&
+            !hasEffect(occ, 'pause')
+          ) {
+            trial.pieces = trial.pieces.filter((p) => p.id !== occ.id);
+          }
+        }
+        tp.gigaStompUsed = true;
       } else if (m.special === 'portal_travel') {
         const occ2 = pieceAt(trial, m.to);
         if (occ2 && occ2.color !== tp.color) {
@@ -679,15 +769,25 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       hint: 'From allied territory with clear orthogonal line: click an allied piece to swap.',
     });
   }
+  if (piece.defId === 'yeti') {
+    out.push({
+      id: 'giga_stomp',
+      name: 'Giga Stomp',
+      ready: !piece.gigaStompUsed,
+      passive: true,
+      hint: 'Once per game: stomp 3 tiles in any direction — removes all allies and enemies in line (King immune). Yeti does not move.',
+    });
+  }
   if (piece.defId === 'snake') {
+    const active = hasBloodlust(piece);
     out.push({
       id: 'bloodlust',
-      name: piece.bloodlust ? 'Bloodlust active' : 'Bloodlust',
-      ready: Boolean(piece.bloodlust),
+      name: active ? `Bloodlust (${piece.bloodlustTurnsRemaining})` : 'Bloodlust',
+      ready: active,
       passive: true,
-      hint: piece.bloodlust
-        ? 'Bloodlust is active: this move can jump and use ±1 L-leg variants.'
-        : 'Capture an enemy to gain Bloodlust on your next Snake move.',
+      hint: active
+        ? 'Bloodlust is active: can jump and use ±1 L-leg variants. Does not stack or renew on capture.'
+        : 'Capture an enemy to gain Bloodlust for 3 turns (jump + ±1 L-leg variants).',
     });
   }
   if (piece.defId === 'pig') {
@@ -697,6 +797,35 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       ready: true,
       passive: true,
       hint: 'Click an allied non-king on a highlighted L (2–1) square — same range as Pig movement.',
+    });
+  }
+  if (piece.defId === 'timekeeper') {
+    const inCheck = isInCheck(state, piece.color);
+    out.push({
+      id: 'temporal_shift',
+      name: 'Temporal Shift',
+      ready: !piece.timekeeperCycleUsed && !inCheck,
+      hint: inCheck
+        ? 'Cannot use while in check'
+        : state.previousDayNight
+          ? 'Once: skip day↔night now, or revert the last phase change (no card draw changes).'
+          : 'Once: skip to the opposite phase now (no card draw). Revert unlocks after any phase change.',
+    });
+    out.push({
+      id: 'temporal_rewind',
+      name: 'Rewind',
+      ready: !piece.timekeeperRewindUsed && !inCheck,
+      hint: inCheck
+        ? 'Cannot use while in check'
+        : 'Once: click any piece in clear line of sight to send it to its previous square (empty).',
+    });
+    out.push({
+      id: 'chrono_recall',
+      name: 'Chrono Recall',
+      ready: !piece.timekeeperRecallUsed && !inCheck,
+      hint: inCheck
+        ? 'Cannot use while in check'
+        : 'Once per game: click any piece in clear line of sight to send it to its spawn square (must be empty).',
     });
   }
   return out;
@@ -732,7 +861,16 @@ export function useAbility(
   if (!piece || piece.color !== color) throw new Error('Invalid piece');
   if ((piece.disabledTurns ?? 0) > 0) throw new Error('Piece is disabled');
   if (isMagicDisabled(next, color) && abilityId !== 'identity_theft') {
-    const magical = ['enchant', 'magic_begone', 'gadget_deploy', 'revive', 'barrier_shift'];
+    const magical = [
+      'enchant',
+      'magic_begone',
+      'gadget_deploy',
+      'revive',
+      'barrier_shift',
+      'temporal_shift',
+      'temporal_rewind',
+      'chrono_recall',
+    ];
     if (magical.includes(abilityId)) throw new Error('Magic is silenced (Magic Be-gone)');
   }
 
@@ -825,6 +963,54 @@ export function useAbility(
       resumeTurnPhase,
     };
     return next;
+  }
+
+  if (abilityId === 'temporal_shift') {
+    const mode = targets as 'skip' | 'revert' | undefined;
+    if (!mode) {
+      next.pendingPrompt = {
+        type: 'ability_target',
+        color,
+        pieceId,
+        abilityId: 'temporal_shift',
+        message: 'Temporal Shift: skip to the opposite phase, or revert the last day/night change?',
+        resumeTurnPhase,
+      };
+      return next;
+    }
+    return finishTemporalShift(next, color, pieceId, mode);
+  }
+
+  if (abilityId === 'temporal_rewind') {
+    const targetId = targets as string | undefined;
+    if (!targetId) {
+      next.pendingPrompt = {
+        type: 'ability_target',
+        color,
+        pieceId,
+        abilityId: 'temporal_rewind',
+        message: 'Rewind: click a piece in clear line of sight to send it to its previous square',
+        resumeTurnPhase,
+      };
+      return next;
+    }
+    return finishTimekeeperRewind(next, color, pieceId, targetId);
+  }
+
+  if (abilityId === 'chrono_recall') {
+    const targetId = targets as string | undefined;
+    if (!targetId) {
+      next.pendingPrompt = {
+        type: 'ability_target',
+        color,
+        pieceId,
+        abilityId: 'chrono_recall',
+        message: 'Chrono Recall: click a piece in clear line of sight to send it to its spawn square',
+        resumeTurnPhase,
+      };
+      return next;
+    }
+    return finishChronoRecall(next, color, pieceId, targetId);
   }
 
   throw new Error('Unknown ability');
@@ -1033,6 +1219,87 @@ function finishBarrierShift(
   return concludeAbilityTurn(state, color);
 }
 
+function finishTemporalShift(
+  state: GameState,
+  color: Color,
+  pieceId: string,
+  mode: 'skip' | 'revert',
+): GameState {
+  const tk = state.pieces.find((p) => p.id === pieceId);
+  if (!tk || tk.defId !== 'timekeeper') throw new Error('Only a TimeKeeper can use Temporal Shift');
+  if (tk.timekeeperCycleUsed) throw new Error('Temporal Shift already used');
+  if (mode === 'revert' && !state.previousDayNight) {
+    throw new Error('Nothing to revert yet');
+  }
+  tk.timekeeperCycleUsed = true;
+  state.pendingPrompt = null;
+  if (mode === 'skip') {
+    flipDayNight(state, false);
+    log(state, 'TimeKeeper skips the cycle');
+  } else {
+    revertDayNight(state);
+    log(state, 'TimeKeeper reverts the cycle');
+  }
+  return concludeAbilityTurn(state, color);
+}
+
+function finishTimekeeperRewind(
+  state: GameState,
+  color: Color,
+  pieceId: string,
+  targetId: string,
+): GameState {
+  const tk = state.pieces.find((p) => p.id === pieceId);
+  if (!tk || tk.defId !== 'timekeeper') throw new Error('Only a TimeKeeper can Rewind');
+  if (tk.timekeeperRewindUsed) throw new Error('Rewind already used');
+  const target = state.pieces.find((p) => p.id === targetId);
+  if (!target) throw new Error('Invalid target');
+  if (!target.previousPos) throw new Error('That piece has no previous square to return to');
+  if (!clearLineOfSight(state, tk.pos, target.pos)) {
+    throw new Error('Target must be in clear line of sight');
+  }
+  const dest = { ...target.previousPos };
+  if (squareBlockedForDisplacement(state, dest)) {
+    throw new Error('Previous square is blocked');
+  }
+  assertTimekeeperDisplacementSafe(state, color, target, dest, 'Rewind');
+  endBestBuddy(state, target, target.pos);
+  target.pos = dest;
+  snareInWeb(state, target);
+  tk.timekeeperRewindUsed = true;
+  state.pendingPrompt = null;
+  log(state, `${getPieceDef(target.defId).name} rewound to its previous square`);
+  return concludeAbilityTurn(state, color);
+}
+
+function finishChronoRecall(
+  state: GameState,
+  color: Color,
+  pieceId: string,
+  targetId: string,
+): GameState {
+  const tk = state.pieces.find((p) => p.id === pieceId);
+  if (!tk || tk.defId !== 'timekeeper') throw new Error('Only a TimeKeeper can use Chrono Recall');
+  if (tk.timekeeperRecallUsed) throw new Error('Chrono Recall already used');
+  const target = state.pieces.find((p) => p.id === targetId);
+  if (!target) throw new Error('Invalid target');
+  if (!clearLineOfSight(state, tk.pos, target.pos)) {
+    throw new Error('Target must be in clear line of sight');
+  }
+  const dest = { ...target.startPos };
+  if (squareBlockedForDisplacement(state, dest)) {
+    throw new Error('Spawn square is obstructed');
+  }
+  assertTimekeeperDisplacementSafe(state, color, target, dest, 'Chrono Recall');
+  endBestBuddy(state, target, target.pos);
+  target.pos = dest;
+  snareInWeb(state, target);
+  tk.timekeeperRecallUsed = true;
+  state.pendingPrompt = null;
+  log(state, `${getPieceDef(target.defId).name} recalled to its spawn square`);
+  return concludeAbilityTurn(state, color);
+}
+
 function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, to: Coord, color: Color): boolean {
   // returns true if a prompt was opened (turn should not end yet)
   const tokens = state.tokens.filter((t) => sameCoord(t.pos, to));
@@ -1183,6 +1450,7 @@ export function applyMove(
     move.special === 'swap_of_fates' ||
     move.special === 'death_stare' ||
     move.special === 'archer_shot' ||
+    move.special === 'giga_stomp' ||
     move.special === 'best_buddy';
   if (!skipWebPath) {
     const hit = firstWebOnPath(next, from, to, piece);
@@ -1224,6 +1492,8 @@ export function applyMove(
     const otherFrom = { ...other.pos };
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     if (endBestBuddy(next, other, otherFrom)) log(next, 'Best Buddy ended');
+    trackPreviousPos(piece, from, other.pos);
+    trackPreviousPos(other, otherFrom, piece.pos);
     const tmp = { ...piece.pos };
     piece.pos = { ...other.pos };
     other.pos = tmp;
@@ -1235,6 +1505,8 @@ export function applyMove(
     const otherFrom = { ...other.pos };
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     if (endBestBuddy(next, other, otherFrom)) log(next, 'Best Buddy ended');
+    trackPreviousPos(piece, from, other.pos);
+    trackPreviousPos(other, otherFrom, piece.pos);
     const tmp = { ...piece.pos };
     piece.pos = { ...other.pos };
     other.pos = tmp;
@@ -1257,6 +1529,7 @@ export function applyMove(
     for (const p of next.pieces) {
       if (p.coOccupantId === piece.id) p.coOccupantId = undefined;
     }
+    trackPreviousPos(piece, from, ally.pos);
     piece.pos = { ...ally.pos };
     piece.coOccupantId = ally.id;
     log(next, `Pig Best Buddy with ${ally.defId}`);
@@ -1265,6 +1538,26 @@ export function applyMove(
     if (captureBestBuddyPair(next, to, color)) {
       captured = undefined;
     }
+  } else if (move.special === 'giga_stomp') {
+    if (piece.gigaStompUsed) throw new Error('Giga Stomp already used');
+    const dr = Math.sign(to.row - from.row);
+    const dc = Math.sign(to.col - from.col);
+    if (dr === 0 && dc === 0) throw new Error('Invalid Giga Stomp');
+    const dist = Math.max(Math.abs(to.row - from.row), Math.abs(to.col - from.col));
+    if (dist < 1 || dist > 3) throw new Error('Giga Stomp out of range');
+    const victims: PieceState[] = [];
+    for (let i = 1; i <= 3; i++) {
+      const pos = { row: from.row + dr * i, col: from.col + dc * i };
+      if (!inBounds(pos)) break;
+      const occ = pieceAt(next, pos);
+      if (occ && occ.class !== 'king' && occ.id !== piece.id) {
+        if (hasEffect(occ, 'invincible') || hasEffect(occ, 'pause')) continue;
+        victims.push(occ);
+      }
+    }
+    for (const v of victims) removePiece(next, v, color);
+    piece.gigaStompUsed = true;
+    log(next, 'Giga Stomp!');
   } else if (move.special === 'portal_travel') {
     const dest = portalExitAt(next, piece.pos);
     if (!dest || !sameCoord(dest, to)) throw new Error('Invalid portal travel');
@@ -1277,12 +1570,14 @@ export function applyMove(
       captured = undefined;
     }
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
+    trackPreviousPos(piece, from, to);
     piece.pos = { ...to };
   }
 
   if (
     move.special !== 'death_stare' &&
     move.special !== 'archer_shot' &&
+    move.special !== 'giga_stomp' &&
     move.special !== 'portal_travel'
   ) {
     const linkedFromOrigin = portalExitAt(next, from);
@@ -1293,6 +1588,9 @@ export function applyMove(
   }
 
   if (captured && captured.color !== color) {
+    if (yetiBlocksPawnCapture(piece, captured)) {
+      throw new Error('Yeti cannot be captured by pawns');
+    }
     // fortify vs pawn/knight
     if (hasEffect(captured, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) {
       throw new Error('Target is fortified against pawns/knights');
@@ -1385,8 +1683,8 @@ export function applyMove(
       log(next, `Fleece stored ${captured.defId} identity (activate Identity Theft to steal its movement)`);
     }
 
-    if (piece.defId === 'snake') {
-      piece.bloodlust = true;
+    if (piece.defId === 'snake' && captured && !hasBloodlust(piece)) {
+      piece.bloodlustTurnsRemaining = 3;
       log(next, 'Snake Bloodlust!');
     }
 
@@ -1414,7 +1712,12 @@ export function applyMove(
       }
     }
 
-    if (captured?.defId === 'spider' && next.pieces.some((p) => p.id === piece.id) && !immuneToWeb(piece)) {
+    if (
+      captured?.defId === 'spider' &&
+      !isAlliedTerritory(captured.color, captured.pos) &&
+      next.pieces.some((p) => p.id === piece.id) &&
+      !immuneToWeb(piece)
+    ) {
       addEffect(piece, { id: `web_${piece.id}_${Date.now()}`, kind: 'webbed', turnsRemaining: 2 });
       log(next, `${piece.defId} is caught in a web (Immovable)`);
     }
@@ -1427,8 +1730,6 @@ export function applyMove(
         log(next, 'Archer Steady Aim — capture status ignored');
       }
     }
-  } else if (piece.defId === 'snake' && piece.bloodlust) {
-    piece.bloodlust = false;
   }
 
   // Prince & Princess mirror
@@ -1443,6 +1744,7 @@ export function applyMove(
       const occ = pieceAt(next, mirror);
       if (occ && occ.color === color) throw new Error('Mirror blocked');
       if (occ && occ.color !== color) removePiece(next, occ, color);
+      trackPreviousPos(other, other.pos, mirror);
       other.pos = mirror;
       snareInWeb(next, other);
     }
@@ -1450,14 +1752,16 @@ export function applyMove(
 
   if (
     move.special !== 'death_stare' &&
-    move.special !== 'archer_shot'
+    move.special !== 'archer_shot' &&
+    move.special !== 'giga_stomp'
   ) {
     snareInWeb(next, piece);
   }
   if (
     piece.defId === 'spider_queen' &&
     move.special !== 'death_stare' &&
-    move.special !== 'archer_shot'
+    move.special !== 'archer_shot' &&
+    move.special !== 'giga_stomp'
   ) {
     placeTrailOfWebs(next, piece, from, piece.pos);
   }
@@ -1506,7 +1810,8 @@ export function applyMove(
     move.special !== 'ancient_shuffle' &&
     move.special !== 'swap_of_fates' &&
     move.special !== 'death_stare' &&
-    move.special !== 'archer_shot'
+    move.special !== 'archer_shot' &&
+    move.special !== 'giga_stomp'
   ) {
     const waiting = resolveGadgetLanding(next, piece, from, piece.pos, color);
     if (waiting) {
@@ -1884,6 +2189,18 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
         selected[0] as Coord,
         selected[1] as Coord,
       );
+    }
+    if (prompt.abilityId === 'temporal_shift') {
+      next.pendingPrompt = null;
+      return finishTemporalShift(next, color, prompt.pieceId, payload as 'skip' | 'revert');
+    }
+    if (prompt.abilityId === 'temporal_rewind') {
+      next.pendingPrompt = null;
+      return finishTimekeeperRewind(next, color, prompt.pieceId, payload as string);
+    }
+    if (prompt.abilityId === 'chrono_recall') {
+      next.pendingPrompt = null;
+      return finishChronoRecall(next, color, prompt.pieceId, payload as string);
     }
   }
 
@@ -2377,29 +2694,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
   if (color === 'black') {
     next.cycleCount += 1;
     if (next.cycleCount % 5 === 0) {
-      next.dayNight = next.dayNight === 'day' ? 'night' : 'day';
-      log(next, `It is now ${next.dayNight}`);
-      clearMagicBegone(next);
-      if (next.dayNight === 'day') {
-        for (const c of ['white', 'black'] as Color[]) {
-          tryDrawWithHandLimit(next, c);
-        }
-        log(next, 'New day — both players draw 1');
-        const dayRng = mulberry32(next.rngSeed + next.cycleCount * 9973 + 42);
-        for (const line of rollGamblerStyles(next, dayRng)) log(next, line);
-      }
-      // reaper gains charge at night if alive; ghosts unlock permanently
-      if (next.dayNight === 'night') {
-        if (next.cycleCount === 5) log(next, 'First night — spell cards are now available');
-        for (const p of next.pieces) {
-          if (p.defId === 'reaper' && (p.disabledTurns ?? 0) <= 0) {
-            p.charges = (p.charges ?? 0) + 1;
-          }
-          if (p.defId === 'ghost' && !hasEffect(p, 'ghost_unlocked')) {
-            addEffect(p, { id: `ghost_unlock_${p.id}`, kind: 'ghost_unlocked' });
-          }
-        }
-      }
+      flipDayNight(next, true);
     }
   }
 
@@ -2473,6 +2768,12 @@ function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
     }
     if ((piece.abilityCooldown ?? 0) > 0 && piece.color === color) {
       piece.abilityCooldown! -= 1;
+    }
+    if (piece.defId === 'snake' && piece.color === color && (piece.bloodlustTurnsRemaining ?? 0) > 0) {
+      piece.bloodlustTurnsRemaining! -= 1;
+      if (piece.bloodlustTurnsRemaining! <= 0) {
+        piece.bloodlustTurnsRemaining = undefined;
+      }
     }
     // Angel revive ritual countdown
     if (piece.defId === 'angel' && piece.color === color && (piece.ritualTurns ?? 0) > 0) {

@@ -11,6 +11,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   rook: { folder: 'Rooks', file: 'Rook' },
   stoneman: { folder: 'Rooks', file: 'Stoneman' },
   gnome: { folder: 'Rooks', file: 'Gnome' },
+  yeti: { folder: 'Rooks', file: 'Yeti' },
   horse: { folder: 'Knights', file: 'Horse' },
   snake: { folder: 'Knights', file: 'Snake' },
   pig: { folder: 'Knights', file: 'Pig' },
@@ -30,6 +31,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   demon: { folder: 'Wildcards', file: 'Demon' },
   mimic: { folder: 'Wildcards', file: 'Mimic' },
   gambler: { folder: 'Wildcards', file: 'Gambler' },
+  timekeeper: { folder: 'Wildcards', file: 'TimeKeeper' },
   king: { folder: 'Kings', file: 'King' },
 };
 

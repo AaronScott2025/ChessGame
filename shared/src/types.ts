@@ -49,10 +49,13 @@ export interface PieceState {
   reviveCount?: number;
   ritualTurns?: number;
   ritualTargetDefId?: string;
-  bloodlust?: boolean;
+  /** Snake: Bloodlust turns remaining (jump + ±1 L-leg variants). */
+  bloodlustTurnsRemaining?: number;
   coOccupantId?: string;
   /** Gnome: gadget already deployed */
   gadgetUsed?: boolean;
+  /** Yeti: Giga Stomp already used */
+  gigaStompUsed?: boolean;
   /** Wizard Enchant cooldown (owner turns remaining) */
   abilityCooldown?: number;
   /** Wizard Magic Be-gone uses spent (max 2). */
@@ -67,6 +70,14 @@ export interface PieceState {
   gamblerStyleDefId?: string;
   /** Gambler: yesterday's style (cannot repeat). */
   gamblerPrevStyleDefId?: string;
+  /** Last square this piece moved from (for TimeKeeper Rewind). */
+  previousPos?: Coord;
+  /** TimeKeeper: day/night skip or revert already used. */
+  timekeeperCycleUsed?: boolean;
+  /** TimeKeeper: Rewind already used. */
+  timekeeperRewindUsed?: boolean;
+  /** TimeKeeper: Chrono Recall (spawn send) already used. */
+  timekeeperRecallUsed?: boolean;
 }
 
 export interface TokenState {
@@ -131,6 +142,8 @@ export interface GameState {
   turn: Color;
   turnPhase: TurnPhase;
   dayNight: DayNight;
+  /** Day/night phase before the most recent flip (for TimeKeeper revert). */
+  previousDayNight?: DayNight;
   /** Full turns by current player; increments when a player finishes their move phase */
   turnCount: number;
   /** Completed mutual turn cycles (white+black) */

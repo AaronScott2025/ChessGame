@@ -63,15 +63,19 @@ interface Piece {
   reaperKills?: number;
   gamblerStyleDefId?: string;
   gadgetUsed?: boolean;
+  gigaStompUsed?: boolean;
   abilityCooldown?: number;
   ritualTurns?: number;
   reviveCount?: number;
-  bloodlust?: boolean;
+  bloodlustTurnsRemaining?: number;
   coOccupantId?: string;
   identityLootDefId?: string;
   identityTheftUsed?: boolean;
   copiedMoveDefId?: string;
   magicBegoneUsed?: number;
+  timekeeperCycleUsed?: boolean;
+  timekeeperRewindUsed?: boolean;
+  timekeeperRecallUsed?: boolean;
 }
 
 interface AbilityInfo {
@@ -111,6 +115,7 @@ interface GameState {
   turnPhase: string;
   turnCount?: number;
   dayNight: string;
+  previousDayNight?: string;
   cycleCount: number;
   check: Color | null;
   winner: Color | null;
@@ -792,6 +797,8 @@ export default function App() {
         setStatus('Death Stare ready — click an enemy in range, then Confirm');
       } else if (specials.has('archer_shot')) {
         setStatus('Archer volley ready — click an enemy on an L, then Confirm');
+      } else if (specials.has('giga_stomp')) {
+        setStatus('Giga Stomp ready — click a square up to 3 tiles away in any direction, then Confirm');
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1152,6 +1159,28 @@ export default function App() {
           }
           return;
         }
+        if (prompt.abilityId === 'temporal_rewind' || prompt.abilityId === 'chrono_recall') {
+          const piece = board[row][col];
+          if (!piece) return;
+          const tk = state.pieces.find((p) => p.id === prompt.pieceId);
+          if (!tk) return;
+          const dr = Math.sign(row - tk.pos.row);
+          const dc = Math.sign(col - tk.pos.col);
+          const aligned =
+            (dr === 0 || dc === 0 || Math.abs(row - tk.pos.row) === Math.abs(col - tk.pos.col)) &&
+            !(dr === 0 && dc === 0);
+          if (!aligned) {
+            setStatus('Target must be in a straight line from the TimeKeeper');
+            return;
+          }
+          const label = prompt.abilityId === 'temporal_rewind' ? 'Rewind' : 'Chrono Recall';
+          const name = pieceMeta(catalog, piece.defId)?.name ?? piece.defId;
+          const summary = `${label} ${name}?`;
+          setSpellConfirm({ summary, mode: 'resolve_prompt', payload: piece.id });
+          setStatus(summary);
+          clearBoardConfirm();
+          return;
+        }
         if (prompt.abilityId === 'barrier_shift') {
           const selected = prompt.selected ?? [];
           const from = selected[0] as Coord | undefined;
@@ -1288,6 +1317,8 @@ export default function App() {
                   ? 'Death Stare'
                   : move.special === 'archer_shot'
                     ? 'Archer volley'
+                    : move.special === 'giga_stomp'
+                      ? 'Giga Stomp'
                     : move.special === 'castle_swap'
                     ? 'Castle'
                     : move.special === 'portal_travel'
@@ -2183,8 +2214,12 @@ export default function App() {
                           )}
                           {(() => {
                             const statuses = visibleBoardEffects(piece.effects ?? []);
-                            if (piece.bloodlust) {
-                              statuses.unshift({ id: 'bloodlust', kind: 'bloodlust' });
+                            if ((piece.bloodlustTurnsRemaining ?? 0) > 0) {
+                              statuses.unshift({
+                                id: 'bloodlust',
+                                kind: 'bloodlust',
+                                turnsRemaining: piece.bloodlustTurnsRemaining,
+                              });
                             }
                             if (!statuses.length) return null;
                             const shown = statuses.slice(0, 3);
@@ -2500,9 +2535,13 @@ export default function App() {
                     gamblerStyleDefId: inspectedPiece.gamblerStyleDefId,
                     ritualTurns: inspectedPiece.ritualTurns,
                     gadgetUsed: inspectedPiece.gadgetUsed,
+                    gigaStompUsed: inspectedPiece.gigaStompUsed,
                     abilityCooldown: inspectedPiece.abilityCooldown,
                     magicBegoneUsed: inspectedPiece.magicBegoneUsed,
-                    bloodlust: inspectedPiece.bloodlust,
+                    timekeeperCycleUsed: inspectedPiece.timekeeperCycleUsed,
+                    timekeeperRewindUsed: inspectedPiece.timekeeperRewindUsed,
+                    timekeeperRecallUsed: inspectedPiece.timekeeperRecallUsed,
+                    bloodlustTurnsRemaining: inspectedPiece.bloodlustTurnsRemaining,
                     identityLootDefId: inspectedPiece.identityLootDefId,
                     copiedMoveDefId: inspectedPiece.copiedMoveDefId,
                     coOccupantId: inspectedPiece.coOccupantId,
@@ -2807,9 +2846,13 @@ function PieceInfoBody({
     gamblerStyleDefId?: string;
     ritualTurns?: number;
     gadgetUsed?: boolean;
+    gigaStompUsed?: boolean;
     abilityCooldown?: number;
     magicBegoneUsed?: number;
-    bloodlust?: boolean;
+    timekeeperCycleUsed?: boolean;
+    timekeeperRewindUsed?: boolean;
+    timekeeperRecallUsed?: boolean;
+    bloodlustTurnsRemaining?: number;
     identityLootDefId?: string;
     copiedMoveDefId?: string;
     coOccupantId?: string;
@@ -2911,13 +2954,19 @@ function PieceInfoBody({
           )}
           {live.ritualTurns != null && live.ritualTurns > 0 && <span>Ritual: {live.ritualTurns}</span>}
           {live.gadgetUsed && <span>Gadget used</span>}
+          {live.gigaStompUsed && <span>Giga Stomp used</span>}
           {live.magicBegoneUsed != null && live.magicBegoneUsed > 0 && (
             <span>Magic Be-gone: {live.magicBegoneUsed}/2 used</span>
           )}
           {live.abilityCooldown != null && live.abilityCooldown > 0 && (
             <span>Cooldown: {live.abilityCooldown}</span>
           )}
-          {live.bloodlust && <span>Bloodlust</span>}
+          {live.bloodlustTurnsRemaining != null && live.bloodlustTurnsRemaining > 0 && (
+            <span>Bloodlust ({live.bloodlustTurnsRemaining})</span>
+          )}
+          {live.timekeeperCycleUsed && <span>Temporal Shift used</span>}
+          {live.timekeeperRewindUsed && <span>Rewind used</span>}
+          {live.timekeeperRecallUsed && <span>Chrono Recall used</span>}
           {live.copiedMoveDefId && <span>Moves as {live.copiedMoveDefId}</span>}
           {!live.copiedMoveDefId && live.identityLootDefId && (
             <span>Stored identity: {live.identityLootDefId}</span>
@@ -2951,9 +3000,13 @@ function PieceInfoTile({
     gamblerStyleDefId?: string;
     ritualTurns?: number;
     gadgetUsed?: boolean;
+    gigaStompUsed?: boolean;
     abilityCooldown?: number;
     magicBegoneUsed?: number;
-    bloodlust?: boolean;
+    timekeeperCycleUsed?: boolean;
+    timekeeperRewindUsed?: boolean;
+    timekeeperRecallUsed?: boolean;
+    bloodlustTurnsRemaining?: number;
     identityLootDefId?: string;
     copiedMoveDefId?: string;
     coOccupantId?: string;
@@ -3342,6 +3395,29 @@ function PlayPromptBanners({
 
       {state.pendingPrompt?.type === 'ability_target' &&
         state.pendingPrompt.color === you &&
+        state.pendingPrompt.abilityId === 'temporal_shift' && (
+          <div className="banner">
+            Temporal Shift:
+            <span className="prompt-actions">
+              <button type="button" onClick={() => send({ type: 'resolve_prompt', payload: 'skip' })}>
+                Skip phase ({state.dayNight === 'day' ? 'Day → Night' : 'Night → Day'})
+              </button>
+              <button
+                type="button"
+                disabled={!state.previousDayNight}
+                onClick={() => send({ type: 'resolve_prompt', payload: 'revert' })}
+              >
+                Revert last change
+              </button>
+              <button type="button" onClick={cancelAbility}>
+                Cancel
+              </button>
+            </span>
+          </div>
+        )}
+
+      {state.pendingPrompt?.type === 'ability_target' &&
+        state.pendingPrompt.color === you &&
         state.pendingPrompt.abilityId === 'revive' && (
           <div className="banner">
             Revive from graveyard:
@@ -3366,7 +3442,8 @@ function PlayPromptBanners({
 
       {state.pendingPrompt?.type === 'ability_target' &&
         state.pendingPrompt.color === you &&
-        state.pendingPrompt.abilityId !== 'revive' && (
+        state.pendingPrompt.abilityId !== 'revive' &&
+        state.pendingPrompt.abilityId !== 'temporal_shift' && (
           <div className="banner">
             {state.pendingPrompt.message}
             <span className="prompt-actions">
