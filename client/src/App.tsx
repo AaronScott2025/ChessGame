@@ -336,6 +336,12 @@ function sanitizeMoves(piece: Piece | undefined, opts: MoveOption[]): MoveOption
   );
 }
 
+/** Giga Stomp is opt-in. Until it is armed, those squares must not replace movement. */
+function movesForBoard(opts: MoveOption[], focusSpecial: string | null): MoveOption[] {
+  if (focusSpecial === 'giga_stomp') return opts.filter((m) => m.special === 'giga_stomp');
+  return opts.filter((m) => m.special !== 'giga_stomp');
+}
+
 function buildLocalCatalog(): Catalog {
   return {
     pieces: Object.values(PIECES).map((p) => ({
@@ -821,8 +827,6 @@ export default function App() {
         setStatus('Death Stare ready — click an enemy in range, then Confirm');
       } else if (specials.has('archer_shot')) {
         setStatus('Archer volley ready — click an enemy on an L, then Confirm');
-      } else if (specials.has('giga_stomp')) {
-        setStatus('Giga Stomp ready — click a square up to 3 tiles away in any direction, then Confirm');
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1123,6 +1127,8 @@ export default function App() {
     clearBoardConfirm();
   };
 
+  const selectableMoves = movesForBoard(moves, focusSpecial);
+
   const onSquareClick = (row: number, col: number) => {
     if (!state || !you) return;
     if (state.pendingPrompt?.type === 'discard_to_draw') return;
@@ -1313,8 +1319,8 @@ export default function App() {
       }
     }
 
-    if (selectedPiece && moves.some((m) => m.to.row === row && m.to.col === col)) {
-      const candidates = moves.filter((m) => m.to.row === row && m.to.col === col);
+    if (selectedPiece && selectableMoves.some((m) => m.to.row === row && m.to.col === col)) {
+      const candidates = selectableMoves.filter((m) => m.to.row === row && m.to.col === col);
       if (candidates.length) {
         const move =
           focusSpecial != null
@@ -2016,7 +2022,7 @@ export default function App() {
                   const piece = board[row][col];
                   const dark = (row + col) % 2 === 1;
                   const selected = piece && piece.id === selectedPiece;
-                  const moveOpts = moves.filter((m) => m.to.row === row && m.to.col === col);
+                  const moveOpts = selectableMoves.filter((m) => m.to.row === row && m.to.col === col);
                   const moveHere = moveOpts.length > 0;
                   const specialHere = moveOpts.some((m) => Boolean(m.special));
                   const captureHere = moveOpts.some((m) => m.capture || Boolean(m.special));

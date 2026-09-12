@@ -557,7 +557,10 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
     );
   });
 
-  if (options?.forAttack) return moves;
+  // Giga Stomp does not attack (the King is immune, and the Yeti does not move).
+  // Counting those squares as attacks puts the king in a false check and can
+  // leave Giga Stomp as the Yeti's only legal action.
+  if (options?.forAttack) return moves.filter((m) => m.special !== 'giga_stomp');
 
   // Filter moves that leave own king in check
   return moves.filter((m) => {
@@ -772,7 +775,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       name: 'Giga Stomp',
       ready: !piece.gigaStompUsed,
       passive: true,
-      hint: 'Once per game: stomp 3 tiles in any direction — removes all allies and enemies in line (King immune). Yeti does not move.',
+      hint: 'Click to arm, then a square up to 3 tiles away. Clears allies and enemies in that line (King immune). The Yeti does not move.',
     });
   }
   if (piece.defId === 'snake') {
