@@ -11,6 +11,7 @@
  * - sfxPiece   → board square / piece interactions
  * - sfxCardCast→ successfully casting a spell card
  * - sfxChecked → loops while you were recently put in check (next 3 of your turns)
+ * - sfxCheckDealt → loops while you recently put the opponent in check (next 3 of your turns)
  * Draw / discard / day-night SFX are procedural (Web Audio) and need no files.
  */
 
@@ -24,6 +25,7 @@ export const AUDIO_FILES = {
   sfxPiece: '/audio/sfx-piece.mp3',
   sfxCardCast: '/audio/sfx-card-cast.mp3',
   sfxChecked: '/audio/checked.mp3',
+  sfxCheckDealt: '/audio/check.mp3',
 } as const;
 
 export type MusicScene = 'menu' | 'game' | 'none';
@@ -96,6 +98,8 @@ type AudioEngine = {
   game: HTMLAudioElement | null;
   checked: HTMLAudioElement | null;
   checkedTurnsLeft: number;
+  checking: HTMLAudioElement | null;
+  checkingTurnsLeft: number;
 };
 
 const engine: AudioEngine = {
@@ -108,6 +112,8 @@ const engine: AudioEngine = {
   game: null,
   checked: null,
   checkedTurnsLeft: 0,
+  checking: null,
+  checkingTurnsLeft: 0,
 };
 
 const CHECKED_VOLUME_SCALE = 1;
@@ -117,6 +123,14 @@ function ensureCheckedTrack() {
     engine.checked = new Audio(AUDIO_FILES.sfxChecked);
     engine.checked.loop = true;
     engine.checked.preload = 'auto';
+  }
+}
+
+function ensureCheckingTrack() {
+  if (!engine.checking) {
+    engine.checking = new Audio(AUDIO_FILES.sfxCheckDealt);
+    engine.checking.loop = true;
+    engine.checking.preload = 'auto';
   }
 }
 
@@ -130,11 +144,35 @@ function checkedThemeWanted() {
   );
 }
 
+function checkingThemeWanted() {
+  return (
+    engine.checkingTurnsLeft > 0 &&
+    !checkedThemeWanted() &&
+    engine.musicEnabled &&
+    engine.unlocked &&
+    engine.musicVolume > 0 &&
+    engine.scene === 'game'
+  );
+}
+
 function applyMusicVolume() {
   const vol = engine.musicVolume;
   if (engine.menu) engine.menu.volume = vol;
   if (engine.game) engine.game.volume = vol;
   if (engine.checked) engine.checked.volume = vol * CHECKED_VOLUME_SCALE;
+  if (engine.checking) engine.checking.volume = vol * CHECKED_VOLUME_SCALE;
+}
+
+function pauseCheckedAudio() {
+  if (!engine.checked) return;
+  engine.checked.pause();
+  engine.checked.currentTime = 0;
+}
+
+function pauseCheckingAudio() {
+  if (!engine.checking) return;
+  engine.checking.pause();
+  engine.checking.currentTime = 0;
 }
 
 function syncCheckedTrack() {
@@ -149,9 +187,32 @@ function syncCheckedTrack() {
   if (a.paused) safePlay(a);
 }
 
-/** Start or refresh the check theme: 3 of your turns. Does not restart if already playing. */
+function syncCheckingTrack() {
+  ensureCheckingTrack();
+  applyMusicVolume();
+  const a = engine.checking;
+  if (!a) return;
+  if (!checkingThemeWanted()) {
+    a.pause();
+    return;
+  }
+  if (a.paused) safePlay(a);
+}
+
+/** Start or refresh the "you are in check" theme: 3 of your turns. */
 export function beginCheckedTrack() {
   engine.checkedTurnsLeft = 3;
+  engine.checkingTurnsLeft = 0;
+  pauseCheckingAudio();
+  unlockAudio();
+  syncMusic();
+}
+
+/** Start or refresh the "you put them in check" theme: 3 of your turns. */
+export function beginCheckingTrack() {
+  engine.checkingTurnsLeft = 3;
+  engine.checkedTurnsLeft = 0;
+  pauseCheckedAudio();
   unlockAudio();
   syncMusic();
 }
@@ -164,12 +225,23 @@ export function tickCheckedPlayerTurn(): number {
   return engine.checkedTurnsLeft;
 }
 
+/** Call after the player who delivered check finishes a turn. Returns remaining turns. */
+export function tickCheckingPlayerTurn(): number {
+  if (engine.checkingTurnsLeft <= 0) return 0;
+  engine.checkingTurnsLeft -= 1;
+  if (engine.checkingTurnsLeft <= 0) stopCheckingTrack();
+  return engine.checkingTurnsLeft;
+}
+
 export function stopCheckedTrack() {
   engine.checkedTurnsLeft = 0;
-  if (engine.checked) {
-    engine.checked.pause();
-    engine.checked.currentTime = 0;
-  }
+  pauseCheckedAudio();
+  if (engine.scene === 'game') syncMusic();
+}
+
+export function stopCheckingTrack() {
+  engine.checkingTurnsLeft = 0;
+  pauseCheckingAudio();
   if (engine.scene === 'game') syncMusic();
 }
 
@@ -209,21 +281,32 @@ function syncMusic() {
     pauseTrack(engine.menu);
     pauseTrack(engine.game);
     syncCheckedTrack();
+    syncCheckingTrack();
     return;
   }
   if (checkedThemeWanted()) {
     pauseTrack(engine.menu);
     pauseTrack(engine.game);
+    pauseCheckingAudio();
     syncCheckedTrack();
+    return;
+  }
+  if (checkingThemeWanted()) {
+    pauseTrack(engine.menu);
+    pauseTrack(engine.game);
+    pauseCheckedAudio();
+    syncCheckingTrack();
     return;
   }
   if (engine.scene === 'menu') {
     pauseTrack(engine.game);
-    pauseTrack(engine.checked);
+    pauseCheckedAudio();
+    pauseCheckingAudio();
     safePlay(engine.menu);
   } else if (engine.scene === 'game') {
     pauseTrack(engine.menu);
-    pauseTrack(engine.checked);
+    pauseCheckedAudio();
+    pauseCheckingAudio();
     safePlay(engine.game);
   }
 }
@@ -257,13 +340,17 @@ function setMusicVolume(volume: number) {
     pauseTrack(engine.menu);
     pauseTrack(engine.game);
     syncCheckedTrack();
+    syncCheckingTrack();
   }
 }
 
 export function setMusicScene(scene: MusicScene) {
   engine.scene = scene;
   syncMusic();
-  if (scene !== 'game') stopCheckedTrack();
+  if (scene !== 'game') {
+    stopCheckedTrack();
+    stopCheckingTrack();
+  }
 }
 
 export function playSfx(id: SfxId) {
@@ -583,6 +670,40 @@ export function playCheckSfx() {
   playTone(ctx, master, { type: 'square', freq: 980, endFreq: 140, start: t + 0.02, dur: 0.12, peak: 0.12 });
   // Tiny metallic ping
   playTone(ctx, master, { type: 'square', freq: 2480, endFreq: 1760, start: t + 0.04, dur: 0.06, peak: 0.09 });
+}
+
+/** Rising fanfare when you put the opponent in check — the reverse of the slash. */
+export function playCheckDealtSfx() {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const master = ctx.createGain();
+  master.gain.value = 1;
+  master.connect(ctx.destination);
+
+  const noise = ctx.createBufferSource();
+  noise.buffer = noiseBuffer(ctx, 0.28);
+  const hipass = ctx.createBiquadFilter();
+  hipass.type = 'highpass';
+  hipass.frequency.setValueAtTime(380, t);
+  hipass.frequency.exponentialRampToValueAtTime(3200, t + 0.2);
+  hipass.Q.value = 0.6;
+  const nGain = ctx.createGain();
+  nGain.gain.setValueAtTime(0.0001, t);
+  nGain.gain.linearRampToValueAtTime(0.22, t + 0.04);
+  nGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+  noise.connect(hipass);
+  hipass.connect(nGain);
+  nGain.connect(master);
+  noise.start(t);
+  noise.stop(t + 0.28);
+
+  playTone(ctx, master, { type: 'square', freq: 330, endFreq: 660, start: t, dur: 0.1, peak: 0.14 });
+  playTone(ctx, master, { type: 'square', freq: 523, endFreq: 1046, start: t + 0.08, dur: 0.12, peak: 0.13 });
+  playTone(ctx, master, { type: 'triangle', freq: 784, endFreq: 1568, start: t + 0.16, dur: 0.16, peak: 0.11 });
+  playTone(ctx, master, { type: 'sine', freq: 1318, endFreq: 1760, start: t + 0.22, dur: 0.18, peak: 0.08 });
 }
 
 /** Cool descending wash as day becomes night. */

@@ -21,9 +21,13 @@ import {
   playCardDrawSfx,
   playCaptureSfx,
   playCheckSfx,
+  playCheckDealtSfx,
   beginCheckedTrack,
+  beginCheckingTrack,
   tickCheckedPlayerTurn,
+  tickCheckingPlayerTurn,
   stopCheckedTrack,
+  stopCheckingTrack,
   playDayToNightSfx,
   playDraftOrderSfx,
   playDraftPickSfx,
@@ -380,6 +384,7 @@ export default function App() {
     useAudioSettings();
   useUiButtonSfx();
   const [rulesOpen, setRulesOpen] = useState(false);
+  const [mobileSheet, setMobileSheet] = useState<null | 'table' | 'info' | 'more'>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [name, setName] = useState('');
   const [joinCode, setJoinCode] = useState('');
@@ -425,7 +430,8 @@ export default function App() {
   const lastCheckRef = useRef<Color | null | 'unset'>('unset');
   const lastTurnForCheckThemeRef = useRef<Color | null>(null);
   const checkedThemeColorRef = useRef<Color | null>(null);
-  const [checkAlert, setCheckAlert] = useState(false);
+  const checkingThemeColorRef = useRef<Color | null>(null);
+  const [checkAlert, setCheckAlert] = useState<null | 'received' | 'dealt'>(null);
   const [moveAnim, setMoveAnim] = useState<{
     key: string;
     pieceId: string;
@@ -618,6 +624,8 @@ export default function App() {
       lastHandIdsRef.current = handIds;
       lastCheckRef.current = state.check;
       lastTurnForCheckThemeRef.current = state.turn;
+      checkedThemeColorRef.current = null;
+      checkingThemeColorRef.current = null;
       return;
     }
 
@@ -628,12 +636,21 @@ export default function App() {
     }
 
     const prevCheck = lastCheckRef.current;
+    const opponent: Color | null = you === 'white' ? 'black' : you === 'black' ? 'white' : null;
     if (prevCheck !== 'unset' && state.check === you && prevCheck !== you) {
       playCheckSfx();
       beginCheckedTrack();
       checkedThemeColorRef.current = you;
-      setCheckAlert(true);
+      checkingThemeColorRef.current = null;
+      setCheckAlert('received');
       setStatus('Check! Your king is under attack.');
+    } else if (prevCheck !== 'unset' && opponent && state.check === opponent && prevCheck !== opponent) {
+      playCheckDealtSfx();
+      beginCheckingTrack();
+      checkingThemeColorRef.current = you;
+      checkedThemeColorRef.current = null;
+      setCheckAlert('dealt');
+      setStatus('Check! Their king is under attack.');
     }
     lastCheckRef.current = state.check;
 
@@ -642,11 +659,17 @@ export default function App() {
     if (themeColor && prevTurn === themeColor && state.turn !== themeColor) {
       if (tickCheckedPlayerTurn() <= 0) checkedThemeColorRef.current = null;
     }
+    const dealtBy = checkingThemeColorRef.current;
+    if (dealtBy && prevTurn === dealtBy && state.turn !== dealtBy) {
+      if (tickCheckingPlayerTurn() <= 0) checkingThemeColorRef.current = null;
+    }
     lastTurnForCheckThemeRef.current = state.turn;
 
     if (state.phase !== 'playing') {
       stopCheckedTrack();
+      stopCheckingTrack();
       checkedThemeColorRef.current = null;
+      checkingThemeColorRef.current = null;
     }
 
     if (head && head !== lastHistorySfxRef.current) {
@@ -688,7 +711,7 @@ export default function App() {
 
   useEffect(() => {
     if (!checkAlert) return;
-    const t = window.setTimeout(() => setCheckAlert(false), 2400);
+    const t = window.setTimeout(() => setCheckAlert(null), 2400);
     return () => window.clearTimeout(t);
   }, [checkAlert]);
 
@@ -1615,7 +1638,15 @@ export default function App() {
       : null;
 
   return (
-    <div className="shell">
+    <div
+      className={[
+        'shell',
+        showBoardKnowledge ? 'is-play' : '',
+        mobileSheet ? `sheet-${mobileSheet}` : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+    >
       <CosmicBackdrop enabled={fxEnabled} dayNight={state.dayNight} />
       {ceremony && (
         <MatchCeremony
@@ -1655,18 +1686,24 @@ export default function App() {
       )}
       <TurnStrip state={state} you={you} localMode={localMode} />
       {checkAlert && (
-        <div className="check-alert" role="alert" aria-live="assertive">
+        <div
+          className={`check-alert${checkAlert === 'dealt' ? ' is-dealt' : ''}`}
+          role="alert"
+          aria-live="assertive"
+        >
           <button
             type="button"
             className="msg-dismiss"
             aria-label="Dismiss check alert"
-            onClick={() => setCheckAlert(false)}
+            onClick={() => setCheckAlert(null)}
           >
             ×
           </button>
           <span className="check-alert-mark" aria-hidden />
           <span className="check-alert-title">Check!</span>
-          <span className="check-alert-sub">Your king is under attack</span>
+          <span className="check-alert-sub">
+            {checkAlert === 'dealt' ? 'Their king is under attack' : 'Your king is under attack'}
+          </span>
         </div>
       )}
       {(overlayPeek || messagesHidden) &&
@@ -2011,7 +2048,8 @@ export default function App() {
                 flip ? 'flipped' : '',
                 state.phase === 'playing' ? (state.turn === you ? 'board-your-turn' : 'board-their-turn') : '',
                 state.phase === 'playing' && state.check === you ? 'board-in-check' : '',
-                checkAlert ? 'board-check-flash' : '',
+                checkAlert === 'received' ? 'board-check-flash' : '',
+                checkAlert === 'dealt' ? 'board-check-dealt-flash' : '',
               ]
                 .filter(Boolean)
                 .join(' ')}
@@ -2625,6 +2663,86 @@ export default function App() {
         />
       )}
       {audioFxStack}
+      <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
+      {showBoardKnowledge && (
+        <>
+          {mobileSheet && (
+            <button
+              type="button"
+              className="mobile-sheet-backdrop"
+              aria-label="Close panel"
+              onClick={() => setMobileSheet(null)}
+            />
+          )}
+          {mobileSheet === 'more' && (
+            <section className="mobile-sheet mobile-more" aria-label="Game menu">
+              <div className="mobile-sheet-head">
+                <p>Menu</p>
+                <button type="button" onClick={() => setMobileSheet(null)} aria-label="Close menu">
+                  ×
+                </button>
+              </div>
+              <p className="mobile-more-meta">
+                {localMode ? 'Local play' : `Room ${roomCode}`}
+                {you ? ` · You are ${you}` : ''}
+                {` · ${state.dayNight === 'day' ? 'Day' : 'Night'} · cycle ${state.cycleCount}`}
+              </p>
+              <div className="mobile-more-controls">
+                <AudioToggles
+                  musicEnabled={musicEnabled}
+                  sfxEnabled={sfxEnabled}
+                  musicVolume={musicVolume}
+                  onToggleMusic={() => setMusicEnabled((v: boolean) => !v)}
+                  onToggleSfx={() => setSfxEnabled((v: boolean) => !v)}
+                  onMusicVolume={(v) => setMusicVolume(v)}
+                />
+                <FxToggle enabled={fxEnabled} onToggle={() => setFxEnabled((v) => !v)} />
+                <KnowledgeToggle
+                  enabled={knowledgeEnabled}
+                  onToggle={() => setKnowledgeEnabled((v) => !v)}
+                />
+              </div>
+              <div className="mobile-more-actions">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileSheet(null);
+                    setRulesOpen(true);
+                  }}
+                >
+                  Rules
+                </button>
+                <button type="button" className="danger" onClick={exitToHome}>
+                  {localMode ? 'Exit local' : 'Leave game'}
+                </button>
+              </div>
+            </section>
+          )}
+          <nav className="mobile-nav" aria-label="Game panels">
+            <button
+              type="button"
+              className={mobileSheet === 'table' ? 'active' : ''}
+              onClick={() => setMobileSheet((cur) => (cur === 'table' ? null : 'table'))}
+            >
+              Fallen
+            </button>
+            <button
+              type="button"
+              className={mobileSheet === 'info' ? 'active' : ''}
+              onClick={() => setMobileSheet((cur) => (cur === 'info' ? null : 'info'))}
+            >
+              Info{inspectedId ? ' ●' : ''}
+            </button>
+            <button
+              type="button"
+              className={mobileSheet === 'more' ? 'active' : ''}
+              onClick={() => setMobileSheet((cur) => (cur === 'more' ? null : 'more'))}
+            >
+              Menu
+            </button>
+          </nav>
+        </>
+      )}
     </div>
   );
 }
@@ -2727,6 +2845,9 @@ function TurnStrip({
       >
         <span className="turn-strip-title">{mode === 'yours' ? title : 'Your turn'}</span>
         <span className="turn-strip-detail">{mode === 'yours' ? yoursDetail || '\u00a0' : '\u00a0'}</span>
+        <span className={`turn-strip-cycle chip-${state.dayNight}`}>
+          {state.dayNight === 'day' ? 'Day' : 'Night'}
+        </span>
       </div>
       <div
         className={`turn-strip-layer ${mode === 'waiting' ? 'is-on' : ''}`}
