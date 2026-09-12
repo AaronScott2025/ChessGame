@@ -379,6 +379,251 @@ html.fx-off .waiting-opponent-dot {
   }
 }
 
+.reset-fx-sfx.is-portaled {
+  position: fixed;
+  z-index: 220;
+  right: max(0.75rem, env(safe-area-inset-right, 0px));
+  bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+}
+
+@media (max-width: 820px) {
+  .reset-fx-sfx.is-portaled {
+    bottom: calc(4.4rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+.result-ceremony {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  padding: max(1rem, env(safe-area-inset-top, 0px)) 1rem max(1.25rem, env(safe-area-inset-bottom, 0px));
+  overflow: hidden;
+}
+
+.result-ceremony.is-victory {
+  background:
+    radial-gradient(circle at 50% 40%, rgba(240, 199, 94, 0.32), rgba(18, 12, 8, 0.78) 46%, rgba(6, 4, 12, 0.94));
+}
+
+.result-ceremony.is-loss {
+  background:
+    radial-gradient(circle at 50% 38%, rgba(120, 18, 32, 0.42), rgba(8, 4, 8, 0.88) 52%, rgba(4, 2, 6, 0.96));
+}
+
+.result-rays {
+  position: absolute;
+  width: 150vmax;
+  height: 150vmax;
+  left: 50%;
+  top: 40%;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.result-ceremony.is-victory .result-rays {
+  background: repeating-conic-gradient(
+    from 0deg,
+    rgba(240, 199, 94, 0.22) 0 7deg,
+    transparent 7deg 22deg
+  );
+  animation: result-spin 16s linear infinite;
+}
+
+.result-ceremony.is-loss .result-rays {
+  background: repeating-conic-gradient(
+    from 0deg,
+    rgba(160, 36, 48, 0.16) 0 5deg,
+    transparent 5deg 20deg
+  );
+  opacity: 0.75;
+  animation: result-spin 28s linear infinite reverse;
+}
+
+.result-particles {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.result-ceremony.is-victory .result-particles span {
+  position: absolute;
+  left: 50%;
+  top: 42%;
+  width: 7px;
+  height: 7px;
+  margin: -3px;
+  border-radius: 50%;
+  background: #f6d98a;
+  box-shadow: 0 0 10px rgba(240, 199, 94, 0.85);
+  animation: result-burst 1.7s ease-out infinite;
+  animation-delay: calc(var(--i) * 0.09s);
+}
+
+.result-ceremony.is-loss .result-particles span {
+  position: absolute;
+  top: -12%;
+  left: calc(4% + var(--i) * 7.6%);
+  width: 6px;
+  height: 16px;
+  border-radius: 1px;
+  background: linear-gradient(#e8c4c8, #6a2030);
+  opacity: 0;
+  animation: result-fall 2.6s linear infinite;
+  animation-delay: calc(var(--i) * -0.2s);
+}
+
+.result-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  text-align: center;
+  max-width: min(28rem, 100%);
+  padding: 1.5rem 1.6rem 1.35rem;
+  border-radius: 18px;
+  background: linear-gradient(165deg, rgba(22, 16, 36, 0.92), rgba(10, 8, 16, 0.94));
+  animation: ceremony-card-in 560ms cubic-bezier(0.16, 0.84, 0.32, 1) both;
+}
+
+.result-ceremony.is-victory .result-card {
+  border: 1px solid rgba(240, 199, 94, 0.55);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45), 0 0 36px rgba(240, 199, 94, 0.22);
+}
+
+.result-ceremony.is-loss .result-card {
+  border: 1px solid rgba(160, 48, 60, 0.55);
+  box-shadow: 0 22px 50px rgba(0, 0, 0, 0.55);
+  animation: result-card-sink 700ms ease both;
+}
+
+.result-kicker {
+  margin: 0;
+  font-size: 0.78rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--day);
+}
+
+.result-ceremony.is-loss .result-kicker {
+  color: #c98a92;
+}
+
+.result-title {
+  margin: 0;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: clamp(3rem, 12vw, 5.2rem);
+  line-height: 0.95;
+  letter-spacing: 0.04em;
+}
+
+.result-ceremony.is-victory .result-title {
+  color: #f0c75e;
+  text-shadow: 0 0 28px rgba(240, 199, 94, 0.7);
+  animation: ceremony-stamp 720ms cubic-bezier(0.16, 0.84, 0.32, 1) both;
+}
+
+.result-ceremony.is-loss .result-title {
+  color: #f0d6d8;
+  text-shadow: 0 10px 24px rgba(0, 0, 0, 0.7);
+  animation: result-defeat 880ms ease both;
+}
+
+.result-sub {
+  margin: 0.35rem 0 0.7rem;
+  color: var(--ink-dim);
+}
+
+.result-continue {
+  min-height: 2.7rem;
+  padding: 0.45rem 1.4rem;
+  border-radius: 999px;
+  border: 1px solid rgba(240, 199, 94, 0.55);
+  background: rgba(240, 199, 94, 0.16);
+  color: #f6e7b2;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.result-ceremony.is-loss .result-continue {
+  border-color: rgba(201, 138, 146, 0.5);
+  background: rgba(120, 28, 40, 0.28);
+  color: #f0d6d8;
+}
+
+@keyframes result-spin {
+  to {
+    transform: translate(-50%, -50%) rotate(360deg);
+  }
+}
+
+@keyframes result-burst {
+  0% {
+    transform: rotate(calc(var(--i) * 30deg)) translateY(0);
+    opacity: 0;
+  }
+  18% {
+    opacity: 1;
+  }
+  100% {
+    transform: rotate(calc(var(--i) * 30deg)) translateY(-36vh);
+    opacity: 0;
+  }
+}
+
+@keyframes result-fall {
+  0% {
+    transform: translateY(-8vh) rotate(0deg);
+    opacity: 0;
+  }
+  14% {
+    opacity: 0.85;
+  }
+  100% {
+    transform: translateY(112vh) rotate(210deg);
+    opacity: 0.15;
+  }
+}
+
+@keyframes result-defeat {
+  0% {
+    opacity: 0;
+    transform: translateY(-16px) scale(1.06);
+    filter: blur(2px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(6px) scale(1);
+    filter: none;
+  }
+}
+
+@keyframes result-card-sink {
+  0% {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+html.fx-off .result-rays,
+html.fx-off .result-title,
+html.fx-off .result-card {
+  animation: none;
+}
+
+html.fx-off .result-particles {
+  display: none;
+}
+
 .lobby-shell {
   padding: 0;
 }
@@ -805,7 +1050,8 @@ html.fx-off .home-rules {
 
 .corner-toggles-right .fx-toggle,
 .corner-toggles-right .audio-toggle,
-.corner-toggles-right .music-volume {
+.corner-toggles-right .music-volume,
+.corner-toggles-right .reset-fx-sfx {
   position: static;
 }
 
@@ -3962,6 +4208,11 @@ html.fx-off .turn-pill-check.is-you {
   .match-vs-name,
   .match-vs-mark,
   .match-order-title,
+  .result-ceremony,
+  .result-rays,
+  .result-particles span,
+  .result-card,
+  .result-title,
   .waiting-room {
     animation: none !important;
   }
@@ -5041,6 +5292,7 @@ html.fx-off .turn-pill-check.is-you {
   .mobile-more-controls .fx-toggle,
   .mobile-more-controls .knowledge-toggle,
   .mobile-more-controls .audio-toggle,
+  .mobile-more-controls .reset-fx-sfx,
   .mobile-more-controls .music-volume {
     position: static;
     display: inline-flex;

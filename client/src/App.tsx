@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import { io, Socket } from 'socket.io-client';
 import { listMoves as engineListMoves, availableAbilities as engineAbilities } from '@shared/engine/game.ts';
 import {
@@ -28,6 +29,8 @@ import {
   tickCheckingPlayerTurn,
   stopCheckedTrack,
   stopCheckingTrack,
+  playResultTrack,
+  stopResultTrack,
   playDayToNightSfx,
   playDraftOrderSfx,
   playDraftPickSfx,
@@ -41,6 +44,7 @@ import {
   useAudioScene,
   useAudioSettings,
   useUiButtonSfx,
+  resetStuckAudio,
 } from './AudioControl';
 import { PieceIcon } from './PieceIcon';
 import { getPieceInfo } from './pieceInfo';
@@ -431,7 +435,13 @@ export default function App() {
   const lastTurnForCheckThemeRef = useRef<Color | null>(null);
   const checkedThemeColorRef = useRef<Color | null>(null);
   const checkingThemeColorRef = useRef<Color | null>(null);
+  const resultShownKeyRef = useRef<string | null>(null);
   const [checkAlert, setCheckAlert] = useState<null | 'received' | 'dealt'>(null);
+  const [resultShow, setResultShow] = useState<null | {
+    kind: 'victory' | 'loss';
+    winnerName: string;
+    reason: string;
+  }>(null);
   const [moveAnim, setMoveAnim] = useState<{
     key: string;
     pieceId: string;
@@ -710,6 +720,24 @@ export default function App() {
   }, [state, you]);
 
   useEffect(() => {
+    if (!state?.winner || state.phase !== 'ended' || !you) {
+      if (resultShownKeyRef.current) {
+        resultShownKeyRef.current = null;
+        stopResultTrack();
+        setResultShow(null);
+      }
+      return;
+    }
+    const key = `${state.winner}:${state.winReason ?? ''}`;
+    if (resultShownKeyRef.current === key) return;
+    resultShownKeyRef.current = key;
+    const kind = state.winner === you ? 'victory' : 'loss';
+    const winnerName = state.players[state.winner]?.name || (state.winner === 'white' ? 'White' : 'Black');
+    setResultShow({ kind, winnerName, reason: state.winReason ?? '' });
+    playResultTrack(kind);
+  }, [state?.phase, state?.winner, state?.winReason, state, you]);
+
+  useEffect(() => {
     if (!checkAlert) return;
     const t = window.setTimeout(() => setCheckAlert(null), 2400);
     return () => window.clearTimeout(t);
@@ -803,8 +831,17 @@ export default function App() {
     if (!state || !you) return;
     if (localMode) {
       try {
-        const next = applyClientAction(state as never, you, action as never);
-        applyLocalState(next as GameState, you);
+        const next = applyClientAction(state as never, you, action as never) as GameState;
+        if (next.phase === 'ended' && next.winner) {
+          const seat = localActiveSeat(next);
+          const kind = next.winner === seat ? 'victory' : 'loss';
+          const winnerName =
+            next.players[next.winner]?.name || (next.winner === 'white' ? 'White' : 'Black');
+          resultShownKeyRef.current = `${next.winner}:${next.winReason ?? ''}`;
+          setResultShow({ kind, winnerName, reason: next.winReason ?? '' });
+          playResultTrack(kind);
+        }
+        applyLocalState(next, you);
       } catch (e) {
         setError((e as Error).message);
       }
@@ -812,8 +849,16 @@ export default function App() {
     }
     const snapshot = state;
     try {
-      const next = applyClientAction(snapshot as never, you, action as never);
-      pushGameState(next as GameState, { actingAs: you, viewer: you });
+      const next = applyClientAction(snapshot as never, you, action as never) as GameState;
+      if (next.phase === 'ended' && next.winner) {
+        const kind = next.winner === you ? 'victory' : 'loss';
+        const winnerName =
+          next.players[next.winner]?.name || (next.winner === 'white' ? 'White' : 'Black');
+        resultShownKeyRef.current = `${next.winner}:${next.winReason ?? ''}`;
+        setResultShow({ kind, winnerName, reason: next.winReason ?? '' });
+        playResultTrack(kind);
+      }
+      pushGameState(next, { actingAs: you, viewer: you });
     } catch (e) {
       setError((e as Error).message);
       return;
@@ -821,6 +866,9 @@ export default function App() {
     if (!socket || !roomCode) return;
     socket.emit('action', { code: roomCode, action }, (res: { ok: boolean; error?: string }) => {
       if (!res?.ok) {
+        resultShownKeyRef.current = null;
+        setResultShow(null);
+        stopResultTrack();
         setError(res?.error ?? 'Action failed');
         pushGameState(snapshot, { actingAs: you, viewer: you });
       }
@@ -915,6 +963,8 @@ export default function App() {
     setRoomCode(null);
     setState(null);
     setYou(null);
+    setResultShow(null);
+    resultShownKeyRef.current = null;
     setCatalog(null);
     setDraftOptions([]);
     clearTransientUi();
@@ -1567,6 +1617,17 @@ export default function App() {
         : 'menu';
   useAudioScene(musicScene);
 
+  const [fxEpoch, setFxEpoch] = useState(0);
+
+  const resetFxSfx = () => {
+    setFxEnabled(true);
+    setSfxEnabled(true);
+    setFxEpoch((n) => n + 1);
+    document.documentElement.classList.remove('fx-off');
+    setResultShow(null);
+    resetStuckAudio(musicScene);
+  };
+
   const audioFxStack = (
     <div className="corner-toggles-right">
       <AudioToggles
@@ -1578,13 +1639,28 @@ export default function App() {
         onMusicVolume={(v) => setMusicVolume(v)}
       />
       <FxToggle enabled={fxEnabled} onToggle={() => setFxEnabled((v) => !v)} />
+      {createPortal(
+        <button
+          type="button"
+          className="audio-toggle reset-fx-sfx is-portaled"
+          data-audio="off"
+          title="Stop stuck tracks and restore FX and SFX"
+          onClick={resetFxSfx}
+        >
+          <span className="fx-toggle-glyph" aria-hidden>
+            ↺
+          </span>
+          <span className="fx-toggle-label">Reset FX & SFX</span>
+        </button>,
+        document.body,
+      )}
     </div>
   );
 
   if (!roomCode || !state) {
     return (
       <div className="shell lobby-shell home">
-        <CosmicBackdrop enabled={fxEnabled} dayNight="day" />
+        <CosmicBackdrop key={fxEpoch} enabled={fxEnabled} dayNight="day" />
         <main className="home-hero">
           <p className="brand home-brand">
             Chesspansion <span className="beta-tag" aria-label="Beta">Beta</span>
@@ -1647,7 +1723,7 @@ export default function App() {
         .filter(Boolean)
         .join(' ')}
     >
-      <CosmicBackdrop enabled={fxEnabled} dayNight={state.dayNight} />
+      <CosmicBackdrop key={fxEpoch} enabled={fxEnabled} dayNight={state.dayNight} />
       {ceremony && (
         <MatchCeremony
           key={
@@ -1685,6 +1761,17 @@ export default function App() {
         />
       )}
       <TurnStrip state={state} you={you} localMode={localMode} />
+      {resultShow && (
+        <ResultCeremony
+          kind={resultShow.kind}
+          winnerName={resultShow.winnerName}
+          reason={resultShow.reason}
+          onContinue={() => {
+            stopResultTrack();
+            setResultShow(null);
+          }}
+        />
+      )}
       {checkAlert && (
         <div
           className={`check-alert${checkAlert === 'dealt' ? ' is-dealt' : ''}`}
@@ -2697,6 +2784,18 @@ export default function App() {
                   onMusicVolume={(v) => setMusicVolume(v)}
                 />
                 <FxToggle enabled={fxEnabled} onToggle={() => setFxEnabled((v) => !v)} />
+                <button
+                  type="button"
+                  className="audio-toggle reset-fx-sfx"
+                  data-audio="off"
+                  title="Stop stuck tracks and restore FX and SFX"
+                  onClick={resetFxSfx}
+                >
+                  <span className="fx-toggle-glyph" aria-hidden>
+                    ↺
+                  </span>
+                  <span className="fx-toggle-label">Reset FX & SFX</span>
+                </button>
                 <KnowledgeToggle
                   enabled={knowledgeEnabled}
                   onToggle={() => setKnowledgeEnabled((v) => !v)}
@@ -2766,6 +2865,48 @@ function formatNamedLine(line: string) {
     );
   }
   return line;
+}
+
+function ResultCeremony({
+  kind,
+  winnerName,
+  reason,
+  onContinue,
+}: {
+  kind: 'victory' | 'loss';
+  winnerName: string;
+  reason: string;
+  onContinue: () => void;
+}) {
+  const victory = kind === 'victory';
+  const screen = (
+    <div
+      className={`result-ceremony is-${kind}`}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="result-title"
+    >
+      <div className="result-rays" aria-hidden />
+      <div className="result-particles" aria-hidden>
+        {Array.from({ length: 12 }, (_, i) => (
+          <span key={i} style={{ '--i': i } as CSSProperties} />
+        ))}
+      </div>
+      <div className="result-card">
+        <p className="result-kicker">{victory ? 'The board is yours' : 'The king has fallen'}</p>
+        <h2 id="result-title" className="result-title">
+          {victory ? 'Victory' : 'Defeat'}
+        </h2>
+        <p className="result-sub">
+          {winnerName} wins{reason ? ` · ${reason}` : ''}
+        </p>
+        <button type="button" className="result-continue" onClick={onContinue}>
+          Continue
+        </button>
+      </div>
+    </div>
+  );
+  return createPortal(screen, document.body);
 }
 
 function MatchCeremony({

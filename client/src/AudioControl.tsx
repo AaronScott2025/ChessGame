@@ -12,6 +12,8 @@
  * - sfxCardCast→ successfully casting a spell card
  * - sfxChecked → loops while you were recently put in check (next 3 of your turns)
  * - sfxCheckDealt → loops while you recently put the opponent in check (next 3 of your turns)
+ * - musicVictory → plays once when you win
+ * - musicLoss → plays once when you lose
  * Draw / discard / day-night SFX are procedural (Web Audio) and need no files.
  */
 
@@ -26,6 +28,8 @@ export const AUDIO_FILES = {
   sfxCardCast: '/audio/sfx-card-cast.mp3',
   sfxChecked: '/audio/checked.mp3',
   sfxCheckDealt: '/audio/check.mp3',
+  musicVictory: '/audio/victory.mp3',
+  musicLoss: '/audio/losing.mp3',
 } as const;
 
 export type MusicScene = 'menu' | 'game' | 'none';
@@ -100,6 +104,12 @@ type AudioEngine = {
   checkedTurnsLeft: number;
   checking: HTMLAudioElement | null;
   checkingTurnsLeft: number;
+  result: HTMLAudioElement | null;
+  resultVictory: HTMLAudioElement | null;
+  resultLoss: HTMLAudioElement | null;
+  resultKind: 'victory' | 'loss' | null;
+  resultFinished: boolean;
+  resultStarted: boolean;
 };
 
 const engine: AudioEngine = {
@@ -114,13 +124,48 @@ const engine: AudioEngine = {
   checkedTurnsLeft: 0,
   checking: null,
   checkingTurnsLeft: 0,
+  result: null,
+  resultVictory: null,
+  resultLoss: null,
+  resultKind: null,
+  resultFinished: false,
+  resultStarted: false,
 };
 
 const CHECKED_VOLUME_SCALE = 1;
 
+function ownAudio(audio: HTMLAudioElement) {
+  audioBag().add(audio);
+  return audio;
+}
+
+function audioBag(): Set<HTMLAudioElement> {
+  const host = window as Window & { __chesspansionAudio?: Set<HTMLAudioElement> };
+  if (!host.__chesspansionAudio) host.__chesspansionAudio = new Set();
+  return host.__chesspansionAudio;
+}
+
+function silenceOwnedAudio() {
+  for (const audio of audioBag()) {
+    playIntent.set(audio, 'pause');
+    audio.muted = true;
+    audio.volume = 0;
+    audio.pause();
+    try {
+      audio.currentTime = 0;
+    } catch {
+      /* not seekable */
+    }
+    audio.removeAttribute('src');
+    audio.load();
+  }
+  audioBag().clear();
+  oneShots.clear();
+}
+
 function ensureCheckedTrack() {
   if (!engine.checked) {
-    engine.checked = new Audio(AUDIO_FILES.sfxChecked);
+    engine.checked = ownAudio(new Audio(AUDIO_FILES.sfxChecked));
     engine.checked.loop = true;
     engine.checked.preload = 'auto';
   }
@@ -128,31 +173,10 @@ function ensureCheckedTrack() {
 
 function ensureCheckingTrack() {
   if (!engine.checking) {
-    engine.checking = new Audio(AUDIO_FILES.sfxCheckDealt);
+    engine.checking = ownAudio(new Audio(AUDIO_FILES.sfxCheckDealt));
     engine.checking.loop = true;
     engine.checking.preload = 'auto';
   }
-}
-
-function checkedThemeWanted() {
-  return (
-    engine.checkedTurnsLeft > 0 &&
-    engine.musicEnabled &&
-    engine.unlocked &&
-    engine.musicVolume > 0 &&
-    engine.scene === 'game'
-  );
-}
-
-function checkingThemeWanted() {
-  return (
-    engine.checkingTurnsLeft > 0 &&
-    !checkedThemeWanted() &&
-    engine.musicEnabled &&
-    engine.unlocked &&
-    engine.musicVolume > 0 &&
-    engine.scene === 'game'
-  );
 }
 
 function applyMusicVolume() {
@@ -161,42 +185,113 @@ function applyMusicVolume() {
   if (engine.game) engine.game.volume = vol;
   if (engine.checked) engine.checked.volume = vol * CHECKED_VOLUME_SCALE;
   if (engine.checking) engine.checking.volume = vol * CHECKED_VOLUME_SCALE;
+  if (engine.result) engine.result.volume = engine.musicVolume > 0 ? engine.musicVolume : 0.85;
 }
 
 function pauseCheckedAudio() {
   if (!engine.checked) return;
-  engine.checked.pause();
-  engine.checked.currentTime = 0;
+  pauseTrack(engine.checked);
+  seekStart(engine.checked);
+}
+
+function pauseResultAudio() {
+  if (!engine.result) return;
+  pauseTrack(engine.result);
+  seekStart(engine.result);
+}
+
+function seekStart(audio: HTMLAudioElement) {
+  try {
+    if (audio.readyState >= 1 && Number.isFinite(audio.duration) && audio.duration > 0) {
+      audio.currentTime = 0;
+    }
+  } catch {
+    /* not seekable yet */
+  }
+}
+
+function resultElement(kind: 'victory' | 'loss') {
+  const key = kind === 'victory' ? 'resultVictory' : 'resultLoss';
+  if (!engine[key]) {
+    const audio = ownAudio(new Audio(kind === 'victory' ? AUDIO_FILES.musicVictory : AUDIO_FILES.musicLoss));
+    audio.preload = 'auto';
+    audio.loop = false;
+    audio.setAttribute('playsinline', '');
+    engine[key] = audio;
+  }
+  return engine[key]!;
+}
+
+/** Unlock both result files during a tap so a later win or loss can play them. */
+function primeResultAudio() {
+  for (const kind of ['victory', 'loss'] as const) {
+    const audio = resultElement(kind);
+    if (audio.dataset.primed === '1') continue;
+    audio.muted = true;
+    const pending = audio.play();
+    if (!pending || typeof pending.then !== 'function') continue;
+    pending
+      .then(() => {
+        if (engine.result === audio && engine.resultKind) {
+          audio.muted = false;
+          audio.dataset.primed = '1';
+          return;
+        }
+        audio.pause();
+        audio.muted = false;
+        try {
+          audio.currentTime = 0;
+        } catch {
+          /* not seekable yet */
+        }
+        audio.dataset.primed = '1';
+      })
+      .catch(() => {});
+  }
+}
+
+function clearResultState() {
+  engine.resultKind = null;
+  engine.resultFinished = false;
+  engine.resultStarted = false;
+}
+
+/** Play victory.mp3 or losing.mp3 once, in place of the game bed. */
+export function playResultTrack(kind: 'victory' | 'loss') {
+  const audio = resultElement(kind);
+  const other = resultElement(kind === 'victory' ? 'loss' : 'victory');
+  if (engine.resultKind === kind && engine.result === audio && engine.resultStarted && !audio.paused) return;
+
+  engine.scene = 'game';
+  engine.resultKind = kind;
+  engine.result = audio;
+  engine.resultFinished = false;
+  engine.resultStarted = true;
+  engine.checkedTurnsLeft = 0;
+  engine.checkingTurnsLeft = 0;
+  engine.unlocked = true;
+  pauseTrack(other);
+  pauseCheckedAudio();
+  pauseCheckingAudio();
+  pauseTrack(engine.menu);
+  pauseTrack(engine.game);
+  audio.muted = false;
+  applyMusicVolume();
+  seekStart(audio);
+  safePlay(audio);
+}
+
+export function stopResultTrack() {
+  if (!engine.resultKind && !engine.resultFinished && !(engine.result && !engine.result.paused)) return;
+  clearResultState();
+  pauseResultAudio();
+  syncMusic();
 }
 
 function pauseCheckingAudio() {
   if (!engine.checking) return;
-  engine.checking.pause();
-  engine.checking.currentTime = 0;
-}
-
-function syncCheckedTrack() {
-  ensureCheckedTrack();
-  applyMusicVolume();
-  const a = engine.checked;
-  if (!a) return;
-  if (!checkedThemeWanted()) {
-    a.pause();
-    return;
-  }
-  if (a.paused) safePlay(a);
-}
-
-function syncCheckingTrack() {
-  ensureCheckingTrack();
-  applyMusicVolume();
-  const a = engine.checking;
-  if (!a) return;
-  if (!checkingThemeWanted()) {
-    a.pause();
-    return;
-  }
-  if (a.paused) safePlay(a);
+  pauseTrack(engine.checking);
+  seekStart(engine.checking);
 }
 
 /** Start or refresh the "you are in check" theme: 3 of your turns. */
@@ -247,23 +342,33 @@ export function stopCheckingTrack() {
 
 function ensureTracks() {
   if (!engine.menu) {
-    engine.menu = new Audio(AUDIO_FILES.musicMenu);
+    engine.menu = ownAudio(new Audio(AUDIO_FILES.musicMenu));
     engine.menu.loop = true;
     engine.menu.preload = 'auto';
   }
   if (!engine.game) {
-    engine.game = new Audio(AUDIO_FILES.musicGame);
+    engine.game = ownAudio(new Audio(AUDIO_FILES.musicGame));
     engine.game.loop = true;
     engine.game.preload = 'auto';
   }
   applyMusicVolume();
 }
 
+const playIntent = new WeakMap<HTMLAudioElement, 'play' | 'pause'>();
+const oneShots = new Set<HTMLAudioElement>();
+
+function markPaused(audio: HTMLAudioElement) {
+  playIntent.set(audio, 'pause');
+}
+
 function safePlay(audio: HTMLAudioElement | null) {
   if (!audio) return;
-  const p = audio.play();
-  if (p && typeof p.catch === 'function') {
-    p.catch(() => {
+  playIntent.set(audio, 'play');
+  const pending = audio.play();
+  if (pending && typeof pending.then === 'function') {
+    pending.then(() => {
+      if (playIntent.get(audio) === 'pause') audio.pause();
+    }).catch(() => {
       /* autoplay blocked or missing file — ignored until next gesture */
     });
   }
@@ -271,49 +376,108 @@ function safePlay(audio: HTMLAudioElement | null) {
 
 function pauseTrack(audio: HTMLAudioElement | null) {
   if (!audio) return;
+  playIntent.set(audio, 'pause');
   audio.pause();
+}
+
+type MusicBed = 'menu' | 'game' | 'checked' | 'checking' | 'result';
+
+function musicAllowed() {
+  return engine.musicEnabled && engine.unlocked && engine.musicVolume > 0 && engine.scene !== 'none';
+}
+
+function resultWanted() {
+  return !!engine.resultKind && !engine.resultFinished && engine.scene === 'game';
+}
+
+/** Exactly one bed may play, and only on the screen it belongs to. */
+function wantedBed(): MusicBed | null {
+  if (resultWanted()) return 'result';
+  if (!musicAllowed()) return null;
+  if (engine.scene === 'menu') return 'menu';
+  if (engine.scene !== 'game') return null;
+  if (engine.checkedTurnsLeft > 0) return 'checked';
+  if (engine.checkingTurnsLeft > 0) return 'checking';
+  return 'game';
 }
 
 function syncMusic() {
   ensureTracks();
   applyMusicVolume();
-  if (!engine.musicEnabled || !engine.unlocked || engine.scene === 'none' || engine.musicVolume <= 0) {
-    pauseTrack(engine.menu);
-    pauseTrack(engine.game);
-    syncCheckedTrack();
-    syncCheckingTrack();
-    return;
+  if (engine.scene !== 'game') {
+    clearResultState();
+    engine.checkedTurnsLeft = 0;
+    engine.checkingTurnsLeft = 0;
   }
-  if (checkedThemeWanted()) {
-    pauseTrack(engine.menu);
-    pauseTrack(engine.game);
-    pauseCheckingAudio();
-    syncCheckedTrack();
-    return;
+
+  const bed = wantedBed();
+  if (bed !== 'menu') pauseTrack(engine.menu);
+  if (bed !== 'game') pauseTrack(engine.game);
+  if (bed !== 'checked') pauseCheckedAudio();
+  if (bed !== 'checking') pauseCheckingAudio();
+  if (bed !== 'result') pauseResultAudio();
+
+  if (bed === 'menu') safePlay(engine.menu);
+  else if (bed === 'game') safePlay(engine.game);
+  else if (bed === 'checked') {
+    ensureCheckedTrack();
+    applyMusicVolume();
+    safePlay(engine.checked);
+  } else if (bed === 'checking') {
+    ensureCheckingTrack();
+    applyMusicVolume();
+    safePlay(engine.checking);
+  } else if (bed === 'result' && engine.resultKind) {
+    const audio = resultElement(engine.resultKind);
+    engine.result = audio;
+    audio.muted = false;
+    applyMusicVolume();
+    if (audio.paused) safePlay(audio);
   }
-  if (checkingThemeWanted()) {
-    pauseTrack(engine.menu);
-    pauseTrack(engine.game);
-    pauseCheckedAudio();
-    syncCheckingTrack();
-    return;
+}
+
+function stopOneShots() {
+  for (const audio of oneShots) {
+    pauseTrack(audio);
+    audio.currentTime = 0;
   }
-  if (engine.scene === 'menu') {
-    pauseTrack(engine.game);
-    pauseCheckedAudio();
-    pauseCheckingAudio();
-    safePlay(engine.menu);
-  } else if (engine.scene === 'game') {
-    pauseTrack(engine.menu);
-    pauseCheckedAudio();
-    pauseCheckingAudio();
-    safePlay(engine.game);
-  }
+  oneShots.clear();
+}
+
+function haltProcedural() {
+  if (!proceduralCtx) return;
+  const ctx = proceduralCtx;
+  proceduralCtx = null;
+  void ctx.close().catch(() => {});
+}
+
+/** Stop every track this page has started, then play only the bed for `scene`. */
+export function resetStuckAudio(scene: MusicScene) {
+  engine.scene = scene;
+  clearResultState();
+  engine.checkedTurnsLeft = 0;
+  engine.checkingTurnsLeft = 0;
+  engine.sfxEnabled = true;
+  writeFlag(SFX_KEY, true);
+  haltProcedural();
+  silenceOwnedAudio();
+  engine.menu = null;
+  engine.game = null;
+  engine.checked = null;
+  engine.checking = null;
+  engine.result = null;
+  engine.resultVictory = null;
+  engine.resultLoss = null;
+  window.setTimeout(() => {
+    if (engine.scene !== scene) return;
+    syncMusic();
+  }, 0);
 }
 
 export function unlockAudio() {
   engine.unlocked = true;
   ensureTracks();
+  primeResultAudio();
   syncMusic();
 }
 
@@ -327,38 +491,38 @@ function setMusicEnabled(enabled: boolean) {
 function setSfxEnabled(enabled: boolean) {
   engine.sfxEnabled = enabled;
   writeFlag(SFX_KEY, enabled);
+  if (!enabled) {
+    stopOneShots();
+    haltProcedural();
+  }
 }
 
 function setMusicVolume(volume: number) {
   engine.musicVolume = Math.min(1, Math.max(0, volume));
   writeVolume(MUSIC_VOL_KEY, engine.musicVolume);
   applyMusicVolume();
-  if (engine.musicVolume > 0 && engine.musicEnabled) {
-    unlockAudio();
-    syncMusic();
-  } else {
-    pauseTrack(engine.menu);
-    pauseTrack(engine.game);
-    syncCheckedTrack();
-    syncCheckingTrack();
-  }
+  if (engine.musicVolume > 0 && engine.musicEnabled) engine.unlocked = true;
+  syncMusic();
 }
 
 export function setMusicScene(scene: MusicScene) {
   engine.scene = scene;
-  syncMusic();
   if (scene !== 'game') {
-    stopCheckedTrack();
-    stopCheckingTrack();
+    clearResultState();
+    engine.checkedTurnsLeft = 0;
+    engine.checkingTurnsLeft = 0;
   }
+  syncMusic();
 }
 
 export function playSfx(id: SfxId) {
   if (!engine.sfxEnabled) return;
   unlockAudio();
   const src = SFX_SRC[id];
-  const audio = new Audio(src);
+  const audio = ownAudio(new Audio(src));
   audio.volume = id === 'ui' ? 0.55 : 0.7;
+  oneShots.add(audio);
+  audio.addEventListener('ended', () => oneShots.delete(audio));
   safePlay(audio);
 }
 
