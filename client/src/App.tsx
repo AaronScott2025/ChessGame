@@ -5,6 +5,7 @@ import {
   applyClientAction,
   createLobbyState,
   getDraftOptions,
+  publicState,
   startDraft,
   CARD_REGISTRY,
   PIECES,
@@ -61,6 +62,7 @@ interface Piece {
   effects: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   charges?: number;
   reaperKills?: number;
+  disabledTurns?: number;
   gamblerStyleDefId?: string;
   gadgetUsed?: boolean;
   gigaStompUsed?: boolean;
@@ -74,7 +76,6 @@ interface Piece {
   copiedMoveDefId?: string;
   magicBegoneUsed?: number;
   timekeeperCycleUsed?: boolean;
-  timekeeperRewindUsed?: boolean;
   timekeeperRecallUsed?: boolean;
 }
 
@@ -447,12 +448,7 @@ export default function App() {
     setSocket(s);
     s.on('state', (payload: { state: GameState; you: Color; draftOptions: string[]; catalog: Catalog }) => {
       if (localModeRef.current) return;
-      setState(payload.state);
-      setYou(payload.you);
-      setDraftOptions(payload.draftOptions ?? []);
-      setCatalog(payload.catalog);
-      setError(null);
-      const turnKey = `${payload.state.turn}:${payload.state.phase}`;
+      const turnKey = `${payload.state.turn}:${payload.state.phase}:${payload.state.pendingPrompt?.type ?? ''}:${payload.you}`;
       if (prevTurnRef.current && prevTurnRef.current !== turnKey) {
         setConfirmKey(null);
         setSpellConfirm(null);
@@ -462,6 +458,11 @@ export default function App() {
         setAbilities([]);
       }
       prevTurnRef.current = turnKey;
+      setState(payload.state);
+      setYou(payload.you);
+      setDraftOptions(payload.draftOptions ?? []);
+      setCatalog(payload.catalog);
+      setError(null);
     });
     s.on('error_message', (msg: string) => setError(msg));
     return () => {
@@ -738,28 +739,40 @@ export default function App() {
     setGadgetKind(null);
   };
 
-  const applyLocalState = (next: GameState, actingAs: Color) => {
-    const seat = localActiveSeat(next);
-    const turnKey = `${next.turn}:${next.phase}:${next.pendingPrompt?.type ?? ''}:${seat}`;
+  const pushGameState = (
+    next: GameState,
+    options: { actingAs?: Color; localPassDevice?: boolean; viewer?: Color | null } = {},
+  ) => {
+    const viewer = options.viewer ?? you;
+    const seat = options.localPassDevice ? localActiveSeat(next) : viewer;
+    const turnKey = `${next.turn}:${next.phase}:${next.pendingPrompt?.type ?? ''}:${seat ?? ''}`;
     if (prevTurnRef.current && prevTurnRef.current !== turnKey) {
       clearTransientUi();
     }
     prevTurnRef.current = turnKey;
-    setState(next as GameState);
-    setYou(seat);
+    const view =
+      viewer && !options.localPassDevice ? (publicState(next as never, viewer) as GameState) : next;
+    setState(view);
+    if (options.localPassDevice) setYou(seat);
     setDraftOptions(getDraftOptions(next as never));
     setError(null);
-    if (seat !== actingAs) {
-      const label = seat === 'white' ? 'White' : 'Black';
-      setStatus(`Pass the device — ${label}'s turn`);
-    } else {
-      setStatus((current) => (current.startsWith('Pass the device') ? '' : current));
+    if (options.localPassDevice && options.actingAs) {
+      if (seat !== options.actingAs) {
+        const label = seat === 'white' ? 'White' : 'Black';
+        setStatus(`Pass the device — ${label}'s turn`);
+      } else {
+        setStatus((current) => (current.startsWith('Pass the device') ? '' : current));
+      }
     }
   };
 
+  const applyLocalState = (next: GameState, actingAs: Color) => {
+    pushGameState(next, { actingAs, localPassDevice: true });
+  };
+
   const send = (action: object) => {
+    if (!state || !you) return;
     if (localMode) {
-      if (!state || !you) return;
       try {
         const next = applyClientAction(state as never, you, action as never);
         applyLocalState(next as GameState, you);
@@ -768,9 +781,20 @@ export default function App() {
       }
       return;
     }
+    const snapshot = state;
+    try {
+      const next = applyClientAction(snapshot as never, you, action as never);
+      pushGameState(next as GameState, { actingAs: you, viewer: you });
+    } catch (e) {
+      setError((e as Error).message);
+      return;
+    }
     if (!socket || !roomCode) return;
     socket.emit('action', { code: roomCode, action }, (res: { ok: boolean; error?: string }) => {
-      if (!res?.ok) setError(res?.error ?? 'Action failed');
+      if (!res?.ok) {
+        setError(res?.error ?? 'Action failed');
+        pushGameState(snapshot, { actingAs: you, viewer: you });
+      }
     });
   };
 
@@ -1159,7 +1183,7 @@ export default function App() {
           }
           return;
         }
-        if (prompt.abilityId === 'temporal_rewind' || prompt.abilityId === 'chrono_recall') {
+        if (prompt.abilityId === 'chrono_recall') {
           const piece = board[row][col];
           if (!piece) return;
           const tk = state.pieces.find((p) => p.id === prompt.pieceId);
@@ -1173,9 +1197,8 @@ export default function App() {
             setStatus('Target must be in a straight line from the TimeKeeper');
             return;
           }
-          const label = prompt.abilityId === 'temporal_rewind' ? 'Rewind' : 'Chrono Recall';
           const name = pieceMeta(catalog, piece.defId)?.name ?? piece.defId;
-          const summary = `${label} ${name}?`;
+          const summary = `Chrono Recall ${name}?`;
           setSpellConfirm({ summary, mode: 'resolve_prompt', payload: piece.id });
           setStatus(summary);
           clearBoardConfirm();
@@ -1298,7 +1321,7 @@ export default function App() {
             ? candidates.find((m) => m.special === focusSpecial) ??
               candidates.find((m) => !m.special) ??
               candidates[0]!
-            : candidates.find((m) => m.special) ?? candidates[0]!;
+            : candidates.find((m) => !m.special) ?? candidates.find((m) => m.special) ?? candidates[0]!;
         if (move.special === 'best_buddy') {
           const pig = state.pieces.find((p) => p.id === selectedPiece);
           if (!pig || !isPigLShape(pig.pos, { row, col }, pigMoveBonus(pig))) {
@@ -2064,7 +2087,10 @@ export default function App() {
                         barrierDest ? 'barrier-target' : '',
                         gamblerTarget ? 'gambler-target' : '',
                         sliding ? 'sq-sliding' : '',
-                        piece?.defId === 'reaper' && (piece.charges ?? 0) > 0 ? 'sq-reaper-fx' : '',
+                        piece?.defId === 'reaper' &&
+                          ((piece.charges ?? 0) > 0 || (piece.disabledTurns ?? 0) > 0)
+                          ? 'sq-reaper-fx'
+                          : '',
                         vampRadius > 0 ? 'sq-vampire-fx' : '',
                         piece?.defId === 'gambler' ? `sq-gambler sq-gambler-${state.dayNight}` : '',
                       ].join(' ')}
@@ -2106,6 +2132,8 @@ export default function App() {
                               ? ` reaper-charged reaper-charged-${Math.min(piece.charges ?? 0, 5)}`
                               : ''
                           }${
+                            piece.defId === 'reaper' && (piece.disabledTurns ?? 0) > 0 ? ' reaper-disabled' : ''
+                          }${
                             vampRadius > 0 ? ` vampire-blood vampire-blood-${vampRadius}` : ''
                           }${
                             (piece.effects ?? []).some((e) => effectTone(e.kind) === 'debuff')
@@ -2117,6 +2145,7 @@ export default function App() {
                           style={
                             sliding ||
                             (piece.defId === 'reaper' && (piece.charges ?? 0) > 0) ||
+                            (piece.defId === 'reaper' && (piece.disabledTurns ?? 0) > 0) ||
                             vampRadius > 0
                               ? ({
                                   ...(sliding
@@ -2128,6 +2157,9 @@ export default function App() {
                                     : {}),
                                   ...(piece.defId === 'reaper' && (piece.charges ?? 0) > 0
                                     ? { '--reaper-c': Math.min(piece.charges ?? 0, 5) }
+                                    : {}),
+                                  ...(piece.defId === 'reaper' && (piece.disabledTurns ?? 0) > 0
+                                    ? { '--reaper-disable-t': Math.min(piece.disabledTurns ?? 0, 12) }
                                     : {}),
                                   ...(vampRadius > 0 ? { '--vamp-r': vampRadius } : {}),
                                 } as React.CSSProperties)
@@ -2151,7 +2183,9 @@ export default function App() {
                                   ? `Moves as ${PIECES[piece.gamblerStyleDefId]?.name ?? piece.gamblerStyleDefId}`
                                   : 'Waiting on a roll'
                               : null,
-                            piece.defId === 'reaper' && (piece.charges ?? 0) > 0
+                            piece.defId === 'reaper' && (piece.disabledTurns ?? 0) > 0
+                              ? `Resting — ${piece.disabledTurns} turn${piece.disabledTurns === 1 ? '' : 's'} left`
+                              : piece.defId === 'reaper' && (piece.charges ?? 0) > 0
                               ? `${piece.charges} charge${piece.charges === 1 ? '' : 's'}`
                               : null,
                             piece.defId === 'vampire' && vampRadius > 0
@@ -2204,6 +2238,8 @@ export default function App() {
                           {vampRadius > 0 && <VampireBloodAura radius={vampRadius} />}
                           {piece.defId === 'vampire' ? (
                             <VampireBloodChargeFx tokens={piece.charges ?? 0} />
+                          ) : piece.defId === 'reaper' && (piece.disabledTurns ?? 0) > 0 ? (
+                            <ReaperDisabledFx turns={piece.disabledTurns ?? 0} />
                           ) : piece.defId === 'reaper' && (piece.charges ?? 0) > 0 ? (
                             <ReaperChargeFx charges={piece.charges ?? 0} />
                           ) : piece.charges != null && piece.charges > 0 ? (
@@ -2532,6 +2568,7 @@ export default function App() {
                   live={{
                     charges: inspectedPiece.charges,
                     reaperKills: inspectedPiece.reaperKills,
+                    disabledTurns: inspectedPiece.disabledTurns,
                     gamblerStyleDefId: inspectedPiece.gamblerStyleDefId,
                     ritualTurns: inspectedPiece.ritualTurns,
                     gadgetUsed: inspectedPiece.gadgetUsed,
@@ -2539,7 +2576,6 @@ export default function App() {
                     abilityCooldown: inspectedPiece.abilityCooldown,
                     magicBegoneUsed: inspectedPiece.magicBegoneUsed,
                     timekeeperCycleUsed: inspectedPiece.timekeeperCycleUsed,
-                    timekeeperRewindUsed: inspectedPiece.timekeeperRewindUsed,
                     timekeeperRecallUsed: inspectedPiece.timekeeperRecallUsed,
                     bloodlustTurnsRemaining: inspectedPiece.bloodlustTurnsRemaining,
                     identityLootDefId: inspectedPiece.identityLootDefId,
@@ -2746,6 +2782,27 @@ function VampireBloodChargeFx({ tokens }: { tokens: number }) {
   );
 }
 
+function ReaperDisabledFx({ turns }: { turns: number }) {
+  const shown = Math.max(1, Math.min(12, turns));
+  return (
+    <span
+      className="reaper-disabled-fx"
+      aria-label={`Disabled for ${shown} turn${shown === 1 ? '' : 's'}`}
+      title={`Resting — ${shown} turn${shown === 1 ? '' : 's'} remaining`}
+    >
+      <i className="reaper-disabled-aura" />
+      <svg className="reaper-disabled-hourglass" viewBox="0 0 20 22" aria-hidden>
+        <path
+          fill="currentColor"
+          d="M4.2 1.5h11.6c.4 0 .7.3.7.7v1.4c0 .5-.2 1-.6 1.3L11 7.2v1.1l4.9 3.7c.4.3.6.8.6 1.3v1.4c0 .4-.3.7-.7.7H4.2c-.4 0-.7-.3-.7-.7v-1.4c0-.5.2-1 .6-1.3L9 8.3V7.2L4.1 3.5c-.4-.3-.6-.8-.6-1.3V2.2c0-.4.3-.7.7-.7z"
+        />
+        <path fill="rgba(12,8,20,0.55)" d="M8.2 5.8h3.6L10 7.8 8.2 5.8zm0 10.4h3.6L10 14.2l-1.8 2z" />
+      </svg>
+      <b className="reaper-disabled-n">{shown}</b>
+    </span>
+  );
+}
+
 function ReaperChargeFx({ charges }: { charges: number }) {
   const shown = Math.max(0, Math.min(5, charges));
   if (shown <= 0) return null;
@@ -2843,6 +2900,7 @@ function PieceInfoBody({
   live?: {
     charges?: number;
     reaperKills?: number;
+    disabledTurns?: number;
     gamblerStyleDefId?: string;
     ritualTurns?: number;
     gadgetUsed?: boolean;
@@ -2850,7 +2908,6 @@ function PieceInfoBody({
     abilityCooldown?: number;
     magicBegoneUsed?: number;
     timekeeperCycleUsed?: boolean;
-    timekeeperRewindUsed?: boolean;
     timekeeperRecallUsed?: boolean;
     bloodlustTurnsRemaining?: number;
     identityLootDefId?: string;
@@ -2947,7 +3004,12 @@ function PieceInfoBody({
                 : 'unrolled'}
             </span>
           )}
-          {defId === 'reaper' && live.charges != null && live.charges > 0 && (
+          {defId === 'reaper' && live.disabledTurns != null && live.disabledTurns > 0 && (
+            <span className="live-effect tone-debuff reaper-rest-timer">
+              Resting: {live.disabledTurns} turn{live.disabledTurns === 1 ? '' : 's'} remaining
+            </span>
+          )}
+          {defId === 'reaper' && live.charges != null && live.charges > 0 && (live.disabledTurns ?? 0) <= 0 && (
             <span>
               Harvest: {live.reaperKills ?? 0}/{reaperCapturesUntilRest(live.charges)} captures until rest
             </span>
@@ -2965,7 +3027,6 @@ function PieceInfoBody({
             <span>Bloodlust ({live.bloodlustTurnsRemaining})</span>
           )}
           {live.timekeeperCycleUsed && <span>Temporal Shift used</span>}
-          {live.timekeeperRewindUsed && <span>Rewind used</span>}
           {live.timekeeperRecallUsed && <span>Chrono Recall used</span>}
           {live.copiedMoveDefId && <span>Moves as {live.copiedMoveDefId}</span>}
           {!live.copiedMoveDefId && live.identityLootDefId && (
@@ -2997,6 +3058,7 @@ function PieceInfoTile({
   live?: {
     charges?: number;
     reaperKills?: number;
+    disabledTurns?: number;
     gamblerStyleDefId?: string;
     ritualTurns?: number;
     gadgetUsed?: boolean;
@@ -3004,7 +3066,6 @@ function PieceInfoTile({
     abilityCooldown?: number;
     magicBegoneUsed?: number;
     timekeeperCycleUsed?: boolean;
-    timekeeperRewindUsed?: boolean;
     timekeeperRecallUsed?: boolean;
     bloodlustTurnsRemaining?: number;
     identityLootDefId?: string;

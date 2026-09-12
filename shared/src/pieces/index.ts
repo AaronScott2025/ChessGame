@@ -363,13 +363,15 @@ export const PIECES: Record<string, PieceDefinition> = {
     getMoves: (p, s) => {
       const moves = filterLegal(p, s, rayMoves(p, s, ORTH, 1));
       if (!p.gigaStompUsed) {
+        const stomps: MoveOption[] = [];
         for (const d of ALL8) {
           for (let i = 1; i <= 3; i++) {
             const to = { row: p.pos.row + d.row * i, col: p.pos.col + d.col * i };
             if (!inBounds(to)) break;
-            moves.push({ to, special: 'giga_stomp', meta: { dir: d } });
+            stomps.push({ to, special: 'giga_stomp', meta: { dir: d } });
           }
         }
+        moves.push(...filterLegal(p, s, stomps));
       }
       return moves;
     },

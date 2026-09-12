@@ -8,6 +8,7 @@ import {
   openingKeep,
   openingRedraw,
   playCard,
+  refreshCheckState,
   resolvePrompt,
   skipSpell,
   useAbility,
@@ -15,41 +16,54 @@ import {
 
 /** Apply a client action for a seated color. Used by the server and local hotseat. */
 export function applyClientAction(state: GameState, color: Color, action: ClientAction): GameState {
+  let next: GameState;
   switch (action.type) {
     case 'set_name': {
-      const next = cloneState(state);
+      next = cloneState(state);
       next.players[color].name = action.name;
-      return next;
+      break;
     }
     case 'choose_first_picker':
       if (color !== 'black') throw new Error('Only Black chooses');
-      return chooseFirstPicker(state, action.whitePicksFirst);
+      next = chooseFirstPicker(state, action.whitePicksFirst);
+      break;
     case 'draft_pick':
-      return draftPick(state, color, action.defId);
+      next = draftPick(state, color, action.defId);
+      break;
     case 'opening_keep':
-      return openingKeep(state, color);
+      next = openingKeep(state, color);
+      break;
     case 'opening_redraw':
-      return openingRedraw(state, color, action.instanceId);
+      next = openingRedraw(state, color, action.instanceId);
+      break;
     case 'skip_spell':
-      return skipSpell(state, color);
+      next = skipSpell(state, color);
+      break;
     case 'play_card':
-      return playCard(state, color, action.instanceId, action.targets ?? []);
+      next = playCard(state, color, action.instanceId, action.targets ?? []);
+      break;
     case 'resolve_prompt':
-      return resolvePrompt(state, color, action.payload);
+      next = resolvePrompt(state, color, action.payload);
+      break;
     case 'move':
-      return applyMove(state, color, action.pieceId, action.to, action.meta);
+      next = applyMove(state, color, action.pieceId, action.to, action.meta);
+      break;
     case 'use_ability':
-      return useAbility(state, color, action.pieceId, action.abilityId, action.targets);
+      next = useAbility(state, color, action.pieceId, action.abilityId, action.targets);
+      break;
     case 'cancel_prompt':
-      return cancelPrompt(state, color);
+      next = cancelPrompt(state, color);
+      break;
     case 'resign': {
-      const next = cloneState(state);
+      next = cloneState(state);
       next.phase = 'ended';
       next.winner = color === 'white' ? 'black' : 'white';
       next.winReason = `${color} resigned`;
-      return next;
+      break;
     }
     default:
       throw new Error(`Unknown action: ${(action as { type?: string })?.type ?? 'undefined'}`);
   }
+  refreshCheckState(next);
+  return next;
 }

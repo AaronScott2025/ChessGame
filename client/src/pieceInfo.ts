@@ -246,7 +246,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       '3+: Soul Lock — night captures may revive the victim as an ally on the Reaper’s start square.',
       '4+: Death Stare — capture in a 2×2 area without moving.',
       '5+: World Shatterer — night captures also remove all enemy pieces of that class.',
-      'After capturing the inverse of your charge count (1 charge → 5 captures, 5 charges → 1 capture): return home and disable for floor(charges × 2.5) turns.',
+      'After capturing the inverse of your charge count (1 charge → 5 captures, 5 charges → 1 capture): all charges are spent, return home, and disable for floor(charges × 2.5) turns.',
     ],
   },
   snail: {
@@ -329,11 +329,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     ],
     abilities: [
       'Temporal Shift (once): skip to the opposite phase, or revert the last day/night change. Affects day/night pieces; does not undo card draws.',
-      'Rewind (once): send any allied or enemy piece in clear line of sight back to its previous square (must be empty).',
       'Chrono Recall (once per game): send any allied or enemy piece in clear line of sight back to its spawn square (must be empty).',
     ],
     notes: [
-      'Rewind and Chrono Recall cannot leave your King in check.',
+      'Chrono Recall cannot leave your King in check.',
       'Line of sight is a straight unobstructed path in any direction.',
     ],
   },

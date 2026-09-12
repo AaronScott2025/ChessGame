@@ -70,12 +70,8 @@ export interface PieceState {
   gamblerStyleDefId?: string;
   /** Gambler: yesterday's style (cannot repeat). */
   gamblerPrevStyleDefId?: string;
-  /** Last square this piece moved from (for TimeKeeper Rewind). */
-  previousPos?: Coord;
   /** TimeKeeper: day/night skip or revert already used. */
   timekeeperCycleUsed?: boolean;
-  /** TimeKeeper: Rewind already used. */
-  timekeeperRewindUsed?: boolean;
   /** TimeKeeper: Chrono Recall (spawn send) already used. */
   timekeeperRecallUsed?: boolean;
 }

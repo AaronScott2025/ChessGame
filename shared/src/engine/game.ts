@@ -372,37 +372,37 @@ function pushSnapshot(state: GameState): void {
 export function isSquareAttacked(state: GameState, pos: Coord, byColor: Color): boolean {
   for (const piece of state.pieces) {
     if (piece.color !== byColor) continue;
-    const def = PIECES[piece.defId];
-    if (!def) continue;
-    if (def.canAct && !def.canAct(piece, state)) continue;
-    // Angel cannot take
     if (piece.defId === 'angel') continue;
-    let moves: MoveOption[] = [];
     try {
-      moves = def.getMoves(piece, state);
+      const moves = listMoves(state, piece.id, { forAttack: true });
+      if (moves.some((m) => sameCoord(m.to, pos))) return true;
     } catch {
       continue;
     }
-    if (moves.some((m) => sameCoord(m.to, pos) && (m.capture || !pieceAt(state, pos)))) {
-      // king attacked if enemy can move onto king square
-      if (sameCoord(mFix(mFind(moves, pos)), pos)) return true;
-    }
-    if (moves.some((m) => sameCoord(m.to, pos))) return true;
   }
   return false;
-}
-
-function mFind(moves: MoveOption[], pos: Coord) {
-  return moves.find((m) => sameCoord(m.to, pos))!;
-}
-function mFix(m: MoveOption) {
-  return m.to;
 }
 
 export function isInCheck(state: GameState, color: Color): boolean {
   const king = getKing(state, color);
   if (!king) return true;
   return isSquareAttacked(state, king.pos, opposite(color));
+}
+
+/** Recompute which king (if any) is in check from the current board. */
+export function refreshCheckState(state: GameState): Color | null {
+  if (state.phase !== 'playing') {
+    state.check = null;
+    return null;
+  }
+  const whiteInCheck = isInCheck(state, 'white');
+  const blackInCheck = isInCheck(state, 'black');
+  let check: Color | null = null;
+  if (whiteInCheck && blackInCheck) check = state.turn;
+  else if (whiteInCheck) check = 'white';
+  else if (blackInCheck) check = 'black';
+  state.check = check;
+  return check;
 }
 
 function assertOwnKingSafe(state: GameState, color: Color, action: string): void {
@@ -414,17 +414,11 @@ function assertOwnKingSafe(state: GameState, color: Color, action: string): void
 /** Abilities spend the turn. Illegal if you remain in check (e.g. Wizard Enchant while checked). */
 function concludeAbilityTurn(state: GameState, color: Color): GameState {
   assertOwnKingSafe(state, color, 'That ability');
-  if (isInCheck(state, opposite(color))) {
-    state.check = opposite(color);
+  refreshCheckState(state);
+  if (state.check === opposite(color)) {
     return endTurn(state, color, true);
   }
   return endTurn(state, color, false);
-}
-
-function trackPreviousPos(piece: PieceState, from: Coord, to: Coord): void {
-  if (!sameCoord(from, to)) {
-    piece.previousPos = { ...from };
-  }
 }
 
 function applyDayNightSideEffects(state: GameState, entering: 'day' | 'night', drawCards: boolean): void {
@@ -443,7 +437,7 @@ function applyDayNightSideEffects(state: GameState, entering: 'day' | 'night', d
     if (state.cycleCount === 5) log(state, 'First night — spell cards are now available');
     for (const p of state.pieces) {
       if (p.defId === 'reaper' && (p.disabledTurns ?? 0) <= 0) {
-        p.charges = (p.charges ?? 0) + 1;
+        p.charges = Math.min(5, (p.charges ?? 0) + 1);
       }
       if (p.defId === 'ghost' && !hasEffect(p, 'ghost_unlocked')) {
         addEffect(p, { id: `ghost_unlock_${p.id}`, kind: 'ghost_unlocked' });
@@ -457,6 +451,7 @@ function flipDayNight(state: GameState, drawCards: boolean): 'day' | 'night' {
   state.dayNight = state.dayNight === 'day' ? 'night' : 'day';
   log(state, `It is now ${state.dayNight}`);
   applyDayNightSideEffects(state, state.dayNight, drawCards);
+  refreshCheckState(state);
   return state.dayNight;
 }
 
@@ -467,6 +462,7 @@ function revertDayNight(state: GameState): void {
   state.previousDayNight = current;
   log(state, `Time reverts — it is now ${state.dayNight}`);
   applyDayNightSideEffects(state, state.dayNight, false);
+  refreshCheckState(state);
 }
 
 function assertTimekeeperDisplacementSafe(
@@ -512,7 +508,6 @@ function travelPortalOnce(state: GameState, piece: PieceState, color: Color): Pi
     if (hasEffect(occ, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) return undefined;
   }
   if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
-  trackPreviousPos(piece, piece.pos, dest);
   piece.pos = { ...dest };
   log(state, `${piece.defId} traveled through a portal`);
   return occ && occ.color !== color ? occ : undefined;
@@ -529,7 +524,7 @@ function simulatePortalHop(state: GameState, piece: PieceState): void {
   piece.pos = { ...dest };
 }
 
-export function listMoves(state: GameState, pieceId: string): MoveOption[] {
+export function listMoves(state: GameState, pieceId: string, options?: { forAttack?: boolean }): MoveOption[] {
   const piece = state.pieces.find((p) => p.id === pieceId);
   if (!piece) return [];
   const def = getPieceDef(piece.defId);
@@ -561,6 +556,8 @@ export function listMoves(state: GameState, pieceId: string): MoveOption[] {
       isKnightLanding(piece, state, m.to, 2, 1, false, true)
     );
   });
+
+  if (options?.forAttack) return moves;
 
   // Filter moves that leave own king in check
   return moves.filter((m) => {
@@ -812,14 +809,6 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
           : 'Once: skip to the opposite phase now (no card draw). Revert unlocks after any phase change.',
     });
     out.push({
-      id: 'temporal_rewind',
-      name: 'Rewind',
-      ready: !piece.timekeeperRewindUsed && !inCheck,
-      hint: inCheck
-        ? 'Cannot use while in check'
-        : 'Once: click any piece in clear line of sight to send it to its previous square (empty).',
-    });
-    out.push({
       id: 'chrono_recall',
       name: 'Chrono Recall',
       ready: !piece.timekeeperRecallUsed && !inCheck,
@@ -868,7 +857,6 @@ export function useAbility(
       'revive',
       'barrier_shift',
       'temporal_shift',
-      'temporal_rewind',
       'chrono_recall',
     ];
     if (magical.includes(abilityId)) throw new Error('Magic is silenced (Magic Be-gone)');
@@ -979,22 +967,6 @@ export function useAbility(
       return next;
     }
     return finishTemporalShift(next, color, pieceId, mode);
-  }
-
-  if (abilityId === 'temporal_rewind') {
-    const targetId = targets as string | undefined;
-    if (!targetId) {
-      next.pendingPrompt = {
-        type: 'ability_target',
-        color,
-        pieceId,
-        abilityId: 'temporal_rewind',
-        message: 'Rewind: click a piece in clear line of sight to send it to its previous square',
-        resumeTurnPhase,
-      };
-      return next;
-    }
-    return finishTimekeeperRewind(next, color, pieceId, targetId);
   }
 
   if (abilityId === 'chrono_recall') {
@@ -1243,35 +1215,6 @@ function finishTemporalShift(
   return concludeAbilityTurn(state, color);
 }
 
-function finishTimekeeperRewind(
-  state: GameState,
-  color: Color,
-  pieceId: string,
-  targetId: string,
-): GameState {
-  const tk = state.pieces.find((p) => p.id === pieceId);
-  if (!tk || tk.defId !== 'timekeeper') throw new Error('Only a TimeKeeper can Rewind');
-  if (tk.timekeeperRewindUsed) throw new Error('Rewind already used');
-  const target = state.pieces.find((p) => p.id === targetId);
-  if (!target) throw new Error('Invalid target');
-  if (!target.previousPos) throw new Error('That piece has no previous square to return to');
-  if (!clearLineOfSight(state, tk.pos, target.pos)) {
-    throw new Error('Target must be in clear line of sight');
-  }
-  const dest = { ...target.previousPos };
-  if (squareBlockedForDisplacement(state, dest)) {
-    throw new Error('Previous square is blocked');
-  }
-  assertTimekeeperDisplacementSafe(state, color, target, dest, 'Rewind');
-  endBestBuddy(state, target, target.pos);
-  target.pos = dest;
-  snareInWeb(state, target);
-  tk.timekeeperRewindUsed = true;
-  state.pendingPrompt = null;
-  log(state, `${getPieceDef(target.defId).name} rewound to its previous square`);
-  return concludeAbilityTurn(state, color);
-}
-
 function finishChronoRecall(
   state: GameState,
   color: Color,
@@ -1362,6 +1305,9 @@ function snareInWeb(state: GameState, piece: PieceState): void {
 function freePiecesNoLongerInWeb(state: GameState): void {
   for (const p of state.pieces) {
     if (!hasEffect(p, 'webbed')) continue;
+    const webbed = hasEffect(p, 'webbed');
+    // Spider pawn capture webs are not tied to trail web tokens.
+    if (webbed?.data?.source === 'spider_capture') continue;
     if (!webTokenAt(state, p.pos)) removeEffects(p, 'webbed');
   }
 }
@@ -1492,8 +1438,6 @@ export function applyMove(
     const otherFrom = { ...other.pos };
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     if (endBestBuddy(next, other, otherFrom)) log(next, 'Best Buddy ended');
-    trackPreviousPos(piece, from, other.pos);
-    trackPreviousPos(other, otherFrom, piece.pos);
     const tmp = { ...piece.pos };
     piece.pos = { ...other.pos };
     other.pos = tmp;
@@ -1505,8 +1449,6 @@ export function applyMove(
     const otherFrom = { ...other.pos };
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     if (endBestBuddy(next, other, otherFrom)) log(next, 'Best Buddy ended');
-    trackPreviousPos(piece, from, other.pos);
-    trackPreviousPos(other, otherFrom, piece.pos);
     const tmp = { ...piece.pos };
     piece.pos = { ...other.pos };
     other.pos = tmp;
@@ -1529,7 +1471,6 @@ export function applyMove(
     for (const p of next.pieces) {
       if (p.coOccupantId === piece.id) p.coOccupantId = undefined;
     }
-    trackPreviousPos(piece, from, ally.pos);
     piece.pos = { ...ally.pos };
     piece.coOccupantId = ally.id;
     log(next, `Pig Best Buddy with ${ally.defId}`);
@@ -1570,7 +1511,6 @@ export function applyMove(
       captured = undefined;
     }
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
-    trackPreviousPos(piece, from, to);
     piece.pos = { ...to };
   }
 
@@ -1664,11 +1604,26 @@ export function applyMove(
         if (charges > 0 && piece.reaperKills >= needed) {
           const disable = Math.floor(charges * 2.5);
           piece.reaperKills = 0;
+          piece.charges = 0;
           piece.disabledTurns = disable;
           const home = nearestEmptyAround(next, piece.startPos);
           if (home) piece.pos = home;
-          log(next, `Reaper harvested ${needed} captures — returns home (disabled ${disable} turns)`);
+          log(next, `Reaper harvested ${needed} captures — charges spent, returns home (disabled ${disable} turns)`);
         }
+      }
+
+      if (
+        victimSnapshot.defId === 'spider' &&
+        !isAlliedTerritory(victimSnapshot.color, victimSnapshot.pos) &&
+        !immuneToWeb(piece)
+      ) {
+        addEffect(piece, {
+          id: `web_${piece.id}_${Date.now()}`,
+          kind: 'webbed',
+          turnsRemaining: 2,
+          data: { source: 'spider_capture' },
+        });
+        log(next, `${getPieceDef(piece.defId).name} is caught in a web (Immovable)`);
       }
     }
 
@@ -1712,16 +1667,6 @@ export function applyMove(
       }
     }
 
-    if (
-      captured?.defId === 'spider' &&
-      !isAlliedTerritory(captured.color, captured.pos) &&
-      next.pieces.some((p) => p.id === piece.id) &&
-      !immuneToWeb(piece)
-    ) {
-      addEffect(piece, { id: `web_${piece.id}_${Date.now()}`, kind: 'webbed', turnsRemaining: 2 });
-      log(next, `${piece.defId} is caught in a web (Immovable)`);
-    }
-
     if (effectsBeforeCapture) {
       const keep = new Set(effectsBeforeCapture.map((e) => e.id));
       const extra = (piece.effects ?? []).filter((e) => !keep.has(e.id));
@@ -1744,7 +1689,6 @@ export function applyMove(
       const occ = pieceAt(next, mirror);
       if (occ && occ.color === color) throw new Error('Mirror blocked');
       if (occ && occ.color !== color) removePiece(next, occ, color);
-      trackPreviousPos(other, other.pos, mirror);
       other.pos = mirror;
       snareInWeb(next, other);
     }
@@ -1849,11 +1793,9 @@ export function applyMove(
     throw new Error('Illegal move — your king would remain in check');
   }
   if (isInCheck(next, enemy)) {
-    next.check = enemy;
     log(next, `${enemy} is in check — turn ends immediately`);
     return endTurn(next, color, true);
   }
-  next.check = isInCheck(next, color) ? color : null;
 
   return endTurn(next, color, false);
 }
@@ -2058,8 +2000,8 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
     out.turnPhase = 'move';
   }
 
-  if (isInCheck(out, opposite(color))) {
-    out.check = opposite(color);
+  refreshCheckState(out);
+  if (out.check === opposite(color)) {
     log(out, 'Check from spell — turn passes');
     return endTurn(out, out.turn, true);
   }
@@ -2193,10 +2135,6 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (prompt.abilityId === 'temporal_shift') {
       next.pendingPrompt = null;
       return finishTemporalShift(next, color, prompt.pieceId, payload as 'skip' | 'revert');
-    }
-    if (prompt.abilityId === 'temporal_rewind') {
-      next.pendingPrompt = null;
-      return finishTimekeeperRewind(next, color, prompt.pieceId, payload as string);
     }
     if (prompt.abilityId === 'chrono_recall') {
       next.pendingPrompt = null;
@@ -2720,16 +2658,13 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
 
   pushSnapshot(next);
 
-  // Checkmate only if the player has no legal move AND no spell/ability that can get out of check
-  if (isInCheck(next, nextColor)) {
-    next.check = nextColor;
+  const checked = refreshCheckState(next);
+  if (checked === nextColor) {
     if (!hasEscapeFromCheck(next, nextColor)) {
       next.phase = 'ended';
       next.winner = opposite(nextColor);
       next.winReason = 'Checkmate';
     }
-  } else {
-    next.check = null;
   }
 
   return next;
