@@ -2350,6 +2350,11 @@ html.fx-off .turn-pill-check.is-you {
   overflow: visible;
   background: transparent;
   color: inherit;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-appearance: none;
+  appearance: none;
 }
 
 .sq:has(.piece) {
@@ -2376,6 +2381,45 @@ html.fx-off .turn-pill-check.is-you {
 
 .sq.dark {
   background: var(--dark-sq);
+}
+
+/* Your half (near side) vs theirs. Kept very light so the wood squares still read. */
+.sq.territory-allied.light {
+  background:
+    linear-gradient(rgba(64, 124, 214, 0.1), rgba(64, 124, 214, 0.1)),
+    var(--light-sq);
+}
+
+.sq.territory-allied.dark {
+  background:
+    linear-gradient(rgba(78, 142, 230, 0.13), rgba(78, 142, 230, 0.13)),
+    var(--dark-sq);
+}
+
+.sq.territory-enemy.light {
+  background:
+    linear-gradient(rgba(196, 58, 58, 0.09), rgba(196, 58, 58, 0.09)),
+    var(--light-sq);
+}
+
+.sq.territory-enemy.dark {
+  background:
+    linear-gradient(rgba(176, 40, 40, 0.12), rgba(176, 40, 40, 0.12)),
+    var(--dark-sq);
+}
+
+.sq.territory-front.light {
+  background:
+    linear-gradient(to bottom, rgba(168, 196, 236, 0.7), rgba(168, 196, 236, 0.7) 1px, transparent 1px),
+    linear-gradient(rgba(64, 124, 214, 0.1), rgba(64, 124, 214, 0.1)),
+    var(--light-sq);
+}
+
+.sq.territory-front.dark {
+  background:
+    linear-gradient(to bottom, rgba(186, 210, 242, 0.55), rgba(186, 210, 242, 0.55) 1px, transparent 1px),
+    linear-gradient(rgba(78, 142, 230, 0.13), rgba(78, 142, 230, 0.13)),
+    var(--dark-sq);
 }
 
 .sq.selected {
@@ -3891,11 +3935,28 @@ html.fx-off .turn-pill-check.is-you {
 
 @media (max-width: 960px) {
   .board-prompt-float {
-    left: 0.5rem;
-    right: 0.5rem;
+    left: 0;
+    right: 0;
+    top: auto;
+    bottom: 0;
     width: auto;
-    top: 50%;
-    transform: translateY(-50%);
+    max-width: none;
+    max-height: min(48dvh, 24rem);
+    transform: none;
+    border-radius: 16px 16px 0 0;
+    padding-bottom: calc(0.85rem + env(safe-area-inset-bottom, 0px));
+    animation: board-prompt-sheet 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+
+  .board-prompt-float.is-action {
+    animation: board-prompt-sheet 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+
+  .prompt-restore {
+    top: auto;
+    bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%);
   }
 
   .draft-screen {
@@ -3934,6 +3995,18 @@ html.fx-off .turn-pill-check.is-you {
   .play-layout {
     grid-template-columns: 1fr;
     justify-items: stretch;
+  }
+
+  .board-wrap {
+    order: 1;
+  }
+
+  .play-dock {
+    order: 2;
+  }
+
+  .side {
+    order: 3;
   }
 
   .play-dock-box {
@@ -4247,6 +4320,415 @@ html.fx-off .turn-pill-check.is-you {
   margin: 0;
   color: #6b5340;
   font-size: 0.95rem;
+}
+
+@keyframes board-prompt-sheet {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Phones: board-first, width-fitted 10×10, touch targets, safe areas. */
+@media (max-width: 820px) {
+  .shell {
+    padding:
+      0.35rem
+      max(0.4rem, env(safe-area-inset-right, 0px))
+      calc(0.6rem + env(safe-area-inset-bottom, 0px))
+      max(0.4rem, env(safe-area-inset-left, 0px));
+  }
+
+  .shell.lobby-shell.home {
+    padding-top: calc(1.25rem + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(5.5rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  .turn-strip {
+    min-height: 2.35rem;
+    margin: 0 calc(-1 * max(0.4rem, env(safe-area-inset-right, 0px))) 0.35rem
+      calc(-1 * max(0.4rem, env(safe-area-inset-left, 0px)));
+    padding: calc(0.28rem + env(safe-area-inset-top, 0px)) 7.8rem 0.28rem 2.8rem;
+    border-radius: 0;
+  }
+
+  .turn-strip-title {
+    font-size: 0.92rem;
+    letter-spacing: 0.04em;
+    gap: 0.35rem;
+  }
+
+  .turn-strip-detail {
+    font-size: 0.72rem;
+    max-width: 100%;
+  }
+
+  .top {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.3rem;
+  }
+
+  .top-left {
+    flex: 1 1 auto;
+    gap: 0.3rem;
+  }
+
+  .brand {
+    font-size: 1.15rem;
+    letter-spacing: 0.03em;
+  }
+
+  .game-status-bar {
+    padding: 0.28rem 0.35rem;
+    gap: 0.28rem;
+    border-radius: 10px;
+  }
+
+  .status-chip {
+    font-size: 0.72rem;
+    padding: 0.18rem 0.42rem;
+    gap: 0.22rem;
+  }
+
+  .chip-cycle {
+    font-size: 0.72rem;
+    padding: 0.18rem 0.42rem;
+  }
+
+  .chip-cycle-meta,
+  .chip-phase,
+  .turn-pill {
+    display: none;
+  }
+
+  .exit-game-btn {
+    min-height: 2.4rem;
+    padding: 0.35rem 0.55rem;
+    font-size: 0.68rem;
+  }
+
+  .board-wrap {
+    --sq: min(
+      calc(
+        (100dvw - 0.8rem - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 8px) / 10
+      ),
+      calc(
+        (100dvh - 10.5rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)) / 10
+      ),
+      48px
+    );
+    width: 100%;
+    align-items: center;
+  }
+
+  .board {
+    --board-border: 4px;
+    border-radius: 4px;
+    box-shadow:
+      0 0 0 1px rgba(240, 199, 94, 0.2),
+      0 10px 24px rgba(0, 0, 0, 0.45);
+  }
+
+  .ability-bar {
+    max-width: 100%;
+    gap: 0.35rem;
+    margin-top: 0.25rem;
+  }
+
+  .ability-bar button {
+    min-height: 2.55rem;
+    padding: 0.4rem 0.7rem;
+    font-size: 0.92rem;
+  }
+
+  .hand-tray {
+    max-width: 100%;
+    position: static;
+    margin-top: 0.1rem;
+    padding: 0.1rem 0 0.2rem;
+    background: transparent;
+  }
+
+  .hand-fan-row {
+    min-height: 4.5rem;
+    gap: 0.3rem;
+    align-items: flex-end;
+  }
+
+  .hand-you-label {
+    margin-bottom: 0.35rem;
+    padding: 0.2rem 0.4rem;
+    font-size: 0.62rem;
+  }
+
+  .hand.hand-fan {
+    min-height: 4.2rem;
+    padding: 0.45rem 0.2rem 0.05rem;
+  }
+
+  .hand.hand-fan .card {
+    width: 2.85rem;
+    --fan-spread: 1.05rem;
+    --fan-rot: 2.4deg;
+  }
+
+  .hand.hand-fan .card span {
+    display: none;
+  }
+
+  .hand.hand-fan .card:hover,
+  .hand.hand-fan .card:focus-visible,
+  .hand.hand-fan .card.active:hover,
+  .hand.hand-fan .card.active:focus-visible {
+    transform: translate3d(0, -0.35rem, 0) scale(1.04) rotate(0deg);
+  }
+
+  .play-dock-box {
+    min-height: 0;
+    max-height: min(34vh, 16rem);
+    padding: 0.65rem 0.7rem 0.75rem;
+  }
+
+  .play-dock-idle {
+    display: none;
+  }
+
+  .play-dock:not(:has(.piece-info-tile)):not(:has(.barrier-hint)) {
+    display: none;
+  }
+
+  .piece-info-tile.is-docked {
+    max-height: none;
+    padding: 0.85rem 0.7rem 0.7rem;
+  }
+
+  .side {
+    width: 100%;
+    padding: 0.55rem 0.6rem;
+  }
+
+  .side h2 {
+    font-size: 0.8rem;
+    margin: 0.35rem 0 0.25rem;
+  }
+
+  .log {
+    max-height: 7.5rem;
+  }
+
+  .check-alert {
+    top: auto;
+    bottom: calc(42% + env(safe-area-inset-bottom, 0px));
+    width: min(18rem, calc(100vw - 1.5rem));
+    min-width: 0;
+    padding: 0.75rem 1.1rem 0.85rem;
+  }
+
+  .check-alert-title {
+    font-size: 1.55rem;
+  }
+
+  .corner-toggles-right,
+  .knowledge-toggle,
+  .fx-toggle {
+    bottom: auto;
+  }
+
+  .knowledge-toggle {
+    top: calc(0.28rem + env(safe-area-inset-top, 0px));
+    left: max(0.3rem, env(safe-area-inset-left, 0px));
+    padding: 0.32rem 0.45rem;
+    min-height: 2rem;
+  }
+
+  .corner-toggles-right {
+    top: calc(0.22rem + env(safe-area-inset-top, 0px));
+    right: max(0.3rem, env(safe-area-inset-right, 0px));
+    flex-direction: row;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .corner-toggles-right .fx-toggle,
+  .corner-toggles-right .audio-toggle {
+    padding: 0.32rem 0.45rem;
+    min-height: 2rem;
+    min-width: 2rem;
+  }
+
+  .fx-toggle-label,
+  .music-volume {
+    display: none;
+  }
+
+  .board-prompt-float .prompt-actions button,
+  .board-prompt-float .spell-confirm-actions button {
+    flex: 1 1 8rem;
+    min-height: 2.75rem;
+    font-size: 1rem;
+  }
+
+  .board-prompt-float .spell-confirm-summary,
+  .board-prompt-float .banner {
+    font-size: 0.98rem;
+  }
+
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  .home-cta,
+  .home-join button,
+  .home-rules,
+  .draft-confirm,
+  .draft-center-actions button {
+    min-height: 2.85rem;
+  }
+
+  .home-join {
+    grid-template-columns: 1fr;
+  }
+
+  .home-join input,
+  .home-join button {
+    min-height: 2.85rem;
+  }
+
+  .waiting-room {
+    margin-top: 1.25rem;
+    padding: 1.15rem 1rem;
+  }
+
+  .waiting-room-code {
+    font-size: clamp(1.8rem, 12vw, 2.4rem);
+    overflow-wrap: anywhere;
+  }
+
+  .draft-tile {
+    flex: 1 1 calc(50% - 0.5rem);
+    width: auto;
+    max-width: calc(50% - 0.5rem);
+    min-height: 0;
+    padding: 0.55rem 0.4rem !important;
+  }
+
+  .draft-tile .sym,
+  .draft-tile .sym .piece-icon {
+    width: 4.4rem !important;
+    height: 4.4rem !important;
+  }
+
+  .draft-tile-name {
+    font-size: 0.82rem;
+  }
+
+  .draft-army-slots {
+    min-height: 0;
+  }
+
+  .draft-army-slot {
+    min-height: 4.6rem;
+    padding: 0.3rem 0.2rem;
+  }
+
+  .draft-confirm {
+    position: fixed;
+    left: max(0.65rem, env(safe-area-inset-left, 0px));
+    right: max(0.65rem, env(safe-area-inset-right, 0px));
+    bottom: calc(0.55rem + env(safe-area-inset-bottom, 0px));
+    z-index: 40;
+    width: auto;
+    min-height: 2.9rem;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.5);
+  }
+
+  .draft-stage {
+    padding-bottom: 4.25rem;
+  }
+
+  .draft-info-panel {
+    max-height: min(34vh, 280px);
+  }
+
+  .match-ceremony-card {
+    width: min(22rem, calc(100vw - 1.5rem));
+    padding: 1.2rem 1rem;
+  }
+
+  .rules-chrome {
+    padding-top: calc(0.75rem + env(safe-area-inset-top, 0px));
+    padding-left: max(1rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1rem, env(safe-area-inset-right, 0px));
+  }
+
+  .opening-mulligan-panel,
+  .hand-limit-overlay {
+    padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+    padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+  }
+
+  button,
+  .card,
+  .draft-tile {
+    touch-action: manipulation;
+  }
+}
+
+@media (max-width: 820px) and (max-height: 480px) and (orientation: landscape) {
+  .turn-strip-detail {
+    display: none;
+  }
+
+  .brand {
+    display: none;
+  }
+
+  .board-wrap {
+    --sq: min(
+      calc((100dvh - 6.2rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)) / 10),
+      calc((100dvw - 1.2rem - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 8px) / 10),
+      42px
+    );
+  }
+
+  .hand-fan-row,
+  .hand.hand-fan {
+    min-height: 3.4rem;
+  }
+
+  .hand.hand-fan .card {
+    width: 2.35rem;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .hand.hand-fan .card:hover,
+  .hand.hand-fan .card.active:hover {
+    transform: translate3d(0, calc(var(--fan-arc) * 0.28rem), 0)
+      rotate(calc((var(--fan-i) - var(--fan-mid)) * var(--fan-rot)));
+    filter: none;
+    z-index: calc(12 + var(--fan-i));
+  }
+
+  .hand.hand-fan .card.active:not(:hover):not(:focus-visible),
+  .hand.hand-fan .card:focus-visible,
+  .hand.hand-fan .card.active:focus-visible {
+    transform: translate3d(0, -0.45rem, 0) scale(1.04)
+      rotate(calc((var(--fan-i) - var(--fan-mid)) * var(--fan-rot) * 0.2));
+    z-index: 70;
+  }
+
+  .sq:active {
+    filter: brightness(1.12);
+  }
 }
 
 @media (max-width: 640px) {

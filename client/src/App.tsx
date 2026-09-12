@@ -2021,6 +2021,9 @@ export default function App() {
                   const col = flip ? 9 - visualCol : visualCol;
                   const piece = board[row][col];
                   const dark = (row + col) % 2 === 1;
+                  const viewer = you ?? 'white';
+                  const alliedHere = isAlliedTerritory(viewer, { row, col });
+                  const territoryFront = viewer === 'white' ? row === 5 : row === 4;
                   const selected = piece && piece.id === selectedPiece;
                   const moveOpts = selectableMoves.filter((m) => m.to.row === row && m.to.col === col);
                   const moveHere = moveOpts.length > 0;
@@ -2074,6 +2077,8 @@ export default function App() {
                       className={[
                         'sq',
                         dark ? 'dark' : 'light',
+                        alliedHere ? 'territory-allied' : 'territory-enemy',
+                        territoryFront ? 'territory-front' : '',
                         selected ? 'selected' : '',
                         piece && piece.id === inspectedId ? 'inspected' : '',
                         piece && !infoLocked && piece.id === hoveredId ? 'info-hover' : '',
@@ -2561,7 +2566,7 @@ export default function App() {
               {!inspectedPiece && !inspectedToken && (
                 <p className="play-dock-idle">
                   {knowledgeEnabled
-                    ? 'Hover a piece or obstacle for details, or click to lock info. Game prompts appear under the board.'
+                    ? 'Tap a piece or obstacle for details. Game prompts appear over the board.'
                     : 'Game prompts and confirmations appear under the board.'}
                 </p>
               )}
