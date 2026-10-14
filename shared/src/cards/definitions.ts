@@ -753,6 +753,8 @@ registerCard({
   targeting: 'none',
   play: (ctx) => {
     const roll = 1 + Math.floor(ctx.rng() * 6) + 1 + Math.floor(ctx.rng() * 6);
+    ctx.state.players[ctx.player].lastPlayedCardDefId = 'gamblers_gambit';
+    log(ctx.state, `${ctx.player} played Gambler's Gambit`);
     log(ctx.state, `Gambler's Gambit rolled ${roll}`);
     ctx.state.pendingPrompt = {
       type: 'gambler_choice',
@@ -782,6 +784,8 @@ registerCard({
   targeting: 'none',
   play: (ctx) => {
     const roll = 1 + Math.floor(ctx.rng() * 6) + 1 + Math.floor(ctx.rng() * 6);
+    ctx.state.players[ctx.player].lastPlayedCardDefId = 'gamblers_delight';
+    log(ctx.state, `${ctx.player} played Gambler's Delight`);
     log(ctx.state, `Gambler's Delight rolled ${roll}`);
     ctx.state.pendingPrompt = {
       type: 'gambler_choice',

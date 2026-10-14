@@ -214,6 +214,15 @@ export function log(state: GameState, message: string): void {
   if (state.history.length > 80) state.history.length = 80;
 }
 
+/** Record an ability trigger so every client can play its sound. */
+export function abilityFx(state: GameState, id: string): void {
+  const list = state.abilityFx ?? [];
+  const seq = (list[list.length - 1]?.seq ?? 0) + 1;
+  list.push({ seq, id });
+  if (list.length > 12) list.splice(0, list.length - 12);
+  state.abilityFx = list;
+}
+
 export function movementBonus(piece: PieceState): number {
   let bonus = 0;
   for (const e of piece.effects) {

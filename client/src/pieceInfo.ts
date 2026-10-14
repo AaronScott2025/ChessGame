@@ -1,3 +1,5 @@
+import { FINAL_FORMS } from '@shared/pieces/prototype.ts';
+
 export interface PieceInfo {
   id: string;
   name: string;
@@ -116,6 +118,17 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     ],
     notes: ['Cannot be captured by any pawn variant.'],
   },
+  crocodile: {
+    id: 'crocodile',
+    name: 'Crocodile',
+    classLabel: 'Rook',
+    movement: ['Moves up to 2 squares horizontally or vertically.'],
+    abilities: [
+      'Ultimate Suck (5-turn cooldown): grab any allied or enemy piece within 2 tiles (not a king) and launch it exactly 3 tiles in a straight line (orthogonal or diagonal). The first 2 tiles of the path must be clear.',
+      'If the 3rd tile holds an enemy piece, it is captured. Kings and protected pieces cannot be captured this way.',
+    ],
+    notes: ['The Crocodile does not move when using Ultimate Suck. Using it takes your turn.'],
+  },
   horse: {
     id: 'horse',
     name: 'Horse',
@@ -203,7 +216,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'spider_queen',
     name: 'Spider Queen',
     classLabel: 'Queen',
-    movement: ['Moves up to 4 squares in any direction (orthogonal or diagonal).'],
+    movement: [
+      'Moves up to 3 squares in any direction (orthogonal or diagonal).',
+      'While standing on any web, moves up to 4 squares instead.',
+    ],
     abilities: [
       'Trail of Webs: after she leaves a square, a web is placed on that square and the tiles to her left and right of travel (horizontal move → above, origin, below).',
       'Any piece that moves onto or through a web is stopped there and stuck for 3 turns, or until that web disappears.',
@@ -256,7 +272,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves 1 tile in any direction.'],
     abilities: [
       'Trail: may move a maximum of 8 tiles per game. After that, it is immobilized permanently.',
-      'If this piece captures, every enemy piece of that same variant is also removed (for example, capturing a Pawn takes all enemy Pawns).',
+      'If this piece captures, every enemy piece of that same class is also removed, whatever its variant (for example, capturing a Pawn also takes every enemy Rogue, nwaP, or Crystalite).',
     ],
   },
   vampire: {
@@ -335,6 +351,46 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Chrono Recall cannot leave your King in check.',
       'Line of sight is a straight unobstructed path in any direction.',
     ],
+  },
+  prototype: {
+    id: 'prototype',
+    name: 'The Prototype',
+    classLabel: 'Wildcard',
+    movement: [
+      'Moves like a Knight (L-shape), but pieces on the long leg block it until it mutates Spider Chassis.',
+      'Movement bonuses lengthen the long leg of the L.',
+    ],
+    abilities: [
+      'Adaptive Evolution: gains a random mutation each time it captures an enemy and each time it survives a night. Mutations are permanent.',
+      'Offensive: Razor Limbs (step 1 after capturing), Execution Protocol (lunge-capture one square past an L landing), Chain Assault (once: capture an adjacent enemy after capturing), Overclock Weapons (captures ignore defenses).',
+      'Mobility: Vector Thrusters (1-square diagonal moves), Spider Chassis (jump over pieces), Teleport Relay (every 3 turns, teleport within 4), Magnetic Leap (pull next to an enemy within 3), Quantum Drive (once: blink anywhere).',
+      'Defensive: Reinforced Hull (ignore the first capture), Reactive Plating (knock adjacent enemies 1 square away at the end of their turn), Self-Repair Nanites (shake off Frozen/Stunned/Immobilized/Webbed each turn), Energy Shield (first enemy ability/spell fails), Backup Core (leave a Backup Drone on death).',
+      'Utility: Gravity Field (adjacent enemies lose 1 movement), EMP Burst (every 4 turns, disable enemy abilities within 2), Drone Launcher (once: deploy a Drone), Battlefield Scanner (+1 movement per adjacent enemy, max +3), Adaptive Reactor (every 3rd turn, an extra non-capturing action).',
+      'Instability: Power Surge (must advance on the nearest enemy), Motor Failure (only 1-square moves), Logic Conflict (instantly glitches to a random empty square within 2), Thermal Overload (cannot capture next turn), Core Fracture (cannot move, capture or use abilities next turn).',
+      'Final Evolution (6 mutations): permanently choose one form. Free action.',
+      ...Object.values(FINAL_FORMS).map((f) => `${f.icon} ${f.name}: ${f.summary} ${f.perks.join(' ')}`),
+    ],
+    notes: [
+      'Its armor visibly upgrades every 2 mutations, up to 6 (cosmetic only).',
+      'Follow-ups (Chain Assault, Razor Limbs) are skipped if the capture gives check.',
+      'Gravity Field does not affect Kings or Knights.',
+    ],
+  },
+  drone: {
+    id: 'drone',
+    name: 'Drone',
+    classLabel: 'Wildcard',
+    movement: ['Moves up to 2 squares orthogonally (cannot capture this way).'],
+    abilities: ['Captures like a King: any adjacent enemy.'],
+    notes: ['Deployed by the Prototype’s Drone Launcher.'],
+  },
+  backup_drone: {
+    id: 'backup_drone',
+    name: 'Backup Drone',
+    classLabel: 'Wildcard',
+    movement: ['Moves 1 square in any direction.'],
+    abilities: [],
+    notes: ['Left behind when a Prototype with Backup Core is destroyed.'],
   },
   king: {
     id: 'king',

@@ -7,10 +7,14 @@ import cors from 'cors';
 import {
   availableAbilities,
   createLobbyState,
+  forceTimeoutMove,
   getDraftOptions,
   listMoves,
   publicState,
+  seatDisplayName,
   startDraft,
+  syncTurnTimer,
+  turnTimerExpired,
   applyClientAction,
   type ClientAction,
   type Color,
@@ -38,9 +42,92 @@ interface Room {
   code: string;
   state: GameState;
   sockets: Partial<Record<Color, string>>;
+  password?: string;
+  createdAt: number;
+  emptySince?: number;
+  timerHandle?: ReturnType<typeof setTimeout>;
+}
+
+interface RoomSummary {
+  code: string;
+  host: string;
+  locked: boolean;
+  banPhase: boolean;
+  anonymous: boolean;
+  turnTimerSeconds: number | null;
+  phase: GameState['phase'];
+  players: number;
+  joinable: boolean;
+  createdAt: number;
+}
+
+interface CreateRoomPayload {
+  name?: string;
+  rules?: { banPhase?: unknown; anonymous?: unknown; turnTimerSeconds?: unknown };
+  password?: unknown;
+}
+
+interface JoinRoomPayload {
+  code: string;
+  name?: string;
+  password?: unknown;
 }
 
 const rooms = new Map<string, Room>();
+const ROOM_BROWSER = 'room-browser';
+const EMPTY_ROOM_TTL_MS = 2 * 60 * 1000;
+const MAX_PASSWORD_LENGTH = 32;
+let lastRoomListJson = '';
+
+function roomSummary(room: Room): RoomSummary {
+  const players = Number(Boolean(room.sockets.white)) + Number(Boolean(room.sockets.black));
+  return {
+    code: room.code,
+    host: room.state.players.white.name || 'White',
+    locked: Boolean(room.password),
+    banPhase: room.state.rules?.banPhase !== false,
+    anonymous: Boolean(room.state.rules?.anonymous),
+    turnTimerSeconds: room.state.rules?.turnTimerSeconds ?? null,
+    phase: room.state.phase,
+    players,
+    joinable: players < 2 && room.state.phase !== 'ended',
+    createdAt: room.createdAt,
+  };
+}
+
+function listRooms(): RoomSummary[] {
+  return [...rooms.values()]
+    .filter((r) => r.sockets.white || r.sockets.black)
+    .map(roomSummary)
+    .sort((a, b) => Number(b.joinable) - Number(a.joinable) || b.createdAt - a.createdAt);
+}
+
+function broadcastRooms(): void {
+  const list = listRooms();
+  const json = JSON.stringify(list);
+  if (json === lastRoomListJson) return;
+  lastRoomListJson = json;
+  io.to(ROOM_BROWSER).emit('rooms', list);
+}
+
+function cleanupEmptyRooms(): void {
+  const now = Date.now();
+  for (const [key, room] of rooms) {
+    if (room.sockets.white || room.sockets.black) {
+      room.emptySince = undefined;
+    } else if (room.emptySince == null) {
+      room.emptySince = now;
+    } else if (now - room.emptySince > EMPTY_ROOM_TTL_MS) {
+      if (room.timerHandle) clearTimeout(room.timerHandle);
+      rooms.delete(key);
+    }
+  }
+}
+
+setInterval(() => {
+  cleanupEmptyRooms();
+  broadcastRooms();
+}, 30_000);
 
 function code(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -61,12 +148,38 @@ function colorOf(room: Room, socketId: string): Color | null {
   return null;
 }
 
+function scheduleTurnTimeout(room: Room): void {
+  if (room.timerHandle) clearTimeout(room.timerHandle);
+  room.timerHandle = undefined;
+  const deadline = room.state.turnTimer?.deadline;
+  if (deadline == null) return;
+  room.timerHandle = setTimeout(() => {
+    room.timerHandle = undefined;
+    if (!rooms.has(room.code) || (!room.sockets.white && !room.sockets.black)) return;
+    if (turnTimerExpired(room.state, Date.now())) {
+      try {
+        room.state = forceTimeoutMove(room.state);
+      } catch (e) {
+        console.error(`Turn timeout failed in room ${room.code}:`, e);
+      }
+      const timer = room.state.turnTimer;
+      if (timer && turnTimerExpired(room.state, Date.now())) {
+        timer.deadline = Date.now() + timer.durationMs;
+      }
+    }
+    emitRoom(room);
+  }, Math.max(0, deadline - Date.now()) + 50);
+}
+
 function emitRoom(room: Room): void {
+  syncTurnTimer(room.state, Date.now());
+  scheduleTurnTimeout(room);
   for (const color of ['white', 'black'] as Color[]) {
     const sid = room.sockets[color];
     if (!sid) continue;
     io.to(sid).emit('state', {
       state: publicState(room.state, color),
+      serverNow: Date.now(),
       you: color,
       legalMoves: {},
       draftOptions: getDraftOptions(room.state),
@@ -97,6 +210,7 @@ function emitRoom(room: Room): void {
     },
     phase: room.state.phase,
   });
+  broadcastRooms();
 }
 
 app.get('/api/health', (_req, res) => {
@@ -113,22 +227,53 @@ app.use((req, res, next) => {
 });
 
 io.on('connection', (socket) => {
-  socket.on('create_room', (payload: { name?: string }, ack?: (r: unknown) => void) => {
+  socket.on('list_rooms', (_payload: unknown, ack?: (r: unknown) => void) => {
+    socket.join(ROOM_BROWSER);
+    ack?.({ ok: true, rooms: listRooms() });
+  });
+
+  socket.on('unlist_rooms', () => {
+    socket.leave(ROOM_BROWSER);
+  });
+
+  socket.on('create_room', (payload: CreateRoomPayload, ack?: (r: unknown) => void) => {
     let roomCode = code();
     while (rooms.has(roomCode)) roomCode = code();
-    const state = createLobbyState(roomCode);
-    const room: Room = { code: roomCode, state, sockets: { white: socket.id } };
+    const password = typeof payload?.password === 'string' ? payload.password.trim() : '';
+    if (password.length > MAX_PASSWORD_LENGTH) {
+      ack?.({ ok: false, error: `Password must be ${MAX_PASSWORD_LENGTH} characters or fewer` });
+      return;
+    }
+    const state = createLobbyState(roomCode, Date.now(), payload?.rules ?? {});
+    const room: Room = {
+      code: roomCode,
+      state,
+      sockets: { white: socket.id },
+      password: password || undefined,
+      createdAt: Date.now(),
+    };
     state.players.white.connected = true;
-    state.players.white.name = payload?.name?.trim() || 'White';
+    state.players.white.name = seatDisplayName(state, 'white', payload?.name);
     rooms.set(roomCode, room);
     socket.join(roomCode);
     ack?.({ ok: true, code: roomCode, color: 'white' });
     emitRoom(room);
   });
 
-  socket.on('join_room', (payload: { code: string; name?: string }, ack?: (r: unknown) => void) => {
+  socket.on('join_room', (payload: JoinRoomPayload, ack?: (r: unknown) => void) => {
     try {
-      const room = getRoom(payload.code);
+      const room = getRoom(String(payload?.code ?? ''));
+      if (room.password) {
+        const given = typeof payload?.password === 'string' ? payload.password.trim() : '';
+        if (given !== room.password) {
+          ack?.({
+            ok: false,
+            needsPassword: true,
+            error: given ? 'Wrong password' : 'This room is password protected',
+          });
+          return;
+        }
+      }
       let color: Color;
       if (!room.sockets.white) color = 'white';
       else if (!room.sockets.black) color = 'black';
@@ -138,7 +283,7 @@ io.on('connection', (socket) => {
       }
       room.sockets[color] = socket.id;
       room.state.players[color].connected = true;
-      room.state.players[color].name = payload?.name?.trim() || (color === 'white' ? 'White' : 'Black');
+      room.state.players[color].name = seatDisplayName(room.state, color, payload?.name);
       socket.join(room.code);
       if (room.sockets.white && room.sockets.black && room.state.phase === 'lobby') {
         room.state = startDraft(room.state);
@@ -190,16 +335,26 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('disconnect', () => {
+  const releaseSeats = (onlyCode?: string) => {
     for (const room of rooms.values()) {
+      if (onlyCode && room.code !== onlyCode.toUpperCase()) continue;
       for (const color of ['white', 'black'] as Color[]) {
         if (room.sockets[color] === socket.id) {
           room.sockets[color] = undefined;
           room.state.players[color].connected = false;
+          socket.leave(room.code);
           emitRoom(room);
         }
       }
     }
+  };
+
+  socket.on('leave_room', (payload: { code?: string }) => {
+    if (typeof payload?.code === 'string') releaseSeats(payload.code);
+  });
+
+  socket.on('disconnect', () => {
+    releaseSeats();
   });
 });
 

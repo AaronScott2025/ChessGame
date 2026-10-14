@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react';
 
 const FX_STORAGE_KEY = 'chesspansion-fx-enabled';
 const KNOWLEDGE_STORAGE_KEY = 'chesspansion-knowledge-enabled';
+const BAN_PHASE_STORAGE_KEY = 'chesspansion-rule-ban-phase';
+const ANONYMOUS_STORAGE_KEY = 'chesspansion-rule-anonymous';
+const TURN_TIMER_STORAGE_KEY = 'chesspansion-rule-turn-timer';
 
 function usePersistedToggle(storageKey: string, defaultValue = true) {
   const [enabled, setEnabled] = useState(() => {
@@ -37,6 +40,38 @@ export function useFxEnabled() {
 export function useKnowledgeEnabled() {
   const [knowledgeEnabled, setKnowledgeEnabled] = usePersistedToggle(KNOWLEDGE_STORAGE_KEY);
   return { knowledgeEnabled, setKnowledgeEnabled };
+}
+
+export function useBanPhaseRule() {
+  const [banPhaseRule, setBanPhaseRule] = usePersistedToggle(BAN_PHASE_STORAGE_KEY);
+  return { banPhaseRule, setBanPhaseRule };
+}
+
+export function useAnonymousRule() {
+  const [anonymousRule, setAnonymousRule] = usePersistedToggle(ANONYMOUS_STORAGE_KEY, false);
+  return { anonymousRule, setAnonymousRule };
+}
+
+/** Chess but Fast seconds per turn; 0 means the rule is off. */
+export function useTurnTimerRule() {
+  const [turnTimerRule, setTurnTimerRule] = useState<number>(() => {
+    try {
+      const raw = Number(localStorage.getItem(TURN_TIMER_STORAGE_KEY));
+      return Number.isFinite(raw) ? raw : 0;
+    } catch {
+      return 0;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TURN_TIMER_STORAGE_KEY, String(turnTimerRule));
+    } catch {
+      /* ignore */
+    }
+  }, [turnTimerRule]);
+
+  return { turnTimerRule, setTurnTimerRule };
 }
 
 export function CosmicBackdrop({

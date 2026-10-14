@@ -4,12 +4,14 @@ import {
   applyMove,
   cancelPrompt,
   chooseFirstPicker,
+  draftBan,
   draftPick,
   openingKeep,
   openingRedraw,
   playCard,
   refreshCheckState,
   resolvePrompt,
+  seatDisplayName,
   skipSpell,
   useAbility,
 } from './game.js';
@@ -20,12 +22,15 @@ export function applyClientAction(state: GameState, color: Color, action: Client
   switch (action.type) {
     case 'set_name': {
       next = cloneState(state);
-      next.players[color].name = action.name;
+      next.players[color].name = seatDisplayName(next, color, action.name);
       break;
     }
     case 'choose_first_picker':
       if (color !== 'black') throw new Error('Only Black chooses');
       next = chooseFirstPicker(state, action.whitePicksFirst);
+      break;
+    case 'draft_ban':
+      next = draftBan(state, color, action.defId);
       break;
     case 'draft_pick':
       next = draftPick(state, color, action.defId);

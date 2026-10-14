@@ -4,11 +4,11 @@ import { getObstacleInfo, OBSTACLE_ORDER, type ObstacleInfo } from './obstacleIn
 
 const CLASS_SECTIONS: Array<{ title: string; ids: string[] }> = [
   { title: 'Pawns', ids: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'] },
-  { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome', 'yeti'] },
+  { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome', 'yeti', 'crocodile'] },
   { title: 'Knights', ids: ['horse', 'snake', 'pig', 'archer'] },
   { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard', 'worm'] },
   { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'] },
-  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper'] },
+  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype'] },
   { title: 'King', ids: ['king'] },
 ];
 
@@ -186,8 +186,16 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
             </p>
             <ul>
               <li>
-                <strong>Black</strong> decides who drafts first. Players then alternate picks until both
-                armies are complete. Each player&apos;s picks are visible during the draft.
+                <strong>Black</strong> decides who goes first. That player bans first and drafts first.
+              </li>
+              <li>
+                <strong>Ban phase</strong> (lobby rule, on by default): players alternate until each has banned{' '}
+                <strong>2 pieces</strong>, at most one per class (you can&apos;t ban two Rooks). A banned piece
+                can&apos;t be drafted by either player. When the lobby turns it off, the draft starts right away.
+              </li>
+              <li>
+                Players then alternate picks until both armies are complete. Each player&apos;s picks are
+                visible during the draft.
               </li>
               <li>
                 Place your pawn row on the <strong>2nd rank</strong> from your side.
@@ -195,6 +203,26 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
               <li>
                 On the back rank, left to right:{' '}
                 <em>Rook, Knight, Wildcard, Bishop, Queen, King, Bishop, Wildcard, Knight, Rook</em>.
+              </li>
+            </ul>
+          </section>
+
+          <section className="rules-page">
+            <h2>Lobby rules</h2>
+            <p>The player who creates the lobby (or starts local play) chooses these before the game.</p>
+            <ul>
+              <li>
+                <strong>Ban phase</strong> — on by default. See <em>Starting the game</em>.
+              </li>
+              <li>
+                <strong>Anonymous</strong> — display names are hidden; the players are shown only as{' '}
+                <strong>White</strong> and <strong>Black</strong>.
+              </li>
+              <li>
+                <strong>Chess but Fast ⏱</strong> — every turn has a clock of <strong>1 min, 45s, 30s, or 15s</strong>.
+                If it runs out, a <strong>random legal move</strong> is played for you (any spell you were
+                targeting is abandoned). A player <strong>in check has unlimited time</strong> that turn. The clock
+                ticks during the final seconds and sounds an alarm at zero.
               </li>
             </ul>
           </section>

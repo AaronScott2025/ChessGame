@@ -112,7 +112,11 @@ type AudioEngine = {
   resultStarted: boolean;
 };
 
-const engine: AudioEngine = {
+const engineHost = window as Window & { __chesspansionEngine?: AudioEngine };
+const freshEngine = !engineHost.__chesspansionEngine;
+
+/** Lives on `window` so a hot-reloaded copy of this module drives the same tracks instead of orphaning them. */
+const engine: AudioEngine = (engineHost.__chesspansionEngine ??= {
   musicEnabled: readFlag(MUSIC_KEY, true),
   sfxEnabled: readFlag(SFX_KEY, true),
   musicVolume: readVolume(MUSIC_VOL_KEY, DEFAULT_MUSIC_VOLUME),
@@ -130,7 +134,7 @@ const engine: AudioEngine = {
   resultKind: null,
   resultFinished: false,
   resultStarted: false,
-};
+});
 
 const CHECKED_VOLUME_SCALE = 1;
 
@@ -356,6 +360,8 @@ function ensureTracks() {
 
 const playIntent = new WeakMap<HTMLAudioElement, 'play' | 'pause'>();
 const oneShots = new Set<HTMLAudioElement>();
+// Tracks left by an older copy of this module have no engine steering them.
+if (freshEngine) silenceOwnedAudio();
 
 function markPaused(audio: HTMLAudioElement) {
   playIntent.set(audio, 'pause');
@@ -448,6 +454,7 @@ function haltProcedural() {
   if (!proceduralCtx) return;
   const ctx = proceduralCtx;
   proceduralCtx = null;
+  fxCtxHost.__chesspansionFxCtx = null;
   void ctx.close().catch(() => {});
 }
 
@@ -616,14 +623,18 @@ export function playMoveSfx(deltaCol = 0, deltaRow = 0) {
   land.stop(t + slide + 0.07);
 }
 
-let proceduralCtx: AudioContext | null = null;
+const fxCtxHost = window as Window & { __chesspansionFxCtx?: AudioContext | null };
+let proceduralCtx: AudioContext | null = fxCtxHost.__chesspansionFxCtx ?? null;
 
 function getProceduralCtx(): AudioContext | null {
   if (!engine.sfxEnabled) return null;
   try {
     const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!Ctx) return null;
-    if (!proceduralCtx) proceduralCtx = new Ctx();
+    if (!proceduralCtx || proceduralCtx.state === 'closed') {
+      proceduralCtx = new Ctx();
+      fxCtxHost.__chesspansionFxCtx = proceduralCtx;
+    }
     if (proceduralCtx.state === 'suspended') {
       proceduralCtx.resume().catch(() => {});
     }
@@ -654,6 +665,136 @@ export function playDraftSelectSfx() {
   osc.connect(master);
   osc.start(t);
   osc.stop(t + 0.24);
+}
+
+/** Two quick low buzzes for a rejected click (e.g. tapping a banned piece). */
+export function playErrorBuzzSfx() {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+
+  const t = ctx.currentTime;
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(1400, t);
+  filter.connect(ctx.destination);
+
+  for (const offset of [0, 0.12]) {
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, t + offset);
+    gain.gain.exponentialRampToValueAtTime(0.16, t + offset + 0.01);
+    gain.gain.setValueAtTime(0.16, t + offset + 0.07);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + offset + 0.1);
+    gain.connect(filter);
+    for (const freq of [138, 146]) {
+      const osc = ctx.createOscillator();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(freq, t + offset);
+      osc.connect(gain);
+      osc.start(t + offset);
+      osc.stop(t + offset + 0.11);
+    }
+  }
+}
+
+/**
+ * Clock tick for Chess but Fast's final seconds. `urgency` (0–1) raises the pitch and
+ * adds a second, sharper blip in the last moments.
+ */
+export function playTimerTickSfx(urgency: number) {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+
+  const u = Math.max(0, Math.min(1, urgency));
+  const t = ctx.currentTime;
+  const blips = u >= 0.7 ? [0, 0.11] : [0];
+  for (const offset of blips) {
+    const osc = ctx.createOscillator();
+    osc.type = u >= 0.7 ? 'square' : 'triangle';
+    osc.frequency.setValueAtTime(880 + u * 660 + offset * 1200, t + offset);
+    const gain = ctx.createGain();
+    const peak = 0.07 + u * 0.09;
+    gain.gain.setValueAtTime(0.0001, t + offset);
+    gain.gain.exponentialRampToValueAtTime(peak, t + offset + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + offset + 0.09);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t + offset);
+    osc.stop(t + offset + 0.1);
+  }
+}
+
+/** Alarm when the turn clock hits zero and a random move is forced. */
+export function playTimeUpSfx() {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+
+  const t = ctx.currentTime;
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(3200, t);
+  filter.connect(ctx.destination);
+  [0, 0.16, 0.32].forEach((offset, i) => {
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    const start = t + offset;
+    osc.frequency.setValueAtTime(i === 2 ? 520 : 760, start);
+    if (i === 2) osc.frequency.exponentialRampToValueAtTime(180, start + 0.45);
+    const gain = ctx.createGain();
+    const len = i === 2 ? 0.5 : 0.12;
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.2, start + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + len);
+    osc.connect(gain);
+    gain.connect(filter);
+    osc.start(start);
+    osc.stop(start + len + 0.02);
+  });
+}
+
+/** Heavy descending slam when a piece is banned. */
+export function playDraftBanSfx() {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+
+  const t = ctx.currentTime;
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0.0001, t);
+  master.gain.exponentialRampToValueAtTime(0.42, t + 0.012);
+  master.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(2400, t);
+  filter.frequency.exponentialRampToValueAtTime(300, t + 0.45);
+  master.connect(filter);
+  filter.connect(ctx.destination);
+
+  const saw = ctx.createOscillator();
+  saw.type = 'sawtooth';
+  saw.frequency.setValueAtTime(320, t);
+  saw.frequency.exponentialRampToValueAtTime(70, t + 0.4);
+  saw.connect(master);
+  saw.start(t);
+  saw.stop(t + 0.5);
+
+  const thud = ctx.createOscillator();
+  thud.type = 'sine';
+  thud.frequency.setValueAtTime(110, t);
+  thud.frequency.exponentialRampToValueAtTime(45, t + 0.2);
+  const thudGain = ctx.createGain();
+  thudGain.gain.setValueAtTime(0.9, t);
+  thudGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+  thud.connect(thudGain);
+  thudGain.connect(master);
+  thud.start(t);
+  thud.stop(t + 0.26);
 }
 
 /** Cosmic stamp when a draft pick lands in the roster (matches pick flash animation). */
@@ -750,48 +891,148 @@ function playTone(
   osc.stop(start + dur + 0.02);
 }
 
-/** Soft wooden-metal tap when you capture an enemy piece. */
+function distortionCurve(amount: number): Float32Array<ArrayBuffer> {
+  const samples = 1024;
+  const curve = new Float32Array(new ArrayBuffer(samples * 4));
+  for (let i = 0; i < samples; i++) {
+    const x = (i * 2) / samples - 1;
+    curve[i] = ((3 + amount) * x * 20 * (Math.PI / 180)) / (Math.PI + amount * Math.abs(x));
+  }
+  return curve;
+}
+
+/** Master bus with a limiter so the big layered hits stay loud without clipping. */
+function limitedMaster(ctx: AudioContext, level = 1): GainNode {
+  const master = ctx.createGain();
+  master.gain.value = level;
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -12;
+  comp.knee.value = 6;
+  comp.ratio.value = 8;
+  comp.attack.value = 0.002;
+  comp.release.value = 0.18;
+  master.connect(comp);
+  comp.connect(ctx.destination);
+  return master;
+}
+
+function noiseBurst(
+  ctx: AudioContext,
+  dest: AudioNode,
+  opts: {
+    start: number;
+    dur: number;
+    peak: number;
+    filter: BiquadFilterType;
+    freq: number;
+    endFreq?: number;
+    q?: number;
+    drive?: number;
+  },
+) {
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx, opts.dur + 0.02);
+  const filter = ctx.createBiquadFilter();
+  filter.type = opts.filter;
+  filter.frequency.setValueAtTime(opts.freq, opts.start);
+  if (opts.endFreq) filter.frequency.exponentialRampToValueAtTime(opts.endFreq, opts.start + opts.dur);
+  filter.Q.value = opts.q ?? 0.8;
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0.0001, opts.start);
+  gain.gain.exponentialRampToValueAtTime(opts.peak, opts.start + 0.006);
+  gain.gain.exponentialRampToValueAtTime(0.0001, opts.start + opts.dur);
+  src.connect(filter);
+  if (opts.drive) {
+    const shaper = ctx.createWaveShaper();
+    shaper.curve = distortionCurve(opts.drive);
+    shaper.oversample = '2x';
+    filter.connect(shaper);
+    shaper.connect(gain);
+  } else {
+    filter.connect(gain);
+  }
+  gain.connect(dest);
+  src.start(opts.start);
+  src.stop(opts.start + opts.dur + 0.02);
+}
+
+/** Punchy crunch with a small chime when you capture an enemy piece. */
 export function playCaptureSfx() {
   if (!engine.sfxEnabled) return;
   unlockAudio();
   const ctx = getProceduralCtx();
   if (!ctx) return;
   const t = ctx.currentTime;
-  const master = ctx.createGain();
-  master.gain.value = 1;
-  master.connect(ctx.destination);
+  const master = limitedMaster(ctx, 1);
 
-  playTone(ctx, master, { type: 'triangle', freq: 210, endFreq: 92, start: t, dur: 0.11, peak: 0.2 });
-  playTone(ctx, master, { type: 'sine', freq: 540, endFreq: 320, start: t + 0.012, dur: 0.07, peak: 0.09 });
+  // Thump
+  playTone(ctx, master, { type: 'sine', freq: 170, endFreq: 55, start: t, dur: 0.24, peak: 0.34 });
+  playTone(ctx, master, { type: 'triangle', freq: 230, endFreq: 90, start: t, dur: 0.12, peak: 0.16 });
 
-  const noise = ctx.createBufferSource();
-  noise.buffer = noiseBuffer(ctx, 0.08);
-  const filter = ctx.createBiquadFilter();
-  filter.type = 'highpass';
-  filter.frequency.value = 900;
-  const nGain = ctx.createGain();
-  nGain.gain.setValueAtTime(0.07, t);
-  nGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
-  noise.connect(filter);
-  filter.connect(nGain);
-  nGain.connect(master);
-  noise.start(t);
-  noise.stop(t + 0.08);
+  // Crunch
+  noiseBurst(ctx, master, {
+    start: t,
+    dur: 0.14,
+    peak: 0.22,
+    filter: 'bandpass',
+    freq: 1900,
+    endFreq: 520,
+    q: 0.9,
+    drive: 18,
+  });
+
+  // Light clang + two-note chime
+  playTone(ctx, master, { type: 'triangle', freq: 1370, endFreq: 1260, start: t + 0.01, dur: 0.18, peak: 0.05 });
+  [1318, 1760].forEach((freq, i) => {
+    playTone(ctx, master, { type: 'triangle', freq, start: t + 0.08 + i * 0.06, dur: 0.14, peak: 0.07 });
+  });
 }
 
-/** Muted falling thud when one of your pieces is taken. */
+/** Heavy thud with a short sinking tone when one of your pieces is taken. */
 export function playPieceLostSfx() {
   if (!engine.sfxEnabled) return;
   unlockAudio();
   const ctx = getProceduralCtx();
   if (!ctx) return;
   const t = ctx.currentTime;
-  const master = ctx.createGain();
-  master.gain.value = 1;
-  master.connect(ctx.destination);
+  const master = limitedMaster(ctx, 1);
 
-  playTone(ctx, master, { type: 'sine', freq: 168, endFreq: 64, start: t, dur: 0.22, peak: 0.18 });
-  playTone(ctx, master, { type: 'triangle', freq: 240, endFreq: 90, start: t + 0.03, dur: 0.18, peak: 0.08 });
+  // Thud
+  playTone(ctx, master, { type: 'sine', freq: 140, endFreq: 40, start: t, dur: 0.34, peak: 0.36 });
+  noiseBurst(ctx, master, {
+    start: t,
+    dur: 0.13,
+    peak: 0.18,
+    filter: 'lowpass',
+    freq: 1200,
+    endFreq: 200,
+    drive: 12,
+  });
+
+  // Small crack
+  noiseBurst(ctx, master, { start: t + 0.02, dur: 0.16, peak: 0.07, filter: 'highpass', freq: 4000, q: 1.1 });
+
+  // Sinking "wahh"
+  const horn = ctx.createBiquadFilter();
+  horn.type = 'lowpass';
+  horn.frequency.value = 900;
+  horn.Q.value = 1.5;
+  horn.connect(master);
+  const start = t + 0.1;
+  const dur = 0.36;
+  const osc = ctx.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(277, start);
+  osc.frequency.exponentialRampToValueAtTime(196, start + dur);
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0.0001, start);
+  gain.gain.exponentialRampToValueAtTime(0.1, start + 0.03);
+  gain.gain.setValueAtTime(0.1, start + dur * 0.6);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  osc.connect(gain);
+  gain.connect(horn);
+  osc.start(start);
+  osc.stop(start + dur + 0.02);
 }
 
 /** One-shot retro sword slash when your king is put in check. */
@@ -916,35 +1157,67 @@ export function playNightToDaySfx() {
   playTone(ctx, master, { type: 'triangle', freq: 247, endFreq: 523, start: t + 0.08, dur: 0.46, peak: 0.07 });
 }
 
-/** Soft sparkle when a spell card is successfully cast. */
-export function playCardCastSfx() {
+/**
+ * Card cast: a card-flick whoosh, then the card's own signature sound (see `CARD_SFX`).
+ * Cards without a signature fall back to a ringing rune chord with an echo tail.
+ * Your casts resolve bright; opponent casts resolve lower and darker.
+ */
+export function playCardCastSfx(mine = true, defId?: string | null) {
   if (!engine.sfxEnabled) return;
   unlockAudio();
   const ctx = getProceduralCtx();
   if (!ctx) return;
   const t = ctx.currentTime;
-  const master = ctx.createGain();
-  master.gain.value = 1;
-  master.connect(ctx.destination);
+  const master = limitedMaster(ctx, 0.95);
 
-  playTone(ctx, master, { type: 'sine', freq: 620, endFreq: 880, start: t, dur: 0.16, peak: 0.11 });
-  playTone(ctx, master, { type: 'triangle', freq: 880, endFreq: 1320, start: t + 0.05, dur: 0.18, peak: 0.08 });
+  if (defId && playCardSignatureSfx(defId, mine)) {
+    noiseBurst(ctx, master, { start: t, dur: 0.05, peak: 0.1, filter: 'highpass', freq: 2600 });
+    noiseBurst(ctx, master, { start: t + 0.02, dur: 0.14, peak: 0.06, filter: 'bandpass', freq: 700, endFreq: 2800, q: 1.4 });
+    return;
+  }
 
-  const noise = ctx.createBufferSource();
-  noise.buffer = noiseBuffer(ctx, 0.16);
-  const filter = ctx.createBiquadFilter();
-  filter.type = 'bandpass';
-  filter.frequency.value = 1800;
-  filter.Q.value = 0.8;
-  const nGain = ctx.createGain();
-  nGain.gain.setValueAtTime(0.0001, t);
-  nGain.gain.linearRampToValueAtTime(0.05, t + 0.02);
-  nGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
-  noise.connect(filter);
-  filter.connect(nGain);
-  nGain.connect(master);
-  noise.start(t);
-  noise.stop(t + 0.16);
+  const bus = ctx.createGain();
+  bus.connect(master);
+  const echo = ctx.createDelay(1);
+  echo.delayTime.value = 0.15;
+  const feedback = ctx.createGain();
+  feedback.gain.value = 0.32;
+  const tone = ctx.createBiquadFilter();
+  tone.type = 'lowpass';
+  tone.frequency.value = 3200;
+  const wet = ctx.createGain();
+  wet.gain.value = 0.38;
+  bus.connect(echo);
+  echo.connect(tone);
+  tone.connect(feedback);
+  feedback.connect(echo);
+  tone.connect(wet);
+  wet.connect(master);
+
+  // Card flick + rising swoosh
+  noiseBurst(ctx, bus, { start: t, dur: 0.05, peak: 0.12, filter: 'highpass', freq: 2600 });
+  noiseBurst(ctx, bus, { start: t + 0.02, dur: 0.3, peak: 0.08, filter: 'bandpass', freq: 500, endFreq: 3400, q: 1.4 });
+
+  // Charging glide
+  const [glideFrom, glideTo] = mine ? [330, 660] : [262, 466];
+  playTone(ctx, bus, { type: 'sine', freq: glideFrom, endFreq: glideTo, start: t + 0.03, dur: 0.26, peak: 0.08 });
+  playTone(ctx, bus, { type: 'triangle', freq: glideFrom * 1.007, endFreq: glideTo * 1.007, start: t + 0.03, dur: 0.26, peak: 0.04 });
+
+  // Release: soft whomp + rune chord
+  const hit = t + 0.27;
+  playTone(ctx, master, { type: 'sine', freq: 120, endFreq: 62, start: hit, dur: 0.3, peak: 0.2 });
+  const chord = mine ? [659, 831, 988, 1319] : [587, 698, 880, 1047];
+  chord.forEach((freq, i) => {
+    const start = hit + i * 0.025;
+    playTone(ctx, bus, { type: 'triangle', freq, start, dur: 0.85, peak: 0.055 });
+    playTone(ctx, bus, { type: 'sine', freq: freq * 2.01, start, dur: 0.45, peak: 0.018 });
+  });
+
+  // Shimmer dust
+  const sparkles = mine ? [3520, 2960, 3950, 2637, 3320] : [2490, 2217, 2793, 1976, 2349];
+  sparkles.forEach((freq, i) => {
+    playTone(ctx, bus, { type: 'sine', freq, start: hit + 0.05 + i * 0.055, dur: 0.12, peak: 0.025 });
+  });
 }
 
 /** Quiet paper flick when a card is discarded. */
@@ -1097,6 +1370,655 @@ export function playDraftOrderSfx(whiteFirst: boolean) {
     dur: 0.28,
     peak: 0.08,
   });
+}
+
+type FxLayerTiming = {
+  /** Start offset in seconds. */
+  at?: number;
+  /** Duration in seconds. */
+  d: number;
+  /** Peak gain. */
+  v?: number;
+  /** Attack time in seconds. */
+  a?: number;
+  /** End frequency (exponential sweep). */
+  to?: number;
+};
+type FxLayer =
+  | (FxLayerTiming & { tone: OscillatorType; f: number; vib?: [rate: number, depth: number] })
+  | (FxLayerTiming & { noise: BiquadFilterType; f: number; q?: number });
+
+const tone = (
+  type: OscillatorType,
+  f: number,
+  d: number,
+  o: Omit<Extract<FxLayer, { tone: OscillatorType }>, 'tone' | 'f' | 'd'> = {},
+): FxLayer => ({ tone: type, f, d, ...o });
+const noise = (
+  type: BiquadFilterType,
+  f: number,
+  d: number,
+  o: Omit<Extract<FxLayer, { noise: BiquadFilterType }>, 'noise' | 'f' | 'd'> = {},
+): FxLayer => ({ noise: type, f, d, ...o });
+
+type LayerPlayback = {
+  gain: number;
+  maxGain: number;
+  stretch: number;
+  sweep: number;
+  vibrato: number;
+  echoDelay: number;
+  echoFeedback: number;
+  echoMix: number;
+  /** Frequency multiplier applied to every layer. */
+  pitch?: number;
+  /** Seconds to wait before the first layer. */
+  delay?: number;
+};
+
+/** Ability sounds are deliberately over the top: louder, longer, wider sweeps, deeper wobble, plus an echo. */
+const ABILITY_EXAGGERATION: LayerPlayback = {
+  gain: 1.9,
+  maxGain: 0.42,
+  stretch: 1.4,
+  sweep: 1.6,
+  vibrato: 2,
+  echoDelay: 0.17,
+  echoFeedback: 0.38,
+  echoMix: 0.45,
+};
+
+/** Card signatures play as written, with a light echo. */
+const CARD_PLAYBACK: LayerPlayback = {
+  gain: 1.2,
+  maxGain: 0.3,
+  stretch: 1,
+  sweep: 1,
+  vibrato: 1,
+  echoDelay: 0.14,
+  echoFeedback: 0.26,
+  echoMix: 0.28,
+};
+
+function exaggeratedSweep(f: number, to: number | undefined, sweep: number): number | undefined {
+  if (to == null) return undefined;
+  const swept = f * Math.pow(to / f, sweep);
+  return Math.min(18000, Math.max(20, swept));
+}
+
+function playLayers(layers: FxLayer[], x: LayerPlayback = ABILITY_EXAGGERATION) {
+  if (!engine.sfxEnabled) return;
+  unlockAudio();
+  const ctx = getProceduralCtx();
+  if (!ctx) return;
+  const t0 = ctx.currentTime + 0.01 + (x.delay ?? 0);
+  const pitch = x.pitch ?? 1;
+
+  const limiter = ctx.createDynamicsCompressor();
+  limiter.threshold.value = -12;
+  limiter.knee.value = 6;
+  limiter.ratio.value = 8;
+  limiter.attack.value = 0.003;
+  limiter.release.value = 0.2;
+  limiter.connect(ctx.destination);
+
+  const master = ctx.createGain();
+  master.gain.value = 1;
+  master.connect(limiter);
+
+  const echo = ctx.createDelay(1);
+  echo.delayTime.value = x.echoDelay;
+  const feedback = ctx.createGain();
+  feedback.gain.value = x.echoFeedback;
+  const wet = ctx.createGain();
+  wet.gain.value = x.echoMix;
+  master.connect(echo);
+  echo.connect(feedback);
+  feedback.connect(echo);
+  echo.connect(wet);
+  wet.connect(limiter);
+
+  let lastEnd = t0;
+  for (const layer of layers) {
+    const start = t0 + (layer.at ?? 0) * x.stretch;
+    const dur = layer.d * x.stretch;
+    const end = start + dur;
+    lastEnd = Math.max(lastEnd, end);
+    const attack = Math.min((layer.a ?? 0.012) * x.stretch, dur * 0.8);
+    const peak = Math.min((layer.v ?? 0.1) * x.gain, x.maxGain);
+    const f = layer.f * pitch;
+    const to = exaggeratedSweep(f, layer.to == null ? undefined : layer.to * pitch, x.sweep);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(peak, start + attack);
+    gain.gain.exponentialRampToValueAtTime(0.0001, end);
+    gain.connect(master);
+
+    if ('tone' in layer) {
+      const osc = ctx.createOscillator();
+      osc.type = layer.tone;
+      osc.frequency.setValueAtTime(f, start);
+      if (to != null) osc.frequency.exponentialRampToValueAtTime(to, end);
+      if (layer.vib) {
+        const lfo = ctx.createOscillator();
+        const depth = ctx.createGain();
+        lfo.frequency.value = layer.vib[0];
+        depth.gain.value = layer.vib[1] * x.vibrato;
+        lfo.connect(depth);
+        depth.connect(osc.frequency);
+        lfo.start(start);
+        lfo.stop(end + 0.02);
+      }
+      osc.connect(gain);
+      osc.start(start);
+      osc.stop(end + 0.02);
+    } else {
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuffer(ctx, dur + 0.03);
+      const filter = ctx.createBiquadFilter();
+      filter.type = layer.noise;
+      filter.frequency.setValueAtTime(f, start);
+      if (to != null) filter.frequency.exponentialRampToValueAtTime(to, end);
+      filter.Q.value = (layer.q ?? 1) * 1.4;
+      src.connect(filter);
+      filter.connect(gain);
+      src.start(start);
+      src.stop(end + 0.02);
+    }
+  }
+
+  const tailMs = (lastEnd - ctx.currentTime + 2) * 1000;
+  window.setTimeout(() => {
+    feedback.disconnect();
+    echo.disconnect();
+    wet.disconnect();
+    master.disconnect();
+    limiter.disconnect();
+  }, tailMs);
+}
+
+/** One recipe per ability id recorded by the engine (`state.abilityFx`). */
+const ABILITY_SFX: Record<string, FxLayer[]> = {
+  // Gnome — ratchet clicks, then a springy gadget pop
+  gadget_deploy: [
+    noise('highpass', 3000, 0.03, { v: 0.12 }),
+    noise('highpass', 3200, 0.03, { at: 0.06, v: 0.12 }),
+    noise('highpass', 3400, 0.03, { at: 0.12, v: 0.12 }),
+    tone('square', 220, 0.2, { to: 440, at: 0.18, v: 0.06 }),
+    tone('triangle', 330, 0.28, { to: 660, at: 0.2, v: 0.1, vib: [22, 40] }),
+  ],
+  ice_floor: [
+    noise('highpass', 4200, 0.4, { to: 2500, v: 0.1 }),
+    tone('sine', 2100, 0.4, { to: 1200, v: 0.05, vib: [14, 40] }),
+  ],
+  spring_board: [tone('triangle', 160, 0.4, { to: 720, v: 0.14, vib: [18, 60] })],
+  gnome_hole: [
+    tone('sine', 650, 0.18, { to: 90, v: 0.12 }),
+    tone('sine', 90, 0.15, { to: 520, at: 0.24, v: 0.12 }),
+    noise('lowpass', 600, 0.06, { at: 0.36, v: 0.1 }),
+  ],
+  // Fleece — pickpocket swish and disguise warble; coin blip when loot is stored
+  identity_theft: [
+    noise('bandpass', 3200, 0.22, { to: 700, q: 1.2, v: 0.18 }),
+    tone('sine', 880, 0.12, { to: 440, at: 0.08, v: 0.08 }),
+    tone('triangle', 220, 0.4, { to: 330, at: 0.18, v: 0.1, vib: [6, 12] }),
+  ],
+  identity_loot: [tone('square', 988, 0.08, { v: 0.07 }), tone('square', 1319, 0.22, { at: 0.07, v: 0.07 })],
+  fraudulent_fate: [
+    tone('sawtooth', 392, 0.2, { v: 0.06 }),
+    tone('sawtooth', 370, 0.2, { at: 0.22, v: 0.06 }),
+    tone('sawtooth', 349, 0.45, { to: 262, at: 0.44, v: 0.06, vib: [6, 8] }),
+  ],
+  // Wizard — sparkle arpeggio; Magic Be-gone drains everything downward
+  enchant: [
+    ...[880, 1109, 1319, 1760].map((f, i) => tone('sine', f, 0.22, { at: i * 0.06, v: 0.09 })),
+    noise('highpass', 6000, 0.35, { at: 0.05, v: 0.03 }),
+  ],
+  magic_begone: [
+    tone('sawtooth', 1400, 0.45, { to: 120, v: 0.06 }),
+    tone('sine', 700, 0.4, { to: 90, at: 0.03, v: 0.1 }),
+    noise('lowpass', 4000, 0.45, { to: 200, v: 0.09 }),
+  ],
+  // Angel — slow choir swell to start, bright bell when the piece returns
+  revive_ritual: [
+    tone('triangle', 523, 0.9, { a: 0.3, v: 0.07 }),
+    tone('triangle', 659, 0.9, { a: 0.35, at: 0.05, v: 0.06 }),
+    tone('triangle', 784, 0.9, { a: 0.4, at: 0.1, v: 0.05 }),
+    tone('sine', 1047, 0.8, { a: 0.3, at: 0.2, v: 0.03, vib: [5, 6] }),
+  ],
+  revive_complete: [
+    tone('sine', 1047, 1.2, { v: 0.12 }),
+    tone('sine', 1568, 1.0, { v: 0.06 }),
+    tone('sine', 2093, 0.8, { v: 0.04 }),
+    tone('triangle', 523, 0.9, { at: 0.05, v: 0.06 }),
+  ],
+  // Crystalite — glassy pings
+  barrier_shift: [
+    tone('sine', 2637, 0.25, { v: 0.07 }),
+    tone('sine', 3136, 0.3, { at: 0.09, v: 0.06 }),
+    noise('highpass', 5000, 0.3, { to: 2000, at: 0.02, v: 0.05 }),
+    tone('triangle', 1319, 0.35, { to: 1976, at: 0.15, v: 0.06 }),
+  ],
+  barrier_phase: [
+    tone('sine', 1568, 0.4, { to: 784, v: 0.08, vib: [9, 30] }),
+    noise('bandpass', 2500, 0.3, { q: 4, v: 0.06 }),
+  ],
+  // TimeKeeper — clock ticks into a warp; recall is a rewind sweep
+  temporal_shift: [
+    ...[0, 0.14, 0.28, 0.42].map((at, i) => tone('square', i % 2 ? 1500 : 2000, 0.03, { at, v: 0.07 })),
+    tone('sine', 300, 0.55, { to: 1200, at: 0.1, v: 0.09, vib: [7, 25] }),
+  ],
+  chrono_recall: [
+    tone('sawtooth', 1800, 0.45, { to: 180, v: 0.05 }),
+    noise('bandpass', 600, 0.45, { to: 4000, q: 1.5, a: 0.38, v: 0.12 }),
+    tone('sine', 440, 0.12, { to: 880, at: 0.42, v: 0.08 }),
+  ],
+  // Crocodile — vacuum inhale, launch, chomp
+  ultimate_suck: [
+    noise('lowpass', 200, 0.4, { to: 3200, a: 0.36, v: 0.2 }),
+    tone('sine', 120, 0.4, { to: 500, a: 0.3, v: 0.08 }),
+    tone('sine', 260, 0.18, { to: 1100, at: 0.4, v: 0.14 }),
+    tone('square', 150, 0.09, { to: 60, at: 0.58, v: 0.12 }),
+    noise('lowpass', 900, 0.08, { at: 0.58, v: 0.12 }),
+  ],
+  // Rook — two heavy thunks and a little fanfare
+  castle_swap: [
+    tone('triangle', 170, 0.14, { to: 80, v: 0.18 }),
+    tone('triangle', 150, 0.14, { to: 70, at: 0.13, v: 0.18 }),
+    tone('square', 523, 0.12, { at: 0.24, v: 0.06 }),
+    tone('square', 784, 0.22, { at: 0.33, v: 0.06 }),
+  ],
+  // Stoneman — grinding stone
+  ancient_shuffle: [
+    noise('lowpass', 420, 0.55, { to: 220, a: 0.08, v: 0.2 }),
+    tone('sine', 72, 0.55, { to: 52, a: 0.06, v: 0.16 }),
+    tone('triangle', 110, 0.3, { to: 90, at: 0.25, v: 0.06 }),
+  ],
+  // Yeti — huge ground-shaking boom
+  giga_stomp: [
+    tone('sine', 95, 0.7, { to: 28, v: 0.3 }),
+    tone('square', 62, 0.35, { to: 35, v: 0.08 }),
+    noise('lowpass', 320, 0.5, { to: 80, v: 0.3 }),
+  ],
+  // Reaper
+  swap_of_fates: [
+    tone('sine', 300, 0.45, { to: 620, v: 0.09 }),
+    tone('sine', 620, 0.45, { to: 300, v: 0.09 }),
+    tone('triangle', 150, 0.5, { v: 0.05, vib: [4, 8] }),
+  ],
+  shadow_step: [
+    noise('bandpass', 900, 0.3, { to: 180, q: 1.2, v: 0.14 }),
+    tone('sine', 220, 0.3, { to: 100, v: 0.08 }),
+  ],
+  death_stare: [
+    tone('sawtooth', 110, 0.5, { a: 0.05, v: 0.06 }),
+    tone('square', 55, 0.5, { v: 0.06 }),
+    tone('sine', 1760, 0.18, { to: 880, at: 0.05, v: 0.08 }),
+    noise('bandpass', 300, 0.4, { q: 2, v: 0.07 }),
+  ],
+  soul_lock: [
+    tone('square', 1800, 0.07, { v: 0.05 }),
+    tone('square', 2400, 0.07, { at: 0.05, v: 0.05 }),
+    tone('square', 1800, 0.07, { at: 0.16, v: 0.05 }),
+    tone('square', 2400, 0.1, { at: 0.21, v: 0.05 }),
+    tone('sine', 150, 0.45, { to: 110, v: 0.1 }),
+  ],
+  world_shatterer: [
+    noise('highpass', 2500, 0.6, { v: 0.18 }),
+    tone('sine', 60, 0.8, { to: 25, v: 0.28 }),
+    ...[3200, 2700, 2100, 3700].map((f, i) => tone('triangle', f, 0.12, { to: f * 0.6, at: 0.05 + i * 0.05, v: 0.05 })),
+  ],
+  reaper_harvest: [
+    tone('sine', 196, 1.4, { v: 0.14 }),
+    tone('sine', 392, 1.1, { v: 0.06 }),
+    tone('sine', 588, 0.8, { v: 0.04 }),
+    tone('triangle', 98, 1.2, { v: 0.06 }),
+  ],
+  // Pig — squeaky double boop and an oink
+  best_buddy: [
+    tone('square', 660, 0.08, { to: 990, v: 0.06 }),
+    tone('square', 990, 0.12, { to: 1320, at: 0.09, v: 0.06 }),
+    tone('triangle', 320, 0.16, { to: 210, at: 0.2, v: 0.12, vib: [30, 20] }),
+  ],
+  // Archer — bowstring twang, arrow whoosh, thunk; Steady Aim focus ping
+  archer_shot: [
+    tone('triangle', 240, 0.16, { to: 170, v: 0.16, vib: [40, 15] }),
+    noise('highpass', 6500, 0.2, { to: 1800, at: 0.03, v: 0.12 }),
+    tone('sine', 200, 0.06, { to: 90, at: 0.22, v: 0.14 }),
+  ],
+  steady_aim: [tone('sine', 1000, 0.15, { v: 0.06 }), tone('sine', 1500, 0.2, { at: 0.12, v: 0.07 })],
+  // Snake — hiss and growl
+  bloodlust: [
+    noise('highpass', 5000, 0.45, { a: 0.05, v: 0.12 }),
+    tone('sawtooth', 110, 0.4, { to: 80, v: 0.06, vib: [25, 10] }),
+  ],
+  // Leapfrog — boing
+  leap: [tone('sine', 300, 0.14, { to: 950, v: 0.12 }), tone('sine', 950, 0.16, { to: 420, at: 0.14, v: 0.1 })],
+  // Worm — dirt digging
+  burrow: [
+    noise('lowpass', 500, 0.06, { v: 0.16 }),
+    noise('lowpass', 450, 0.06, { at: 0.08, v: 0.16 }),
+    noise('lowpass', 400, 0.08, { at: 0.16, v: 0.16 }),
+    tone('sine', 130, 0.3, { to: 70, v: 0.1 }),
+  ],
+  // Ghost — wavering "oooh"
+  phase_walk: [
+    tone('sine', 440, 0.55, { to: 330, a: 0.1, v: 0.09, vib: [5, 14] }),
+    tone('triangle', 660, 0.5, { to: 495, a: 0.12, v: 0.04, vib: [5, 20] }),
+  ],
+  // Spiders — silk thwips and sticky snares
+  trail_of_webs: [
+    noise('highpass', 3500, 0.06, { v: 0.08 }),
+    tone('triangle', 1300, 0.09, { to: 420, v: 0.08 }),
+    tone('triangle', 1100, 0.09, { to: 380, at: 0.08, v: 0.07 }),
+  ],
+  web_snare: [
+    tone('sawtooth', 210, 0.3, { to: 120, v: 0.05 }),
+    noise('lowpass', 900, 0.25, { to: 300, v: 0.12 }),
+    tone('sine', 500, 0.12, { to: 250, at: 0.15, v: 0.06 }),
+  ],
+  spider_web: [
+    tone('square', 900, 0.08, { to: 300, v: 0.06 }),
+    tone('square', 800, 0.1, { to: 260, at: 0.09, v: 0.06 }),
+    noise('lowpass', 700, 0.2, { at: 0.1, v: 0.1 }),
+  ],
+  // Demon — detuned growl while a soul is drawn in
+  soul_syphon: [
+    tone('sawtooth', 80, 0.6, { a: 0.1, v: 0.06 }),
+    tone('sawtooth', 83, 0.6, { a: 0.1, v: 0.05 }),
+    tone('sine', 700, 0.5, { to: 90, v: 0.08 }),
+    noise('lowpass', 200, 0.5, { to: 1200, a: 0.3, v: 0.08 }),
+  ],
+  // Vampire — blood drip
+  blood_token: [tone('sine', 1200, 0.08, { to: 400, v: 0.12 }), tone('sine', 900, 0.1, { to: 300, at: 0.14, v: 0.08 })],
+  // Snail — slimy sweep; sad sigh when out of tiles
+  snail_wipe: [
+    noise('lowpass', 300, 0.6, { to: 1800, a: 0.2, v: 0.18 }),
+    tone('sine', 220, 0.6, { to: 45, v: 0.14 }),
+    tone('triangle', 440, 0.4, { to: 110, at: 0.1, v: 0.05 }),
+  ],
+  snail_exhausted: [
+    tone('triangle', 330, 0.35, { to: 262, v: 0.08 }),
+    tone('triangle', 262, 0.5, { to: 165, at: 0.3, v: 0.08 }),
+  ],
+  // Prince & Princess — sweet harmony; heartbreak when both fall
+  dance_of_romance: [
+    tone('sine', 523, 0.3, { v: 0.07 }),
+    tone('sine', 659, 0.3, { v: 0.06 }),
+    tone('sine', 659, 0.4, { at: 0.2, v: 0.07 }),
+    tone('sine', 784, 0.4, { at: 0.2, v: 0.06 }),
+  ],
+  true_love: [
+    tone('triangle', 659, 0.35, { v: 0.08 }),
+    tone('triangle', 622, 0.35, { at: 0.3, v: 0.08 }),
+    tone('triangle', 523, 0.7, { to: 440, at: 0.6, v: 0.08, vib: [5, 6] }),
+  ],
+  // Gambler — dice rattle and a ding
+  lucky_draw: [
+    ...[0, 0.05, 0.11, 0.16, 0.24, 0.3].map((at) => noise('bandpass', 2400, 0.025, { at, q: 3, v: 0.12 })),
+    tone('square', 1047, 0.12, { at: 0.38, v: 0.06 }),
+    tone('square', 1568, 0.25, { at: 0.47, v: 0.06 }),
+  ],
+  // Prototype — servo whines, data chirps, and an angry machine growl
+  mutation: [
+    tone('sawtooth', 110, 0.5, { to: 220, v: 0.08, vib: [30, 15] }),
+    ...[0.1, 0.16, 0.22, 0.28].map((at, i) => tone('square', 1400 + i * 300, 0.04, { at, v: 0.05 })),
+    tone('square', 440, 0.3, { to: 880, at: 0.34, v: 0.07 }),
+    noise('bandpass', 1800, 0.25, { to: 5000, at: 0.32, q: 3, v: 0.08 }),
+  ],
+  mutation_unstable: [
+    tone('sawtooth', 180, 0.6, { to: 70, v: 0.1, vib: [17, 40] }),
+    ...[0, 0.12, 0.24].map((at) => noise('highpass', 3500, 0.05, { at, v: 0.14 })),
+    tone('square', 600, 0.08, { at: 0.36, v: 0.06 }),
+    tone('square', 300, 0.25, { at: 0.44, to: 150, v: 0.06 }),
+  ],
+  final_evolution_ready: [
+    tone('square', 880, 0.1, { v: 0.06 }),
+    tone('square', 880, 0.1, { at: 0.18, v: 0.06 }),
+    tone('square', 1320, 0.25, { at: 0.36, v: 0.07 }),
+  ],
+  final_evolution: [
+    tone('sawtooth', 55, 1.1, { to: 220, a: 0.5, v: 0.14, vib: [8, 6] }),
+    tone('sawtooth', 82, 1.1, { to: 330, a: 0.5, v: 0.1 }),
+    noise('lowpass', 300, 1.0, { to: 6000, a: 0.8, v: 0.12 }),
+    tone('square', 1760, 0.5, { at: 0.9, to: 2637, v: 0.06 }),
+    noise('lowpass', 800, 0.3, { at: 1.0, v: 0.16 }),
+  ],
+  razor_limbs: [
+    noise('highpass', 5000, 0.12, { to: 9000, v: 0.16 }),
+    tone('sawtooth', 2400, 0.12, { to: 900, at: 0.02, v: 0.05 }),
+    noise('highpass', 6000, 0.1, { at: 0.12, v: 0.12 }),
+  ],
+  chain_assault: [
+    noise('bandpass', 2000, 0.08, { q: 2, v: 0.16 }),
+    noise('bandpass', 2400, 0.08, { at: 0.1, q: 2, v: 0.16 }),
+    tone('square', 160, 0.2, { to: 50, at: 0.18, v: 0.14 }),
+    noise('lowpass', 700, 0.15, { at: 0.18, v: 0.16 }),
+  ],
+  teleport_relay: [
+    tone('sine', 300, 0.3, { to: 2400, v: 0.1, vib: [40, 80] }),
+    noise('bandpass', 3000, 0.3, { q: 6, v: 0.07 }),
+    tone('sine', 2400, 0.25, { to: 400, at: 0.3, v: 0.08 }),
+  ],
+  magnetic_leap: [
+    tone('sawtooth', 60, 0.5, { to: 180, a: 0.3, v: 0.1, vib: [50, 20] }),
+    tone('sine', 400, 0.3, { to: 1200, at: 0.3, v: 0.08 }),
+    noise('lowpass', 500, 0.08, { at: 0.55, v: 0.14 }),
+  ],
+  quantum_drive: [
+    tone('sine', 1200, 0.5, { to: 80, v: 0.1, vib: [24, 200] }),
+    noise('highpass', 2000, 0.4, { to: 10000, v: 0.08 }),
+    tone('sine', 80, 0.4, { to: 1600, at: 0.45, v: 0.1 }),
+  ],
+  emp_burst: [
+    tone('sawtooth', 3000, 0.08, { v: 0.08 }),
+    noise('lowpass', 8000, 0.9, { to: 200, v: 0.2 }),
+    tone('sine', 900, 0.9, { to: 40, v: 0.12 }),
+    ...[0.3, 0.5, 0.65].map((at) => noise('highpass', 4000, 0.03, { at, v: 0.1 })),
+  ],
+  drone_launcher: [
+    noise('lowpass', 1200, 0.12, { v: 0.16 }),
+    tone('sawtooth', 200, 0.6, { to: 600, at: 0.08, v: 0.06, vib: [60, 30] }),
+    tone('square', 1200, 0.06, { at: 0.5, v: 0.05 }),
+    tone('square', 1600, 0.1, { at: 0.58, v: 0.05 }),
+  ],
+  reinforced_hull: [
+    tone('triangle', 180, 0.5, { to: 120, v: 0.16 }),
+    tone('sine', 1100, 0.6, { v: 0.07, vib: [7, 12] }),
+    noise('bandpass', 2500, 0.12, { q: 5, v: 0.16 }),
+  ],
+  reactive_plating: [
+    noise('bandpass', 900, 0.15, { to: 2400, q: 2, v: 0.12 }),
+    tone('square', 500, 0.12, { to: 900, at: 0.08, v: 0.06 }),
+  ],
+  energy_shield: [
+    tone('sine', 700, 0.5, { to: 1400, v: 0.1, vib: [12, 30] }),
+    tone('sine', 1050, 0.45, { to: 2100, at: 0.04, v: 0.06 }),
+    noise('highpass', 6000, 0.3, { at: 0.1, v: 0.06 }),
+  ],
+  self_repair: [
+    ...[0, 0.08, 0.16, 0.24, 0.32].map((at, i) => tone('square', 600 + i * 150, 0.05, { at, v: 0.05 })),
+    tone('sine', 1320, 0.4, { at: 0.4, v: 0.07 }),
+  ],
+  backup_core: [
+    tone('sine', 220, 0.3, { to: 55, v: 0.12 }),
+    tone('square', 440, 0.08, { at: 0.4, v: 0.06 }),
+    tone('square', 660, 0.08, { at: 0.52, v: 0.06 }),
+    tone('square', 880, 0.2, { at: 0.64, v: 0.06 }),
+  ],
+  adaptive_reactor: [
+    tone('sawtooth', 70, 0.7, { to: 140, a: 0.3, v: 0.12, vib: [6, 10] }),
+    noise('bandpass', 400, 0.7, { to: 1600, q: 2, a: 0.4, v: 0.1 }),
+    tone('sine', 880, 0.2, { at: 0.6, v: 0.07 }),
+  ],
+};
+
+/** Play the sound for an ability id recorded by the engine. */
+export function playAbilitySfx(id: string) {
+  const layers = ABILITY_SFX[id];
+  if (layers) playLayers(layers);
+}
+
+/** Signature sound per spell card id, layered on top of a short shared card flick. */
+const CARD_SFX: Record<string, FxLayer[]> = {
+  // Stone wall grinding up out of the floor, then settling with a clank
+  barrier: [
+    noise('lowpass', 180, 0.45, { to: 700, a: 0.08, v: 0.2 }),
+    tone('sine', 95, 0.35, { to: 55, v: 0.26 }),
+    tone('square', 330, 0.08, { at: 0.32, v: 0.05 }),
+    noise('bandpass', 900, 0.12, { at: 0.32, q: 2, v: 0.12 }),
+  ],
+  // Zip out, pop, and a faint zip back (the marked return square)
+  blink: [
+    tone('sine', 600, 0.1, { to: 2400, v: 0.12 }),
+    tone('sine', 1800, 0.06, { at: 0.11, v: 0.1 }),
+    tone('sine', 2400, 0.12, { at: 0.22, to: 600, v: 0.05 }),
+  ],
+  // Shimmering rising arpeggio over a warm pad
+  enchant: [
+    tone('sine', 262, 0.8, { a: 0.2, v: 0.06 }),
+    ...[523, 659, 784, 1047].map((f, i) => tone('triangle', f, 0.3, { at: i * 0.08, v: 0.08, vib: [6, 6] })),
+  ],
+  // Hoofbeats, then a short regal fanfare
+  kingstead: [
+    ...[0, 0.09, 0.25, 0.34].map((at) => noise('bandpass', 1200, 0.05, { at, q: 3, v: 0.16 })),
+    tone('triangle', 392, 0.35, { at: 0.42, to: 523, v: 0.1 }),
+    tone('triangle', 659, 0.3, { at: 0.48, v: 0.07 }),
+  ],
+  // Revving zoom that tops out in a blip
+  speed_plus: [
+    tone('sawtooth', 200, 0.35, { to: 1600, v: 0.06 }),
+    noise('highpass', 2000, 0.3, { to: 6000, v: 0.08 }),
+    tone('square', 1568, 0.06, { at: 0.34, v: 0.06 }),
+  ],
+  // Calculator beeps climbing to a "plus" chime
+  mathematical: [
+    ...[880, 1175, 1568].map((f, i) => tone('square', f, 0.05, { at: i * 0.08, v: 0.05 })),
+    tone('sine', 2093, 0.25, { at: 0.24, v: 0.1 }),
+    tone('sine', 2637, 0.2, { at: 0.24, v: 0.04 }),
+  ],
+  // Shield clang
+  fortify: [
+    tone('sine', 131, 0.3, { v: 0.2 }),
+    noise('bandpass', 3000, 0.06, { q: 1.5, v: 0.14 }),
+    tone('square', 523, 0.4, { to: 510, v: 0.06 }),
+    tone('triangle', 1046, 0.5, { to: 1030, v: 0.08 }),
+  ],
+  // Tick... tock... then time slows and freezes into a crystal ping
+  pause: [
+    noise('highpass', 4000, 0.02, { v: 0.16 }),
+    noise('highpass', 3000, 0.02, { at: 0.18, v: 0.14 }),
+    tone('sine', 1200, 0.5, { at: 0.3, to: 300, v: 0.08 }),
+    tone('sine', 2637, 0.4, { at: 0.36, v: 0.06 }),
+  ],
+  // Two identical sparkles, then both at once
+  doublecast: [
+    tone('triangle', 880, 0.15, { to: 1320, v: 0.09 }),
+    tone('triangle', 880, 0.15, { at: 0.18, to: 1320, v: 0.09 }),
+    tone('sine', 1320, 0.3, { at: 0.36, v: 0.08 }),
+    tone('sine', 1760, 0.3, { at: 0.36, v: 0.06 }),
+  ],
+  // One ping that repeats itself, fading
+  echo: [0, 0.16, 0.32, 0.48].map((at, i) => tone('sine', 988, 0.15, { at, v: 0.14 / (i + 1) })),
+  // Card-shuffle riffle, then scrambled notes
+  rearrange: [
+    ...[0, 0.06, 0.12, 0.18].map((at) => noise('bandpass', 2500, 0.05, { at, q: 2, v: 0.12 })),
+    ...[659, 523, 784, 587].map((f, i) => tone('triangle', f, 0.08, { at: 0.26 + i * 0.06, v: 0.08 })),
+  ],
+  // Force push: boom, a rushing gust, and a falling whine
+  repel: [
+    tone('sine', 180, 0.3, { to: 60, v: 0.26 }),
+    noise('lowpass', 2000, 0.35, { to: 200, v: 0.14 }),
+    tone('sawtooth', 400, 0.3, { at: 0.05, to: 120, v: 0.05 }),
+  ],
+  // War drum and horn call
+  rally: [
+    tone('sine', 110, 0.2, { to: 60, v: 0.24 }),
+    tone('sawtooth', 196, 0.6, { a: 0.08, v: 0.07, vib: [5, 3] }),
+    tone('sawtooth', 294, 0.5, { at: 0.1, a: 0.08, v: 0.05, vib: [5, 3] }),
+  ],
+  // Warp out, crackle, warp in
+  teleport: [
+    tone('sine', 300, 0.25, { to: 2400, v: 0.1, vib: [30, 40] }),
+    noise('bandpass', 4000, 0.06, { at: 0.26, q: 2, v: 0.1 }),
+    tone('sine', 2400, 0.25, { at: 0.28, to: 300, v: 0.1, vib: [30, 40] }),
+  ],
+  // Homing glide down to an anchor bell
+  recall: [
+    tone('triangle', 1046, 0.35, { to: 523, v: 0.08, vib: [8, 10] }),
+    tone('sine', 523, 0.45, { at: 0.38, v: 0.1 }),
+    tone('sine', 784, 0.4, { at: 0.38, v: 0.05 }),
+  ],
+  // Tape rewinding, then a clunk
+  rewind: [
+    tone('sawtooth', 1600, 0.5, { to: 300, v: 0.04, vib: [18, 60] }),
+    noise('bandpass', 3000, 0.5, { to: 800, q: 1.5, v: 0.06 }),
+    tone('sine', 140, 0.12, { at: 0.5, v: 0.2 }),
+  ],
+  // Two tones crossing paths, then a pop
+  swap: [
+    tone('sine', 400, 0.3, { to: 1000, v: 0.09 }),
+    tone('sine', 1000, 0.3, { to: 400, v: 0.09 }),
+    tone('triangle', 1318, 0.1, { at: 0.3, v: 0.08 }),
+  ],
+  // Choir-like swell rising into a bell
+  revive: [
+    ...[262, 330, 392].map((f) => tone('sine', f, 0.8, { a: 0.2, v: 0.06 })),
+    tone('triangle', 523, 0.4, { at: 0.2, to: 1046, v: 0.07 }),
+    tone('sine', 2093, 0.4, { at: 0.5, v: 0.05 }),
+  ],
+  // A rinse of water, bubbles, and a clean chime
+  refresh: [
+    noise('bandpass', 800, 0.3, { to: 3000, q: 2, v: 0.1 }),
+    ...[0.05, 0.12, 0.2].map((at, i) => tone('sine', 700 + i * 150, 0.05, { at, to: 1100 + i * 150, v: 0.07 })),
+    tone('sine', 1568, 0.3, { at: 0.3, v: 0.08 }),
+  ],
+  // Marching drum taps and a little bugle
+  pawn_summon: [
+    tone('sine', 150, 0.12, { to: 80, v: 0.22 }),
+    tone('sine', 150, 0.12, { at: 0.14, to: 80, v: 0.22 }),
+    tone('square', 523, 0.1, { at: 0.3, v: 0.05 }),
+    tone('square', 659, 0.22, { at: 0.4, v: 0.05 }),
+  ],
+  // Creaking gate, heavy thud, two pieces trading places
+  pocket_castle: [
+    tone('sawtooth', 110, 0.3, { to: 90, v: 0.04, vib: [7, 6] }),
+    tone('sine', 90, 0.2, { at: 0.32, to: 50, v: 0.24 }),
+    tone('triangle', 392, 0.25, { at: 0.35, to: 523, v: 0.07 }),
+    tone('triangle', 523, 0.25, { at: 0.35, to: 392, v: 0.07 }),
+  ],
+  // Swirling vortex
+  portal: [
+    tone('sine', 200, 0.6, { to: 800, v: 0.08, vib: [9, 50] }),
+    tone('sine', 800, 0.6, { to: 200, v: 0.06, vib: [7, 40] }),
+    noise('bandpass', 1500, 0.6, { q: 4, a: 0.15, v: 0.06 }),
+  ],
+  // Sneaky tiptoe, a swipe, and a "ka-ching"
+  blind_gambit: [
+    ...[784, 659, 523].map((f, i) => tone('triangle', f, 0.06, { at: i * 0.09, v: 0.08 })),
+    noise('highpass', 3000, 0.1, { at: 0.28, to: 6000, v: 0.1 }),
+    tone('sine', 2637, 0.25, { at: 0.36, v: 0.07 }),
+    tone('sine', 3520, 0.25, { at: 0.36, v: 0.05 }),
+  ],
+  // Dice rattle, then a tense two-note slot ding
+  gamblers_gambit: [
+    ...[0, 0.05, 0.1, 0.16, 0.21, 0.28].map((at) => noise('bandpass', 3500, 0.03, { at, q: 4, v: 0.14 })),
+    tone('square', 1046, 0.08, { at: 0.38, v: 0.05 }),
+    tone('square', 1318, 0.2, { at: 0.46, v: 0.05 }),
+  ],
+  // Lighter dice rattle and a cheerful major arpeggio
+  gamblers_delight: [
+    ...[0, 0.06, 0.12, 0.2].map((at) => noise('bandpass', 3800, 0.03, { at, q: 4, v: 0.12 })),
+    ...[784, 988, 1175, 1568].map((f, i) => tone('triangle', f, 0.14, { at: 0.3 + i * 0.06, v: 0.07 })),
+  ],
+};
+
+/** Signature layers for a card, played after the shared cast flick. Returns false if the card has none. */
+export function playCardSignatureSfx(defId: string, mine: boolean): boolean {
+  const layers = CARD_SFX[defId];
+  if (!layers) return false;
+  playLayers(layers, { ...CARD_PLAYBACK, pitch: mine ? 1 : 0.89, delay: 0.12 });
+  return true;
 }
 
 /** Keep music scene in sync with the current UI surface. */

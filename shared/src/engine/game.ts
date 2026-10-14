@@ -1,10 +1,32 @@
-import type { Color, Coord, GameState, PendingPrompt, PieceClass, PieceState, PlayerState } from '../types.js';
-import { BOARD_SIZE, MAX_HAND } from '../types.js';
+import type {
+  Color,
+  Coord,
+  GameRules,
+  GameState,
+  PendingPrompt,
+  PieceClass,
+  PieceState,
+  PlayerState,
+  PrototypeForm,
+} from '../types.js';
+import { BOARD_SIZE, DEFAULT_RULES, MAX_HAND, TURN_TIMER_OPTIONS } from '../types.js';
 import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS, rollGamblerStyles } from '../pieces/index.js';
+import {
+  ensureProto,
+  FINAL_EVOLUTION_AT,
+  FINAL_FORMS,
+  finalFormHint,
+  MUTATIONS,
+  protoHas,
+  protoLockedDown,
+  protoRng,
+  rollMutationId,
+} from '../pieces/prototype.js';
 import type { MoveOption } from '../pieces/helpers.js';
-import { isKnightLanding, isPigLShape, yetiBlocksPawnCapture } from '../pieces/helpers.js';
+import { chebyshevPathBlocked, isKnightLanding, isPigLShape, yetiBlocksPawnCapture } from '../pieces/helpers.js';
 import { buildDeck, discardCard, drawCard, getCardDef } from '../cards/index.js';
 import {
+  abilityFx,
   addEffect,
   backRow,
   barriersAdjacent,
@@ -110,6 +132,11 @@ function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
           ? 'Finish Barrier Shift: pick a barrier, then a destination'
           : 'Waiting for opponent to finish Barrier Shift';
       }
+      if (prompt.abilityId === 'ultimate_suck') {
+        return yours
+          ? 'Finish Ultimate Suck: pick a piece, then where to launch it'
+          : 'Waiting for opponent to finish Ultimate Suck';
+      }
       return yours
         ? prompt.message || 'Finish the ability choice first'
         : 'Waiting for opponent to finish their ability';
@@ -148,7 +175,11 @@ function emptyPlayer(color: Color, name: string): PlayerState {
   };
 }
 
-export function createLobbyState(roomCode: string, seed = Date.now()): GameState {
+export function createLobbyState(
+  roomCode: string,
+  seed = Date.now(),
+  rules: Partial<Record<keyof GameRules, unknown>> = {},
+): GameState {
   const state: GameState = {
     roomCode,
     phase: 'lobby',
@@ -173,19 +204,40 @@ export function createLobbyState(roomCode: string, seed = Date.now()): GameState
     snapshots: [],
     pendingPrompt: null,
     rngSeed: seed,
+    rules: normalizeRules(rules),
   };
   log(state, 'Room created. Waiting for players…');
   return state;
 }
 
+/** Fill defaults and drop anything invalid (rules can arrive from untrusted clients). */
+export function normalizeRules(input: Partial<Record<keyof GameRules, unknown>> = {}): GameRules {
+  const rules: GameRules = { ...DEFAULT_RULES };
+  if (typeof input.banPhase === 'boolean') rules.banPhase = input.banPhase;
+  if (input.anonymous === true) rules.anonymous = true;
+  const secs = TURN_TIMER_OPTIONS.find((s) => s === input.turnTimerSeconds);
+  if (secs) rules.turnTimerSeconds = secs;
+  return rules;
+}
+
+/** Display name for a seat, honoring the Anonymous rule. */
+export function seatDisplayName(state: GameState, color: Color, requested?: string): string {
+  const fallback = color === 'white' ? 'White' : 'Black';
+  if (state.rules?.anonymous) return fallback;
+  return requested?.trim().slice(0, 24) || fallback;
+}
+
 export function startDraft(state: GameState): GameState {
   const next = cloneState(state);
   next.phase = 'draft';
+  const banPhase = next.rules?.banPhase ?? DEFAULT_RULES.banPhase;
   next.draft = {
     pickingColor: 'white',
     blackChoseFirstPicker: null,
+    stage: banPhase ? 'ban' : 'pick',
+    bans: { white: [], black: [] },
   };
-  log(next, 'Draft started — Black chooses who picks first.');
+  log(next, `Draft started — Black chooses who ${banPhase ? 'bans and picks' : 'picks'} first.`);
   return next;
 }
 
@@ -196,19 +248,64 @@ export function chooseFirstPicker(state: GameState, whitePicksFirst: boolean): G
   const next = cloneState(state);
   next.draft!.blackChoseFirstPicker = whitePicksFirst;
   next.draft!.pickingColor = whitePicksFirst ? 'white' : 'black';
-  log(next, `Black decided ${whitePicksFirst ? 'White' : 'Black'} picks first.`);
+  log(next, `Black decided ${whitePicksFirst ? 'White' : 'Black'} bans and picks first.`);
+  return next;
+}
+
+export const BANS_PER_COLOR = 2;
+
+export function draftBannedIds(state: GameState): string[] {
+  const bans = state.draft?.bans;
+  return bans ? [...bans.white, ...bans.black] : [];
+}
+
+/** Why `color` can't ban `defId` right now, or null if the ban is allowed. */
+export function draftBanBlockReason(state: GameState, color: Color, defId: string): string | null {
+  const draft = state.draft;
+  if (!draft || draft.stage !== 'ban' || !draft.bans) return 'Not in the ban phase';
+  const def = PIECES[defId];
+  if (!def || def.class === 'king' || !DRAFT_ORDER.includes(def.class)) return 'That piece cannot be banned';
+  if (draftBannedIds(state).includes(defId)) return `${def.name} is already banned`;
+  if (draft.bans[color].length >= BANS_PER_COLOR) return 'You have used all your bans';
+  if (draft.bans[color].some((id) => PIECES[id]?.class === def.class)) {
+    return `You already banned a ${def.class} variant`;
+  }
+  return null;
+}
+
+export function draftBan(state: GameState, color: Color, defId: string): GameState {
+  if (state.phase !== 'draft' || !state.draft) throw new Error('Not drafting');
+  if (state.draft.blackChoseFirstPicker == null) throw new Error('Black must choose who bans first');
+  if (state.draft.pickingColor !== color) throw new Error('Not your ban');
+  const blocked = draftBanBlockReason(state, color, defId);
+  if (blocked) throw new Error(blocked);
+
+  const next = cloneState(state);
+  const draft = next.draft!;
+  draft.bans![color].push(defId);
+  draft.lastBan = { color, defId };
+  log(next, `${color} banned ${getPieceDef(defId).name}`);
+  if (draft.bans!.white.length >= BANS_PER_COLOR && draft.bans!.black.length >= BANS_PER_COLOR) {
+    draft.stage = 'pick';
+    draft.pickingColor = draft.blackChoseFirstPicker ? 'white' : 'black';
+    log(next, 'Bans locked in — the draft begins.');
+  } else {
+    draft.pickingColor = opposite(color);
+  }
   return next;
 }
 
 export function draftPick(state: GameState, color: Color, defId: string): GameState {
   if (state.phase !== 'draft' || !state.draft) throw new Error('Not drafting');
   if (state.draft.blackChoseFirstPicker == null) throw new Error('Black must choose who picks first');
+  if (state.draft.stage === 'ban') throw new Error('Finish the ban phase first');
   if (state.draft.pickingColor !== color) throw new Error('Not your pick');
 
   const def = getPieceDef(defId);
   const cls = def.class;
   if (cls === 'king' || !DRAFT_ORDER.includes(cls)) throw new Error('Invalid draft class');
   if (!VARIANTS_BY_CLASS[cls]?.includes(defId)) throw new Error('Invalid variant for this class');
+  if (draftBannedIds(state).includes(defId)) throw new Error(`${def.name} is banned`);
   if (state.players[color].army[cls]) throw new Error(`Already drafted ${cls}`);
 
   const next = cloneState(state);
@@ -423,27 +520,55 @@ function concludeAbilityTurn(state: GameState, color: Color): GameState {
 
 function applyDayNightSideEffects(state: GameState, entering: 'day' | 'night', drawCards: boolean): void {
   clearMagicBegone(state);
+  for (const p of state.pieces) {
+    if (p.defId === 'prototype' && p.proto?.form === 'fortress') p.proto.bulwark = 1;
+  }
   if (entering === 'day') {
     if (drawCards) {
       for (const c of ['white', 'black'] as Color[]) {
         tryDrawWithHandLimit(state, c);
       }
       log(state, 'New day — both players draw 1');
+      prototypeNightSurvival(state);
     }
     const dayRng = mulberry32(state.rngSeed + state.cycleCount * 9973 + 42);
-    for (const line of rollGamblerStyles(state, dayRng)) log(state, line);
+    const rolls = rollGamblerStyles(state, dayRng);
+    for (const line of rolls) log(state, line);
+    if (rolls.length) abilityFx(state, 'lucky_draw');
   }
   if (entering === 'night') {
     if (state.cycleCount === 5) log(state, 'First night — spell cards are now available');
     for (const p of state.pieces) {
       if (p.defId === 'reaper' && (p.disabledTurns ?? 0) <= 0) {
         p.charges = Math.min(5, (p.charges ?? 0) + 1);
+        reaperHarvestIfDue(state, p);
       }
       if (p.defId === 'ghost' && !hasEffect(p, 'ghost_unlocked')) {
         addEffect(p, { id: `ghost_unlock_${p.id}`, kind: 'ghost_unlocked' });
       }
     }
   }
+}
+
+/**
+ * Rest once captures since the last rest reach 6 − charges. Gaining a charge lowers the
+ * threshold, so this runs at nightfall as well as after each capture.
+ */
+function reaperHarvestIfDue(state: GameState, reaper: PieceState): void {
+  const charges = reaper.charges ?? 0;
+  const kills = reaper.reaperKills ?? 0;
+  if (charges <= 0 || kills < reaperCapturesUntilRest(charges)) return;
+  const disable = Math.floor(charges * 2.5);
+  reaper.reaperKills = 0;
+  reaper.charges = 0;
+  reaper.disabledTurns = disable;
+  const home = nearestEmptyAround(state, reaper.startPos);
+  if (home) {
+    endBestBuddy(state, reaper, reaper.pos);
+    reaper.pos = home;
+  }
+  log(state, `Reaper harvested ${kills} captures — charges spent, returns home (disabled ${disable} turns)`);
+  abilityFx(state, 'reaper_harvest');
 }
 
 function flipDayNight(state: GameState, drawCards: boolean): 'day' | 'night' {
@@ -506,6 +631,7 @@ function travelPortalOnce(state: GameState, piece: PieceState, color: Color): Pi
     if (occ.id === piece.id || occ.color === color) return undefined;
     if (hasEffect(occ, 'invincible') || hasEffect(occ, 'pause')) return undefined;
     if (hasEffect(occ, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) return undefined;
+    if (hullProtects(piece, occ)) return undefined;
   }
   if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
   piece.pos = { ...dest };
@@ -557,10 +683,19 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
     );
   });
 
+  if (hasEffect(piece, 'emp')) moves = moves.filter((m) => !m.special || !EMP_BLOCKED_SPECIALS.has(m.special));
+  if (gravityPenalized(state, piece)) moves = applyGravity(piece, moves);
+
   // Giga Stomp does not attack (the King is immune, and the Yeti does not move).
   // Counting those squares as attacks puts the king in a false check and can
   // leave Giga Stomp as the Yeti's only legal action.
   if (options?.forAttack) return moves.filter((m) => m.special !== 'giga_stomp');
+
+  const reactor = state.reactorAction;
+  if (reactor && reactor.color === piece.color) {
+    if (reactor.pieceId !== piece.id) return [];
+    moves = moves.filter((m) => !m.special && !pieceAt(state, m.to));
+  }
 
   // Filter moves that leave own king in check
   return moves.filter((m) => {
@@ -568,6 +703,10 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
       const trial = cloneState(state);
       const tp = trial.pieces.find((p) => p.id === pieceId)!;
       const occ = pieceAt(trial, m.to);
+      if (occ && hullProtects(tp, occ) && (!m.special || m.special === 'death_stare' || m.special === 'archer_shot')) {
+        // Reinforced Hull: the attacker stays where it is
+        return !isInCheck(trial, piece.color);
+      }
       if (occ && occ.color !== tp.color) {
         trial.pieces = trial.pieces.filter((p) => p.id !== occ.id);
       }
@@ -778,6 +917,18 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       hint: 'Click to arm, then a square up to 3 tiles away. Clears allies and enemies in that line (King immune). The Yeti does not move.',
     });
   }
+  if (piece.defId === 'crocodile') {
+    const cd = piece.abilityCooldown ?? 0;
+    out.push({
+      id: 'ultimate_suck',
+      name: cd > 0 ? `Ultimate Suck (${cd})` : 'Ultimate Suck',
+      ready: cd <= 0 && (piece.disabledTurns ?? 0) <= 0 && ultimateSuckTargets(state, piece.id).length > 0,
+      hint:
+        cd > 0
+          ? `Recharging: ${cd} more of your turns`
+          : 'Grab any non-king piece within 2 tiles and launch it exactly 3 tiles in a clear straight line. Landing on an enemy captures it. 5-turn cooldown.',
+    });
+  }
   if (piece.defId === 'snake') {
     const active = hasBloodlust(piece);
     out.push({
@@ -819,6 +970,16 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
         ? 'Cannot use while in check'
         : 'Once per game: click any piece in clear line of sight to send it to its spawn square (must be empty).',
     });
+  }
+  if (piece.defId === 'prototype') out.push(...prototypeAbilityList(state, piece));
+
+  const reactor = state.reactorAction;
+  const reactorLocked = Boolean(reactor && reactor.color === piece.color && reactor.pieceId !== piece.id);
+  if (hasEffect(piece, 'emp') || reactorLocked) {
+    const hint = reactorLocked ? 'Only the Prototype can act during its Reactor action' : 'Disabled by EMP Burst until the enemy’s next turn';
+    return out.map((a) =>
+      a.passive || a.id === 'reactor_end' ? a : { ...a, ready: false, hint },
+    );
   }
   return out;
 }
@@ -867,6 +1028,32 @@ export function useAbility(
 
   const avail = availableAbilities(next, pieceId).find((a) => a.id === abilityId);
   if (!avail?.ready) throw new Error('Ability not available');
+
+  if (piece.defId === 'prototype') {
+    if (abilityId === 'mut_status') throw new Error('Mutation status is informational');
+    if (abilityId === 'reactor_end') {
+      log(next, 'Reactor action skipped');
+      return endTurn(next, color, false);
+    }
+    const form = PROTO_FORMS[abilityId];
+    if (form) {
+      chooseFinalForm(next, piece, form);
+      next.turnPhase = resumeTurnPhase;
+      return next;
+    }
+    if (abilityId === 'emp_burst') return finishEmpBurst(next, color, piece);
+    if (PROTO_MOVE_ABILITIES.has(abilityId)) {
+      const to = targets as Coord | undefined;
+      if (to && typeof to === 'object' && 'row' in to) return finishPrototypeAbility(next, color, piece, abilityId, to);
+      const options = prototypeSafeOptions(next, piece, abilityId);
+      if (!options.length) throw new Error('No destination keeps your king safe');
+      const label = avail.name.replace(/\s*\(.*\)$/, '');
+      openPrototypePrompt(next, color, piece, abilityId, options, `${label}: click a highlighted square`, {
+        resumeTurnPhase,
+      });
+      return next;
+    }
+  }
 
   if (abilityId === 'gadget_deploy') {
     if (!targets) {
@@ -988,6 +1175,22 @@ export function useAbility(
     return finishChronoRecall(next, color, pieceId, targetId);
   }
 
+  if (abilityId === 'ultimate_suck') {
+    const payload = targets as { targetId?: string; to?: Coord } | undefined;
+    if (payload?.targetId && payload.to) {
+      return finishUltimateSuck(next, color, pieceId, payload.targetId, payload.to);
+    }
+    next.pendingPrompt = {
+      type: 'ability_target',
+      color,
+      pieceId,
+      abilityId: 'ultimate_suck',
+      message: 'Ultimate Suck: click a piece within 2 tiles of the Crocodile',
+      resumeTurnPhase,
+    };
+    return next;
+  }
+
   throw new Error('Unknown ability');
 }
 
@@ -1031,6 +1234,7 @@ function finishGadgetDeploy(
   piece.gadgetUsed = true;
   state.pendingPrompt = null;
   log(state, `${color} Gnome deployed ${kind}`);
+  abilityFx(state, 'gadget_deploy');
   return concludeAbilityTurn(state, color);
 }
 
@@ -1051,6 +1255,7 @@ function finishIdentityTheft(state: GameState, color: Color, pieceId: string): G
   });
   state.pendingPrompt = null;
   log(state, `Fleece Identity Theft — now moves like ${stolenDef.name}`);
+  abilityFx(state, 'identity_theft');
   return concludeAbilityTurn(state, color);
 }
 
@@ -1068,6 +1273,7 @@ function finishWizardEnchant(state: GameState, color: Color, pieceId: string, ta
   wizard.abilityCooldown = 4;
   state.pendingPrompt = null;
   log(state, `Wizard enchanted ${target.defId} (+1 move, 2 turns)`);
+  abilityFx(state, 'enchant');
   return concludeAbilityTurn(state, color);
 }
 
@@ -1096,6 +1302,7 @@ function finishMagicBegone(state: GameState, color: Color, pieceId: string): Gam
     state,
     `${color} Wizard used Magic Be-gone — ${enemy}'s magic is silenced until the next day/night change`,
   );
+  abilityFx(state, 'magic_begone');
   return concludeAbilityTurn(state, color);
 }
 
@@ -1121,6 +1328,7 @@ function finishAngelReviveStart(state: GameState, color: Color, pieceId: string,
   angel.ritualTargetDefId = defId;
   state.pendingPrompt = null;
   log(state, `Angel began revive ritual for ${defId} (${duration} turns)`);
+  abilityFx(state, 'revive_ritual');
   // Revive consumes the turn (cannot move then revive; ritual start ends turn)
   return concludeAbilityTurn(state, color);
 }
@@ -1158,6 +1366,7 @@ function completeAngelRevive(state: GameState, angel: PieceState): void {
   });
   angel.reviveCount = (angel.reviveCount ?? 0) + 1;
   log(state, `Angel revived ${entry.defId}`);
+  abilityFx(state, 'revive_complete');
   if ((angel.reviveCount ?? 0) >= 3) {
     removePiece(state, angel, opposite(angel.color));
     log(state, 'Angel perished after 3 revives');
@@ -1191,6 +1400,7 @@ function finishBarrierShift(
   token.pos = { ...to };
   state.pendingPrompt = null;
   log(state, `${color} shifted a barrier`);
+  abilityFx(state, 'barrier_shift');
   return concludeAbilityTurn(state, color);
 }
 
@@ -1208,6 +1418,7 @@ function finishTemporalShift(
   }
   tk.timekeeperCycleUsed = true;
   state.pendingPrompt = null;
+  abilityFx(state, 'temporal_shift');
   if (mode === 'skip') {
     flipDayNight(state, false);
     log(state, 'TimeKeeper skips the cycle');
@@ -1237,13 +1448,751 @@ function finishChronoRecall(
     throw new Error('Spawn square is obstructed');
   }
   assertTimekeeperDisplacementSafe(state, color, target, dest, 'Chrono Recall');
+  if (shieldBlocks(state, target, color)) {
+    tk.timekeeperRecallUsed = true;
+    state.pendingPrompt = null;
+    return concludeAbilityTurn(state, color);
+  }
   endBestBuddy(state, target, target.pos);
   target.pos = dest;
   snareInWeb(state, target);
   tk.timekeeperRecallUsed = true;
   state.pendingPrompt = null;
   log(state, `${getPieceDef(target.defId).name} recalled to its spawn square`);
+  abilityFx(state, 'chrono_recall');
   return concludeAbilityTurn(state, color);
+}
+
+const ULTIMATE_SUCK_REACH = 2;
+const ULTIMATE_SUCK_LAUNCH = 3;
+const ULTIMATE_SUCK_COOLDOWN = 6;
+const LAUNCH_DIRS: Array<[number, number]> = [
+  [-1, -1], [-1, 0], [-1, 1],
+  [0, -1], [0, 1],
+  [1, -1], [1, 0], [1, 1],
+];
+
+/** Pieces a Crocodile can grab with Ultimate Suck (any non-king within 2 tiles). */
+export function ultimateSuckTargets(state: GameState, pieceId: string): PieceState[] {
+  const croc = state.pieces.find((p) => p.id === pieceId);
+  if (!croc || croc.defId !== 'crocodile') return [];
+  return state.pieces.filter(
+    (p) =>
+      p.id !== croc.id &&
+      p.class !== 'king' &&
+      chebyshev(p.pos, croc.pos) <= ULTIMATE_SUCK_REACH &&
+      ultimateSuckLandings(state, pieceId, p.id).length > 0,
+  );
+}
+
+/** Squares exactly 3 tiles away in a straight line with a clear path; the last tile may hold a capturable enemy. */
+export function ultimateSuckLandings(state: GameState, pieceId: string, targetId: string): Coord[] {
+  const croc = state.pieces.find((p) => p.id === pieceId);
+  const target = state.pieces.find((p) => p.id === targetId);
+  if (!croc || !target || croc.defId !== 'crocodile') return [];
+  const out: Coord[] = [];
+  for (const [dr, dc] of LAUNCH_DIRS) {
+    let clear = true;
+    for (let step = 1; step < ULTIMATE_SUCK_LAUNCH; step++) {
+      const pos = { row: target.pos.row + dr * step, col: target.pos.col + dc * step };
+      if (squareBlockedForDisplacement(state, pos)) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) continue;
+    const dest = { row: target.pos.row + dr * ULTIMATE_SUCK_LAUNCH, col: target.pos.col + dc * ULTIMATE_SUCK_LAUNCH };
+    if (!inBounds(dest)) continue;
+    if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, dest))) continue;
+    const occ = pieceAt(state, dest);
+    if (occ && (occ.color === croc.color || gadgetCannotCapture(occ))) continue;
+    out.push(dest);
+  }
+  return out;
+}
+
+function finishUltimateSuck(
+  state: GameState,
+  color: Color,
+  pieceId: string,
+  targetId: string,
+  to: Coord,
+): GameState {
+  const croc = state.pieces.find((p) => p.id === pieceId);
+  if (!croc || croc.color !== color || croc.defId !== 'crocodile') {
+    throw new Error('Ultimate Suck requires a Crocodile');
+  }
+  if ((croc.abilityCooldown ?? 0) > 0) throw new Error('Ultimate Suck is on cooldown');
+  const target = state.pieces.find((p) => p.id === targetId);
+  if (!target || target.id === croc.id) throw new Error('Invalid target');
+  if (target.class === 'king') throw new Error('Kings cannot be launched');
+  if (chebyshev(target.pos, croc.pos) > ULTIMATE_SUCK_REACH) {
+    throw new Error('Target must be within 2 tiles of the Crocodile');
+  }
+  if (!ultimateSuckLandings(state, pieceId, targetId).some((c) => sameCoord(c, to))) {
+    throw new Error('Launch must be exactly 3 tiles in a clear straight line');
+  }
+  if (shieldBlocks(state, target, color)) {
+    croc.abilityCooldown = ULTIMATE_SUCK_COOLDOWN;
+    state.pendingPrompt = null;
+    return concludeAbilityTurn(state, color);
+  }
+  const occ = pieceAt(state, to);
+  const victimName = occ ? getPieceDef(occ.defId).name : undefined;
+  if (occ && !captureBestBuddyPair(state, to, color)) removePiece(state, occ, color);
+  const from = { ...target.pos };
+  endBestBuddy(state, target, target.pos);
+  target.pos = { ...to };
+  snareInWeb(state, target);
+  croc.abilityCooldown = ULTIMATE_SUCK_COOLDOWN;
+  state.lastMove = {
+    pieceId: target.id,
+    from,
+    to: { ...to },
+    capturedId: occ?.id,
+    defId: target.defId,
+    color,
+  };
+  state.pendingPrompt = null;
+  const name = getPieceDef(target.defId).name;
+  log(
+    state,
+    victimName
+      ? `Crocodile launched ${name} into ${victimName} — captured!`
+      : `Crocodile launched ${name} 3 tiles`,
+  );
+  abilityFx(state, 'ultimate_suck');
+  return concludeAbilityTurn(state, color);
+}
+
+const PROTO_TELEPORT_RANGE = 4;
+const PROTO_MAGNET_RANGE = 3;
+const PROTO_EMP_RADIUS = 2;
+const PROTO_MOVE_ABILITIES = new Set(['teleport_relay', 'magnetic_leap', 'quantum_drive', 'drone_launcher']);
+const PROTO_FOLLOWUPS = new Set(['chain_assault', 'razor_limbs']);
+const PROTO_FORMS: Record<string, PrototypeForm> = {
+  form_assault: 'assault',
+  form_fortress: 'fortress',
+  form_phantom: 'phantom',
+};
+const EMP_BLOCKED_SPECIALS = new Set(['ancient_shuffle', 'giga_stomp', 'best_buddy', 'swap_of_fates', 'death_stare']);
+
+function overclocked(attacker: PieceState | undefined): boolean {
+  return Boolean(attacker && attacker.defId === 'prototype' && protoHas(attacker, 'overclock_weapons'));
+}
+
+/** Reinforced Hull or Fortress Bulwark can still soak a capture from this attacker. */
+function hullProtects(attacker: PieceState | undefined, target: PieceState): boolean {
+  if (target.defId !== 'prototype' || !target.proto) return false;
+  if (attacker && attacker.color === target.color) return false;
+  if (overclocked(attacker)) return false;
+  const p = target.proto;
+  if (p.form === 'fortress' && (p.bulwark ?? 0) > 0) return true;
+  return p.hull > 0 && protoHas(target, 'reinforced_hull');
+}
+
+/** Spend whichever capture guard is up (Bulwark first, since it recharges); returns its name. */
+function spendCaptureGuard(state: GameState, target: PieceState): string {
+  const p = target.proto!;
+  if (p.form === 'fortress' && (p.bulwark ?? 0) > 0) {
+    p.bulwark = (p.bulwark ?? 1) - 1;
+    abilityFx(state, 'reinforced_hull');
+    return 'Fortress Bulwark';
+  }
+  p.hull = 0;
+  abilityFx(state, 'reinforced_hull');
+  return 'Reinforced Hull';
+}
+
+/** Fortress form or a charged Energy Shield turns away enemy abilities and spells. */
+function protoWarded(target: PieceState | undefined, byColor: Color): boolean {
+  if (!target || target.defId !== 'prototype' || target.color === byColor || !target.proto) return false;
+  if (target.proto.form === 'fortress') return true;
+  return target.proto.shield > 0 && protoHas(target, 'energy_shield');
+}
+
+function shieldBlocks(state: GameState, target: PieceState | undefined, byColor: Color): boolean {
+  if (!protoWarded(target, byColor)) return false;
+  const p = target!.proto!;
+  if (p.form === 'fortress') {
+    log(state, 'The Fortress Prototype shrugged off the effect');
+  } else {
+    p.shield -= 1;
+    log(state, `Energy Shield absorbed the effect (${p.shield} charge${p.shield === 1 ? '' : 's'} left)`);
+  }
+  abilityFx(state, 'energy_shield');
+  return true;
+}
+
+function grantProtoUpgrade(piece: PieceState, id: string): void {
+  const p = ensureProto(piece);
+  if (!p.upgrades.includes(id)) p.upgrades.push(id);
+  if (id === 'reinforced_hull') p.hull = 1;
+  if (id === 'energy_shield') p.shield = 1;
+}
+
+function applyInstability(state: GameState, piece: PieceState, id: string): void {
+  const p = ensureProto(piece);
+  // Counters tick at the end of the owner's turn; a mutation gained on the owner's turn must survive that tick.
+  const window = state.turn === piece.color ? 2 : 1;
+  if (id === 'power_surge') p.surge = window;
+  else if (id === 'motor_failure') p.motor = window;
+  else if (id === 'thermal_overload') p.thermal = window;
+  else if (id === 'core_fracture') p.lockdown = window;
+  else if (id === 'logic_conflict') shuntPrototype(state, piece);
+}
+
+/** Logic Conflict: hop to a random empty square within 2 that leaves neither King in check. */
+function shuntPrototype(state: GameState, piece: PieceState): void {
+  const spots: Coord[] = [];
+  for (let dr = -2; dr <= 2; dr++) {
+    for (let dc = -2; dc <= 2; dc++) {
+      const to = { row: piece.pos.row + dr, col: piece.pos.col + dc };
+      if ((dr === 0 && dc === 0) || !inBounds(to) || !protoSquareOpen(state, to)) continue;
+      const trial = cloneState(state);
+      const tp = trial.pieces.find((p) => p.id === piece.id);
+      if (!tp) continue;
+      endBestBuddy(trial, tp, tp.pos);
+      tp.pos = { ...to };
+      if (isInCheck(trial, piece.color) || isInCheck(trial, opposite(piece.color))) continue;
+      spots.push(to);
+    }
+  }
+  if (!spots.length) {
+    log(state, 'Logic Conflict — the Prototype twitched but had nowhere to go');
+    return;
+  }
+  const dest = spots[Math.floor(protoRng(state, piece, 2)() * spots.length)];
+  endBestBuddy(state, piece, piece.pos);
+  piece.pos = { ...dest };
+  snareInWeb(state, piece);
+  log(state, 'Logic Conflict — the Prototype glitched to a new square');
+}
+
+function gainMutation(state: GameState, piece: PieceState, reason: string): void {
+  if (piece.defId !== 'prototype' || !state.pieces.some((p) => p.id === piece.id)) return;
+  const id = rollMutationId(state, piece);
+  const p = ensureProto(piece);
+  p.gained += 1;
+  p.history = [...(p.history ?? []), id];
+  const info = MUTATIONS[id];
+  if (info.kind === 'instability') {
+    applyInstability(state, piece, id);
+    abilityFx(state, 'mutation_unstable');
+  } else {
+    grantProtoUpgrade(piece, id);
+    abilityFx(state, 'mutation');
+  }
+  log(state, `Prototype mutated (${reason}): ${info.icon} ${info.name}`);
+  if (p.gained === FINAL_EVOLUTION_AT && !p.form) {
+    log(state, 'The Prototype is ready for its Final Evolution');
+    abilityFx(state, 'final_evolution_ready');
+  }
+}
+
+function prototypeNightSurvival(state: GameState): void {
+  for (const piece of [...state.pieces]) {
+    if (piece.defId !== 'prototype') continue;
+    gainMutation(state, piece, 'survived the night');
+  }
+}
+
+/** End of `color`'s turn: count down Prototype windows and cooldowns. */
+function tickPrototypes(state: GameState, color: Color): void {
+  for (const piece of state.pieces) {
+    if (piece.defId !== 'prototype' || piece.color !== color || !piece.proto) continue;
+    const p = piece.proto;
+    if (p.surge > 0) p.surge -= 1;
+    if (p.motor > 0) p.motor -= 1;
+    if (p.thermal > 0) p.thermal -= 1;
+    if (p.lockdown > 0) p.lockdown -= 1;
+    if (p.teleportCooldown > 0) p.teleportCooldown -= 1;
+    if (p.empCooldown > 0) p.empCooldown -= 1;
+  }
+}
+
+/** End of `mover`'s turn: enemy Reactive Plating knocks their adjacent non-King pieces 1 square away. */
+function reactivePlatingKnockback(state: GameState, mover: Color): void {
+  for (const proto of state.pieces) {
+    if (proto.defId !== 'prototype' || proto.color === mover || !protoHas(proto, 'reactive_plating')) continue;
+    let pushed = 0;
+    const checkedBefore = { white: isInCheck(state, 'white'), black: isInCheck(state, 'black') };
+    for (const victim of [...state.pieces]) {
+      if (victim.color !== mover || victim.class === 'king' || chebyshev(victim.pos, proto.pos) !== 1) continue;
+      const to = {
+        row: victim.pos.row + Math.sign(victim.pos.row - proto.pos.row),
+        col: victim.pos.col + Math.sign(victim.pos.col - proto.pos.col),
+      };
+      if (!inBounds(to) || !protoSquareOpen(state, to)) continue;
+      const trial = cloneState(state);
+      const tv = trial.pieces.find((p) => p.id === victim.id)!;
+      endBestBuddy(trial, tv, tv.pos);
+      tv.pos = { ...to };
+      if ((!checkedBefore.white && isInCheck(trial, 'white')) || (!checkedBefore.black && isInCheck(trial, 'black'))) {
+        continue;
+      }
+      endBestBuddy(state, victim, victim.pos);
+      victim.pos = { ...to };
+      snareInWeb(state, victim);
+      pushed += 1;
+    }
+    if (pushed) {
+      log(state, `Reactive Plating knocked back ${pushed} piece${pushed === 1 ? '' : 's'}`);
+      abilityFx(state, 'reactive_plating');
+    }
+  }
+}
+
+const NANITE_CLEANSED = ['frozen', 'stunned', 'immobilized', 'webbed'];
+
+/** Start of `color`'s turn: their EMP fields collapse; Self-Repair Nanites shake off disabling effects. */
+function startPrototypeTurn(state: GameState, color: Color): void {
+  for (const piece of state.pieces) {
+    const emp = hasEffect(piece, 'emp');
+    if (emp && emp.data?.by === color) removeEffects(piece, 'emp');
+  }
+  for (const piece of state.pieces) {
+    if (piece.defId !== 'prototype' || piece.color !== color || !protoHas(piece, 'self_repair')) continue;
+    // Pause pairs Frozen with invincibility; stripping half of it would leave an invincible, mobile piece.
+    if (hasEffect(piece, 'pause')) continue;
+    const before = piece.effects.length;
+    piece.effects = piece.effects.filter((e) => !NANITE_CLEANSED.includes(e.kind));
+    if (piece.effects.length < before) {
+      log(state, 'Self-Repair Nanites shook off the disabling effects');
+      abilityFx(state, 'self_repair');
+    }
+  }
+}
+
+function triggerAdaptiveReactor(state: GameState, color: Color): boolean {
+  const proto = state.pieces.find(
+    (p) => p.color === color && p.defId === 'prototype' && protoHas(p, 'adaptive_reactor'),
+  );
+  if (!proto?.proto) return false;
+  proto.proto.reactorTurns += 1;
+  if (proto.proto.reactorTurns % 3 !== 0) return false;
+  if (protoLockedDown(proto) || hasEffect(proto, 'emp') || (proto.disabledTurns ?? 0) > 0) return false;
+  if (isInCheck(state, color) || isInCheck(state, opposite(color))) return false;
+  state.reactorAction = { color, pieceId: proto.id };
+  state.turnPhase = 'move';
+  log(state, 'Adaptive Reactor — the Prototype takes an extra action (no capturing)');
+  abilityFx(state, 'adaptive_reactor');
+  return true;
+}
+
+function gravityPenalized(state: GameState, piece: PieceState): boolean {
+  if (piece.class === 'king' || piece.class === 'knight') return false;
+  return state.pieces.some(
+    (p) =>
+      p.defId === 'prototype' &&
+      p.color !== piece.color &&
+      protoHas(p, 'gravity_field') &&
+      chebyshev(p.pos, piece.pos) <= (p.proto?.form === 'fortress' ? 2 : 1),
+  );
+}
+
+/** Gravity Field: along each straight line, the farthest reachable square is lost. */
+function applyGravity(piece: PieceState, moves: MoveOption[]): MoveOption[] {
+  const groups = new Map<string, MoveOption[]>();
+  for (const m of moves) {
+    if (m.special) continue;
+    const dr = m.to.row - piece.pos.row;
+    const dc = m.to.col - piece.pos.col;
+    if (!(dr === 0 || dc === 0 || Math.abs(dr) === Math.abs(dc))) continue;
+    const key = `${Math.sign(dr)},${Math.sign(dc)}`;
+    const g = groups.get(key) ?? [];
+    g.push(m);
+    groups.set(key, g);
+  }
+  const drop = new Set<MoveOption>();
+  for (const g of groups.values()) {
+    if (g.length < 2) continue;
+    const far = Math.max(...g.map((m) => chebyshev(m.to, piece.pos)));
+    for (const m of g) if (chebyshev(m.to, piece.pos) === far) drop.add(m);
+  }
+  return drop.size ? moves.filter((m) => !drop.has(m)) : moves;
+}
+
+function protoSquareOpen(state: GameState, pos: Coord): boolean {
+  return !squareBlockedForDisplacement(state, pos);
+}
+
+function relocationKeepsKingSafe(state: GameState, piece: PieceState, to: Coord): boolean {
+  const trial = cloneState(state);
+  const tp = trial.pieces.find((p) => p.id === piece.id);
+  if (!tp) return false;
+  endBestBuddy(trial, tp, tp.pos);
+  tp.pos = { ...to };
+  return Boolean(getKing(trial, piece.color)) && !isInCheck(trial, piece.color);
+}
+
+function protoMobilityLocked(piece: PieceState): boolean {
+  return (piece.proto?.motor ?? 0) > 0 || (piece.proto?.surge ?? 0) > 0;
+}
+
+/** Raw (not king-safety filtered) destinations for a Prototype ability. */
+function prototypeAbilityOptions(state: GameState, piece: PieceState, abilityId: string): Coord[] {
+  const out: Coord[] = [];
+  const scan = (pred: (c: Coord) => boolean) => {
+    for (let row = 0; row < BOARD_SIZE; row++) {
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        const c = { row, col };
+        if (!sameCoord(c, piece.pos) && protoSquareOpen(state, c) && pred(c)) out.push(c);
+      }
+    }
+  };
+  if (abilityId === 'teleport_relay') scan((c) => chebyshev(c, piece.pos) <= PROTO_TELEPORT_RANGE);
+  else if (abilityId === 'quantum_drive') scan(() => true);
+  else if (abilityId === 'drone_launcher') scan((c) => chebyshev(c, piece.pos) === 1);
+  else if (abilityId === 'magnetic_leap') {
+    const enemies = state.pieces.filter(
+      (p) => p.color !== piece.color && chebyshev(p.pos, piece.pos) <= PROTO_MAGNET_RANGE,
+    );
+    scan((c) => enemies.some((e) => chebyshev(e.pos, c) === 1));
+  } else if (abilityId === 'razor_limbs') {
+    scan((c) => chebyshev(c, piece.pos) === 1);
+  } else if (abilityId === 'chain_assault') {
+    const overclock = overclocked(piece);
+    for (const e of state.pieces) {
+      if (e.color === piece.color || e.class === 'king' || chebyshev(e.pos, piece.pos) !== 1) continue;
+      if (!overclock && (hasEffect(e, 'invincible') || hasEffect(e, 'pause'))) continue;
+      out.push({ ...e.pos });
+    }
+  }
+  return out;
+}
+
+function prototypeSafeOptions(state: GameState, piece: PieceState, abilityId: string): Coord[] {
+  const raw = prototypeAbilityOptions(state, piece, abilityId);
+  if (abilityId === 'drone_launcher') {
+    return raw.filter((c) => {
+      const trial = cloneState(state);
+      trial.pieces.push(makeDrone(piece, c, 'drone'));
+      return !isInCheck(trial, piece.color);
+    });
+  }
+  if (abilityId === 'chain_assault') {
+    return raw.filter((c) => {
+      const trial = cloneState(state);
+      trial.pieces = trial.pieces.filter((p) => !sameCoord(p.pos, c));
+      return !isInCheck(trial, piece.color);
+    });
+  }
+  return raw.filter((c) => relocationKeepsKingSafe(state, piece, c));
+}
+
+function makeDrone(owner: PieceState, pos: Coord, defId: 'drone' | 'backup_drone'): PieceState {
+  return {
+    id: `${defId}_${owner.id}_${Date.now().toString(36)}`,
+    defId,
+    class: 'wildcard',
+    color: owner.color,
+    pos: { ...pos },
+    hasMoved: false,
+    startPos: { ...pos },
+    effects: [],
+  };
+}
+
+function prototypeAbilityList(
+  state: GameState,
+  piece: PieceState,
+): Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> {
+  const out: Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> = [];
+  const p = piece.proto;
+  const gained = p?.gained ?? 0;
+  const owned = p?.upgrades ?? [];
+  const statusBits: string[] = [];
+  if (p?.form) statusBits.push(`Form: ${p.form}`);
+  if (p?.surge) statusBits.push('Power Surge');
+  if (p?.motor) statusBits.push('Motor Failure');
+  if (p?.thermal) statusBits.push('Thermal Overload');
+  if (p?.lockdown) statusBits.push('Core Fracture');
+  out.push({
+    id: 'mut_status',
+    name: `Mutations: ${gained}${gained >= FINAL_EVOLUTION_AT ? ' (max form)' : ''}`,
+    ready: true,
+    passive: true,
+    hint:
+      (owned.length ? owned.map((id) => `${MUTATIONS[id]?.icon ?? ''} ${MUTATIONS[id]?.name ?? id}`).join(', ') : 'No mutations yet') +
+      (statusBits.length ? ` · ${statusBits.join(' · ')}` : '') +
+      ' · Mutates on each capture and each night survived.',
+  });
+
+  const online = !protoLockedDown(piece) && (piece.disabledTurns ?? 0) <= 0;
+  const offlineHint = protoLockedDown(piece) ? 'Core Fracture: locked down this turn' : undefined;
+  const mobilityHint = protoMobilityLocked(piece) ? 'Instability — mobility mutations are locked this turn' : undefined;
+  const inReactor = state.reactorAction?.pieceId === piece.id;
+
+  if (protoHas(piece, 'teleport_relay')) {
+    const cd = p?.teleportCooldown ?? 0;
+    out.push({
+      id: 'teleport_relay',
+      name: cd > 0 ? `Teleport Relay (${cd})` : 'Teleport Relay',
+      ready: online && cd <= 0 && !protoMobilityLocked(piece) && prototypeAbilityOptions(state, piece, 'teleport_relay').length > 0,
+      hint: offlineHint ?? mobilityHint ?? (cd > 0 ? `Recharging: ${cd} more of your turns` : 'Teleport to an empty square within 4 tiles. Uses your turn.'),
+    });
+  }
+  if (protoHas(piece, 'magnetic_leap')) {
+    out.push({
+      id: 'magnetic_leap',
+      name: 'Magnetic Leap',
+      ready: online && !protoMobilityLocked(piece) && prototypeAbilityOptions(state, piece, 'magnetic_leap').length > 0,
+      hint: offlineHint ?? mobilityHint ?? 'Pull yourself next to an enemy within 3 tiles (no capture). Uses your turn.',
+    });
+  }
+  if (protoHas(piece, 'quantum_drive')) {
+    const left = 1 - (p?.quantumUses ?? 0);
+    out.push({
+      id: 'quantum_drive',
+      name: `Quantum Drive (${Math.max(0, left)})`,
+      ready: online && left > 0 && !protoMobilityLocked(piece),
+      hint: offlineHint ?? mobilityHint ?? 'Blink to any empty square on the board. Uses your turn.',
+    });
+  }
+  if (protoHas(piece, 'emp_burst') && !inReactor) {
+    const cd = p?.empCooldown ?? 0;
+    out.push({
+      id: 'emp_burst',
+      name: cd > 0 ? `EMP Burst (${cd})` : 'EMP Burst',
+      ready: online && cd <= 0,
+      hint: offlineHint ?? (cd > 0 ? `Recharging: ${cd} more of your turns` : 'Disable enemy abilities within 2 tiles until your next turn. Uses your turn.'),
+    });
+  }
+  if (protoHas(piece, 'drone_launcher') && !p?.droneLaunched) {
+    out.push({
+      id: 'drone_launcher',
+      name: 'Drone Launcher',
+      ready: online && prototypeAbilityOptions(state, piece, 'drone_launcher').length > 0,
+      hint: offlineHint ?? 'Once: deploy a Drone on an adjacent empty square. Uses your turn.',
+    });
+  }
+  if (gained >= FINAL_EVOLUTION_AT && !p?.form && !inReactor) {
+    for (const form of Object.values(FINAL_FORMS)) {
+      out.push({
+        id: `form_${form.id}`,
+        name: `Evolve: ${form.icon} ${form.name}`,
+        ready: true,
+        hint: finalFormHint(form.id),
+      });
+    }
+  }
+  if (inReactor) {
+    out.push({ id: 'reactor_end', name: 'End Reactor Action', ready: true, hint: 'Skip the extra action and end your turn.' });
+  }
+  return out;
+}
+
+function chooseFinalForm(state: GameState, piece: PieceState, form: PrototypeForm): void {
+  const p = ensureProto(piece);
+  p.form = form;
+  if (form === 'fortress') p.bulwark = 1;
+  log(state, `The Prototype evolved into its ${FINAL_FORMS[form].icon} ${FINAL_FORMS[form].name} form!`);
+  abilityFx(state, 'final_evolution');
+}
+
+function openPrototypePrompt(
+  state: GameState,
+  color: Color,
+  piece: PieceState,
+  abilityId: string,
+  options: Coord[],
+  message: string,
+  extra?: { skippable?: boolean; actorColor?: Color; resumeTurnPhase?: GameState['turnPhase'] },
+): void {
+  state.pendingPrompt = {
+    type: 'ability_target',
+    color,
+    pieceId: piece.id,
+    abilityId,
+    message,
+    options,
+    ...(extra?.skippable ? { skippable: true } : {}),
+    ...(extra?.actorColor ? { actorColor: extra.actorColor } : {}),
+    resumeTurnPhase: extra?.resumeTurnPhase ?? state.turnPhase,
+  };
+}
+
+/** Queue the next post-capture follow-up (Chain Assault, then Razor Limbs). Returns true if a prompt opened. */
+function nextPrototypeFollowup(state: GameState, piece: PieceState, color: Color): boolean {
+  const p = piece.proto;
+  if (!p || !state.pieces.some((x) => x.id === piece.id)) return false;
+  if (protoLockedDown(piece) || state.reactorAction) {
+    p.followup = undefined;
+    return false;
+  }
+  const f = p.followup ?? {
+    chainDone: false,
+    razorLeft: protoHas(piece, 'razor_limbs') ? 1 : 0,
+  };
+  p.followup = f;
+  if (!f.chainDone) {
+    f.chainDone = true;
+    if (protoHas(piece, 'chain_assault') && p.chainUses < 1) {
+      const opts = prototypeSafeOptions(state, piece, 'chain_assault');
+      if (opts.length) {
+        openPrototypePrompt(state, color, piece, 'chain_assault', opts, 'Chain Assault: capture an adjacent enemy (or Skip)', {
+          skippable: true,
+        });
+        return true;
+      }
+    }
+  }
+  while (f.razorLeft > 0) {
+    f.razorLeft -= 1;
+    const opts = prototypeSafeOptions(state, piece, 'razor_limbs');
+    if (opts.length) {
+      openPrototypePrompt(state, color, piece, 'razor_limbs', opts, 'Razor Limbs: move 1 square (no capture), or Skip', {
+        skippable: true,
+      });
+      return true;
+    }
+  }
+  p.followup = undefined;
+  return false;
+}
+
+/** Reinforced Hull / Fortress Bulwark soaks a capture: the attacker stays put and the turn ends. */
+function absorbWithHull(state: GameState, color: Color, attacker: PieceState, target: PieceState): GameState {
+  const guard = spendCaptureGuard(state, target);
+  attacker.hasMoved = true;
+  state.lastMove = {
+    pieceId: attacker.id,
+    from: { ...attacker.pos },
+    to: { ...attacker.pos },
+    defId: attacker.defId,
+    color,
+  } as GameState['lastMove'];
+  log(state, `${guard} absorbed the ${getPieceDef(attacker.defId).name}'s attack!`);
+  return concludeAbilityTurn(state, color);
+}
+
+function finishPrototypeFollowup(state: GameState, color: Color, piece: PieceState): GameState {
+  if (nextPrototypeFollowup(state, piece, color)) return state;
+  return concludeAbilityTurn(state, color);
+}
+
+function resolvePrototypePrompt(state: GameState, color: Color, payload: unknown, skip: boolean): GameState {
+  const prompt = state.pendingPrompt;
+  if (!prompt || prompt.type !== 'ability_target') throw new Error('No prompt');
+  const piece = state.pieces.find((p) => p.id === prompt.pieceId);
+  const abilityId = prompt.abilityId;
+  state.pendingPrompt = null;
+
+  if (!piece) return concludeAbilityTurn(state, color);
+
+  if (abilityId === 'chain_assault' || abilityId === 'razor_limbs') {
+    if (!skip) {
+      const dest = payload as Coord;
+      if (!prompt.options?.some((o) => sameCoord(o, dest))) throw new Error('Pick a highlighted square');
+      if (abilityId === 'chain_assault') {
+        const victim = pieceAt(state, dest);
+        if (!victim || victim.color === color) throw new Error('No enemy there');
+        piece.proto!.chainUses += 1;
+        abilityFx(state, 'chain_assault');
+        if (hullProtects(piece, victim)) {
+          log(state, `${spendCaptureGuard(state, victim)} absorbed the Chain Assault!`);
+        } else if (!captureBestBuddyPair(state, dest, color)) {
+          const name = getPieceDef(victim.defId).name;
+          if (removePiece(state, victim, color, { overclock: overclocked(piece) })) {
+            log(state, `Chain Assault — ${name} captured`);
+            state.lastMove = {
+              pieceId: piece.id,
+              from: { ...piece.pos },
+              to: { ...piece.pos },
+              capturedId: victim.id,
+              defId: piece.defId,
+              color,
+            } as GameState['lastMove'];
+            gainMutation(state, piece, 'capture');
+          }
+        }
+        if (state.phase === 'ended') return state;
+      } else {
+        endBestBuddy(state, piece, piece.pos);
+        piece.pos = { ...dest };
+        snareInWeb(state, piece);
+        log(state, 'Razor Limbs — the Prototype repositions');
+        abilityFx(state, 'razor_limbs');
+      }
+    }
+    if (isInCheck(state, opposite(color))) {
+      piece.proto!.followup = undefined;
+      return concludeAbilityTurn(state, color);
+    }
+    return finishPrototypeFollowup(state, color, piece);
+  }
+
+  if (skip) {
+    const resume = prompt.resumeTurnPhase;
+    if (resume === 'spell' || resume === 'move') state.turnPhase = resume;
+    return state;
+  }
+  return finishPrototypeAbility(state, color, piece, abilityId, payload as Coord);
+}
+
+function finishPrototypeAbility(
+  state: GameState,
+  color: Color,
+  piece: PieceState,
+  abilityId: string,
+  to: Coord,
+): GameState {
+  const p = ensureProto(piece);
+  if (!prototypeSafeOptions(state, piece, abilityId).some((c) => sameCoord(c, to))) {
+    throw new Error('Pick a highlighted square');
+  }
+  if (abilityId === 'drone_launcher') {
+    state.pieces.push(makeDrone(piece, to, 'drone'));
+    p.droneLaunched = true;
+    log(state, 'Drone Launcher — a Drone deploys');
+    abilityFx(state, 'drone_launcher');
+    return concludeAbilityTurn(state, color);
+  }
+  const from = { ...piece.pos };
+  endBestBuddy(state, piece, piece.pos);
+  piece.pos = { ...to };
+  snareInWeb(state, piece);
+  if (abilityId === 'teleport_relay') {
+    p.teleportCooldown = 3;
+    log(state, 'Teleport Relay!');
+  } else if (abilityId === 'quantum_drive') {
+    p.quantumUses += 1;
+    log(state, 'Quantum Drive — the Prototype blinks across the board');
+  } else {
+    log(state, 'Magnetic Leap — the Prototype pulls itself in');
+  }
+  abilityFx(state, abilityId);
+  state.lastMove = { pieceId: piece.id, from, to: { ...piece.pos }, defId: piece.defId, color } as GameState['lastMove'];
+  return concludeAbilityTurn(state, color);
+}
+
+function finishEmpBurst(state: GameState, color: Color, piece: PieceState): GameState {
+  const p = ensureProto(piece);
+  p.empCooldown = 4;
+  let hit = 0;
+  for (const e of state.pieces) {
+    if (e.color === color || chebyshev(e.pos, piece.pos) > PROTO_EMP_RADIUS) continue;
+    if (shieldBlocks(state, e, color)) continue;
+    removeEffects(e, 'emp');
+    addEffect(e, { id: `emp_${e.id}`, kind: 'emp', data: { by: color } });
+    hit += 1;
+  }
+  log(state, `EMP Burst — ${hit} enemy piece${hit === 1 ? '' : 's'} disabled`);
+  abilityFx(state, 'emp_burst');
+  return concludeAbilityTurn(state, color);
+}
+
+function prototypeAbilitySaves(state: GameState, color: Color): boolean {
+  for (const piece of state.pieces) {
+    if (piece.defId !== 'prototype' || piece.color !== color) continue;
+    for (const a of prototypeAbilityList(state, piece)) {
+      if (!a.ready || !PROTO_MOVE_ABILITIES.has(a.id)) continue;
+      if (hasEffect(piece, 'emp')) continue;
+      if (prototypeSafeOptions(state, piece, a.id).length) return true;
+    }
+  }
+  return false;
 }
 
 function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, to: Coord, color: Color): boolean {
@@ -1266,6 +2215,7 @@ function resolveGadgetLanding(state: GameState, piece: PieceState, from: Coord, 
       piece.pos = slide;
       snareInWeb(state, piece);
       log(state, `${piece.defId} slid on ice`);
+      abilityFx(state, 'ice_floor');
     }
     if (t.kind === 'spring_board') {
       state.pendingPrompt = {
@@ -1303,6 +2253,7 @@ function snareInWeb(state: GameState, piece: PieceState): void {
   removeEffects(piece, 'webbed');
   addEffect(piece, { id: `web_${piece.id}_${Date.now()}`, kind: 'webbed', turnsRemaining: 3 });
   log(state, `${getPieceDef(piece.defId).name} is caught in a web`);
+  abilityFx(state, 'web_snare');
 }
 
 function freePiecesNoLongerInWeb(state: GameState): void {
@@ -1331,6 +2282,7 @@ function placeTrailOfWebs(state: GameState, queen: PieceState, from: Coord, to: 
   ];
   const rowId = `webrow_${queen.id}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const seq = Date.now() + Math.random();
+  abilityFx(state, 'trail_of_webs');
   for (const pos of tiles) {
     if (!inBounds(pos)) continue;
     const occ = pieceAt(state, pos);
@@ -1357,6 +2309,42 @@ function placeTrailOfWebs(state: GameState, queen: PieceState, from: Coord, to: 
     const oldest = ordered.shift();
     if (oldest) removeWebRow(state, oldest[0]);
   }
+}
+
+const SPECIAL_MOVE_FX = new Set([
+  'castle_swap',
+  'ancient_shuffle',
+  'swap_of_fates',
+  'best_buddy',
+  'death_stare',
+  'archer_shot',
+  'giga_stomp',
+]);
+
+function moveAbilityFxId(
+  state: GameState,
+  piece: PieceState,
+  special: string | undefined,
+  from: Coord,
+  to: Coord,
+): string | null {
+  if (special && SPECIAL_MOVE_FX.has(special)) return special;
+  if (special) return null;
+  const dist = chebyshev(from, to);
+  const straightTwo = dist === 2 && (from.row === to.row || from.col === to.col);
+  if (piece.defId === 'leapfrog' && dist === 2) return 'leap';
+  if (piece.defId === 'worm' && !straightTwo) return 'burrow';
+  if (piece.defId === 'reaper' && dist === 2) return 'shadow_step';
+  if (piece.defId === 'ghost' && state.dayNight === 'night' && chebyshevPathBlocked(from, to, state)) {
+    return 'phase_walk';
+  }
+  if (
+    piece.defId === 'enchanted_pawn' &&
+    state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, to))
+  ) {
+    return 'barrier_phase';
+  }
+  return null;
 }
 
 export function applyMove(
@@ -1411,7 +2399,13 @@ export function applyMove(
         capture: Boolean(occ && occ.color !== color),
       };
       log(next, `${getPieceDef(piece.defId).name} is snared mid-path by a web`);
+      abilityFx(next, 'web_snare');
     }
+  }
+
+  if (!move.special || move.special === 'death_stare' || move.special === 'archer_shot') {
+    const struck = pieceAt(next, to);
+    if (struck && hullProtects(piece, struck)) return absorbWithHull(next, color, piece, struck);
   }
 
   // cancel recall if moves
@@ -1499,7 +2493,9 @@ export function applyMove(
         victims.push(occ);
       }
     }
-    for (const v of victims) removePiece(next, v, color);
+    for (const v of victims) {
+      if (!shieldBlocks(next, v, color)) removePiece(next, v, color);
+    }
     piece.gigaStompUsed = true;
     log(next, 'Giga Stomp!');
   } else if (move.special === 'portal_travel') {
@@ -1516,6 +2512,8 @@ export function applyMove(
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     piece.pos = { ...to };
   }
+  const moveFx = moveAbilityFxId(next, piece, move.special, from, to);
+  if (moveFx) abilityFx(next, moveFx);
 
   if (
     move.special !== 'death_stare' &&
@@ -1530,23 +2528,26 @@ export function applyMove(
     }
   }
 
+  const overclock = overclocked(piece);
+  let protoCaptured = false;
   if (captured && captured.color !== color) {
     if (yetiBlocksPawnCapture(piece, captured)) {
       throw new Error('Yeti cannot be captured by pawns');
     }
     // fortify vs pawn/knight
-    if (hasEffect(captured, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) {
+    if (!overclock && hasEffect(captured, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) {
       throw new Error('Target is fortified against pawns/knights');
     }
-    if (hasEffect(captured, 'invincible') || hasEffect(captured, 'pause')) {
+    if (!overclock && (hasEffect(captured, 'invincible') || hasEffect(captured, 'pause'))) {
       throw new Error('Target is invincible');
     }
 
     // ScamMan fraud
-    if (captured.defId === 'scamman' && piece.class !== 'pawn') {
+    if (captured.defId === 'scamman' && piece.class !== 'pawn' && !overclock) {
       piece.defId = 'pawn';
       piece.class = 'pawn';
       log(next, `${piece.id} was fleeced into a pawn!`);
+      abilityFx(next, 'fraudulent_fate');
     }
 
     // Demon convert
@@ -1564,10 +2565,11 @@ export function applyMove(
         converted.pos = park;
         next.pieces.push(converted);
       }
+      abilityFx(next, 'soul_syphon');
       captured = undefined;
     } else {
       const victimSnapshot = { ...captured };
-      removePiece(next, captured, color);
+      protoCaptured = removePiece(next, captured, color, { overclock });
       if (victimSnapshot.class === 'king' && isInCheck(next, color)) {
         throw new Error('Cannot capture the king while remaining in check');
       }
@@ -1594,6 +2596,7 @@ export function applyMove(
             const gi = egy.findIndex((g) => g.defId === victimSnapshot.defId);
             if (gi >= 0) egy.splice(gi, 1);
             log(next, 'Soul Lock — captive joins your ranks');
+            abilityFx(next, 'soul_lock');
           }
         }
         if (charges >= 5 && next.dayNight === 'night') {
@@ -1601,24 +2604,17 @@ export function applyMove(
           const victims = next.pieces.filter((p) => p.color !== color && p.class === cls);
           for (const v of [...victims]) removePiece(next, v, color);
           log(next, `World Shatterer — ${cls}s annihilated`);
+          abilityFx(next, 'world_shatterer');
         }
         piece.reaperKills = (piece.reaperKills ?? 0) + 1;
-        const needed = reaperCapturesUntilRest(charges);
-        if (charges > 0 && piece.reaperKills >= needed) {
-          const disable = Math.floor(charges * 2.5);
-          piece.reaperKills = 0;
-          piece.charges = 0;
-          piece.disabledTurns = disable;
-          const home = nearestEmptyAround(next, piece.startPos);
-          if (home) piece.pos = home;
-          log(next, `Reaper harvested ${needed} captures — charges spent, returns home (disabled ${disable} turns)`);
-        }
+        reaperHarvestIfDue(next, piece);
       }
 
       if (
         victimSnapshot.defId === 'spider' &&
         !isAlliedTerritory(victimSnapshot.color, victimSnapshot.pos) &&
-        !immuneToWeb(piece)
+        !immuneToWeb(piece) &&
+        !overclock
       ) {
         addEffect(piece, {
           id: `web_${piece.id}_${Date.now()}`,
@@ -1627,6 +2623,7 @@ export function applyMove(
           data: { source: 'spider_capture' },
         });
         log(next, `${getPieceDef(piece.defId).name} is caught in a web (Immovable)`);
+        abilityFx(next, 'spider_web');
       }
     }
 
@@ -1639,11 +2636,13 @@ export function applyMove(
         data: { defId: captured.defId },
       });
       log(next, `Fleece stored ${captured.defId} identity (activate Identity Theft to steal its movement)`);
+      abilityFx(next, 'identity_loot');
     }
 
     if (piece.defId === 'snake' && captured && !hasBloodlust(piece)) {
       piece.bloodlustTurnsRemaining = 3;
       log(next, 'Snake Bloodlust!');
+      abilityFx(next, 'bloodlust');
     }
 
     const def = getPieceDef(piece.defId);
@@ -1655,18 +2654,21 @@ export function applyMove(
     if (piece.defId === 'vampire' && captured) {
       piece.charges = (piece.charges ?? 0) + 1;
       log(next, `Vampire gains a Blood Token (${piece.charges})`);
+      abilityFx(next, 'blood_token');
     }
 
-    if (piece.defId === 'snail' && captured) {
-      const variant = captured.defId;
+    if (piece.defId === 'snail' && captured && captured.class !== 'king') {
+      const wipedClass = captured.class;
+      const capturedId = captured.id;
       const extras = next.pieces.filter(
-        (p) => p.defId === variant && p.color !== color && p.class !== 'king',
+        (p) => p.class === wipedClass && p.color !== color && p.id !== capturedId,
       );
       for (const v of extras) {
         removePiece(next, v, color);
       }
       if (extras.length) {
-        log(next, `Snail capture — all enemy ${variant}s are wiped out`);
+        log(next, `Snail capture — every enemy ${wipedClass} variant is wiped out`);
+        abilityFx(next, 'snail_wipe');
       }
     }
 
@@ -1676,9 +2678,12 @@ export function applyMove(
       if (extra.length) {
         piece.effects = effectsBeforeCapture;
         log(next, 'Archer Steady Aim — capture status ignored');
+        abilityFx(next, 'steady_aim');
       }
     }
   }
+
+  if (protoCaptured && piece.defId === 'prototype') gainMutation(next, piece, 'capture');
 
   // Prince & Princess mirror
   if (piece.defId === 'prince_princess' && piece.linkedPieceId) {
@@ -1691,8 +2696,11 @@ export function applyMove(
       if (!inBounds(mirror)) throw new Error('Mirror move illegal');
       const occ = pieceAt(next, mirror);
       if (occ && occ.color === color) throw new Error('Mirror blocked');
-      if (occ && occ.color !== color) removePiece(next, occ, color);
+      if (occ && occ.color !== color && !removePiece(next, occ, color)) {
+        throw new Error('Mirror blocked by Reinforced Hull');
+      }
       other.pos = mirror;
+      abilityFx(next, 'dance_of_romance');
       snareInWeb(next, other);
     }
   }
@@ -1741,6 +2749,7 @@ export function applyMove(
     if ((piece.charges ?? 0) <= 0) {
       addEffect(piece, { id: `snail_imm_${piece.id}`, kind: 'immobilized' });
       log(next, 'The Snail has used all 8 tiles and is immobilized');
+      abilityFx(next, 'snail_exhausted');
     }
   }
 
@@ -1775,6 +2784,17 @@ export function applyMove(
   }
 
   retireSpidersAtFarEdge(next);
+
+  if (
+    protoCaptured &&
+    piece.defId === 'prototype' &&
+    next.phase === 'playing' &&
+    !isInCheck(next, color) &&
+    !isInCheck(next, opposite(color))
+  ) {
+    if (piece.proto) piece.proto.followup = undefined;
+    if (nextPrototypeFollowup(next, piece, color)) return next;
+  }
 
   // Promotion
   const promoteRow = color === 'white' ? 0 : BOARD_SIZE - 1;
@@ -1831,7 +2851,17 @@ function retireSpidersAtFarEdge(state: GameState): void {
   }
 }
 
-function removePiece(state: GameState, piece: PieceState, byColor: Color): void {
+/** Returns false when the piece survived (Reinforced Hull). */
+function removePiece(state: GameState, piece: PieceState, byColor: Color, opts?: { overclock?: boolean }): boolean {
+  if (
+    piece.defId === 'prototype' &&
+    byColor !== piece.color &&
+    !opts?.overclock &&
+    hullProtects(undefined, piece)
+  ) {
+    log(state, `${spendCaptureGuard(state, piece)} absorbed a lethal blow!`);
+    return false;
+  }
   endBestBuddy(state, piece, piece.pos);
   for (const p of state.pieces) {
     if (p.coOccupantId === piece.id) p.coOccupantId = undefined;
@@ -1859,6 +2889,16 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
       state.pieces = state.pieces.filter((p) => p.id !== other.id);
       state.players[other.color].graveyard.push({ defId: other.defId, class: other.class });
       log(state, 'True Love\'s Gambit — both fall');
+      abilityFx(state, 'true_love');
+    }
+  }
+
+  if (piece.defId === 'prototype' && protoHas(piece, 'backup_core') && !opts?.overclock) {
+    const spot = pieceAt(state, piece.pos) ? nearestEmptyAround(state, piece.pos) : { ...piece.pos };
+    if (spot) {
+      state.pieces.push(makeDrone(piece, spot, 'backup_drone'));
+      log(state, 'Backup Core — a Backup Drone boots up');
+      abilityFx(state, 'backup_core');
     }
   }
 
@@ -1869,6 +2909,7 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
     state.winReason = 'King captured';
   }
   void isAlliedTerritory;
+  return true;
 }
 
 /**
@@ -1958,10 +2999,24 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
 
   // Cannot cast abilities on enemy king — enforced per-card
 
+  if (next.reactorAction) throw new Error('Spells cannot be cast during a Reactor action');
+
   const rng = mulberry32(next.rngSeed + next.turnCount * 31);
+  const beforePlay = cloneState(next);
   const result = def.play({ state: next, player: color, card, rng }, targets);
   // Cards may replace the whole board (e.g. Rewind) — always honor returned state
-  const out = result.state;
+  let out = result.state;
+  if (result.done) {
+    const shielded = targets
+      .filter((t): t is string => typeof t === 'string')
+      .map((id) => beforePlay.pieces.find((p) => p.id === id))
+      .find((p) => protoWarded(p, color));
+    if (shielded) {
+      out = beforePlay;
+      if (out.pendingPrompt?.type === 'card_target') out.pendingPrompt = null;
+      shieldBlocks(out, shielded, color);
+    }
+  }
 
   if (!result.done) {
     if (!out.pendingPrompt) {
@@ -2019,6 +3074,9 @@ export function cancelPrompt(state: GameState, color: Color): GameState {
     throw new Error('This choice cannot be canceled');
   }
   const next = cloneState(state);
+  if (prompt.type === 'ability_target' && prompt.skippable) {
+    return resolvePrototypePrompt(next, color, null, true);
+  }
   const resume = prompt.resumeTurnPhase;
   next.pendingPrompt = null;
   if (resume === 'spell' || resume === 'move') next.turnPhase = resume;
@@ -2108,6 +3166,11 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
 
   if (prompt.type === 'ability_target') {
     if (prompt.color !== color) throw new Error('Not your prompt');
+    if (PROTO_FOLLOWUPS.has(prompt.abilityId) || PROTO_MOVE_ABILITIES.has(prompt.abilityId)) {
+      const skip = payload === null || payload === 'skip';
+      if (skip && !prompt.skippable) throw new Error('Pick a highlighted square');
+      return resolvePrototypePrompt(next, color, payload, skip);
+    }
     if (prompt.abilityId === 'enchant') {
       next.pendingPrompt = null;
       return finishWizardEnchant(next, color, prompt.pieceId, payload as string);
@@ -2143,6 +3206,23 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
       next.pendingPrompt = null;
       return finishChronoRecall(next, color, prompt.pieceId, payload as string);
     }
+    if (prompt.abilityId === 'ultimate_suck') {
+      if (typeof payload === 'string') {
+        const target = next.pieces.find((p) => p.id === payload);
+        if (!target || !ultimateSuckTargets(next, prompt.pieceId).some((p) => p.id === payload)) {
+          throw new Error('Pick a non-king piece within 2 tiles that has a clear 3-tile launch');
+        }
+        next.pendingPrompt = {
+          ...prompt,
+          targetId: payload,
+          message: `Ultimate Suck: click where to launch the ${getPieceDef(target.defId).name} (3 tiles)`,
+        };
+        return next;
+      }
+      if (!prompt.targetId) throw new Error('Pick a piece to launch first');
+      next.pendingPrompt = null;
+      return finishUltimateSuck(next, color, prompt.pieceId, prompt.targetId, payload as Coord);
+    }
   }
 
   if (prompt.type === 'spring_bounce') {
@@ -2166,6 +3246,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     snareInWeb(next, piece);
     next.pendingPrompt = null;
     log(next, 'Spring Board bounce!');
+    abilityFx(next, 'spring_board');
     if (isInCheck(next, opposite(color))) return endTurn(next, color, true);
     return endTurn(next, color, false);
   }
@@ -2187,6 +3268,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     snareInWeb(next, piece);
     next.pendingPrompt = null;
     log(next, 'Traveled through Gnome Hole');
+    abilityFx(next, 'gnome_hole');
     if (isInCheck(next, opposite(color))) return endTurn(next, color, true);
     return endTurn(next, color, false);
   }
@@ -2358,7 +3440,11 @@ function applyGambler(
 }
 
 function gadgetCannotCapture(occ: PieceState): boolean {
-  return occ.class === 'king' || Boolean(hasEffect(occ, 'invincible') || hasEffect(occ, 'pause'));
+  return (
+    occ.class === 'king' ||
+    Boolean(hasEffect(occ, 'invincible') || hasEffect(occ, 'pause')) ||
+    hullProtects(undefined, occ)
+  );
 }
 
 function hasLegalBoardMoves(state: GameState, color: Color): boolean {
@@ -2588,9 +3674,36 @@ function barrierShiftSaves(state: GameState, color: Color): boolean {
   return false;
 }
 
+function ultimateSuckSaves(state: GameState, color: Color): boolean {
+  const crocs = state.pieces.filter(
+    (p) =>
+      p.defId === 'crocodile' &&
+      p.color === color &&
+      (p.disabledTurns ?? 0) <= 0 &&
+      (p.abilityCooldown ?? 0) <= 0,
+  );
+  for (const croc of crocs) {
+    for (const target of ultimateSuckTargets(state, croc.id)) {
+      for (const to of ultimateSuckLandings(state, croc.id, target.id)) {
+        const trial = cloneState(state);
+        const tp = trial.pieces.find((p) => p.id === target.id);
+        if (!tp) continue;
+        const occ = pieceAt(trial, to);
+        if (occ && !captureBestBuddyPair(trial, to, color)) removePiece(trial, occ, color);
+        endBestBuddy(trial, tp, tp.pos);
+        tp.pos = { ...to };
+        if (getKing(trial, color) && !isInCheck(trial, color)) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function hasEscapeFromCheck(state: GameState, color: Color): boolean {
   if (hasLegalBoardMoves(state, color)) return true;
   if (!isMagicDisabled(state, color) && barrierShiftSaves(state, color)) return true;
+  if (ultimateSuckSaves(state, color)) return true;
+  if (prototypeAbilitySaves(state, color)) return true;
   if (!spellsUnlocked(state)) return false;
   if (isMagicDisabled(state, color)) return false;
   if (state.turnPhase !== 'spell') return false;
@@ -2605,6 +3718,17 @@ function hasEscapeFromCheck(state: GameState, color: Color): boolean {
 export function endTurn(state: GameState, color: Color, fromCheck: boolean): GameState {
   retireSpidersAtFarEdge(state);
   const next = state;
+  const finishingReactor = next.reactorAction?.color === color;
+  next.reactorAction = undefined;
+  if (
+    !finishingReactor &&
+    !fromCheck &&
+    next.phase === 'playing' &&
+    !next.pendingPrompt &&
+    triggerAdaptiveReactor(next, color)
+  ) {
+    return next;
+  }
   tickEffectsOnTurnEnd(next, color);
 
   next.players[color].spellsThisTurn = 0;
@@ -2638,6 +3762,8 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
       flipDayNight(next, true);
     }
   }
+  reactivePlatingKnockback(next, color);
+  tickPrototypes(next, color);
 
   let nextColor = opposite(color);
   // skip turns
@@ -2658,6 +3784,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
   next.turn = nextColor;
   next.turnPhase = spellsUnlocked(next) && !isMagicDisabled(next, nextColor) ? 'spell' : 'move';
   next.players[nextColor].maxSpellsThisTurn = 1;
+  startPrototypeTurn(next, nextColor);
 
   pushSnapshot(next);
 
@@ -2796,10 +3923,16 @@ export function publicState(state: GameState, viewer: Color | null): GameState {
 export function getDraftOptions(state: GameState, color?: Color): string[] {
   if (!state.draft) return [];
   const picker = color ?? state.draft.pickingColor;
+  if (state.draft.stage === 'ban') {
+    return DRAFT_ORDER.flatMap((cls) => VARIANTS_BY_CLASS[cls] ?? []).filter(
+      (id) => !draftBanBlockReason(state, picker, id),
+    );
+  }
   const army = state.players[picker].army;
+  const banned = draftBannedIds(state);
   const out: string[] = [];
   for (const cls of DRAFT_ORDER) {
-    if (!army[cls]) out.push(...(VARIANTS_BY_CLASS[cls] ?? []));
+    if (!army[cls]) out.push(...(VARIANTS_BY_CLASS[cls] ?? []).filter((id) => !banned.includes(id)));
   }
   return out;
 }

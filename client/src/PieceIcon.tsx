@@ -12,6 +12,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   stoneman: { folder: 'Rooks', file: 'Stoneman' },
   gnome: { folder: 'Rooks', file: 'Gnome' },
   yeti: { folder: 'Rooks', file: 'Yeti' },
+  crocodile: { folder: 'Rooks', file: 'Crocodile' },
   horse: { folder: 'Knights', file: 'Horse' },
   snake: { folder: 'Knights', file: 'Snake' },
   pig: { folder: 'Knights', file: 'Pig' },
@@ -32,13 +33,22 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   mimic: { folder: 'Wildcards', file: 'Mimic' },
   gambler: { folder: 'Wildcards', file: 'Gambler' },
   timekeeper: { folder: 'Wildcards', file: 'TimeKeeper' },
+  prototype: { folder: 'Wildcards', file: 'Prototype' },
+  drone: { folder: 'Wildcards', file: 'Drone' },
+  backup_drone: { folder: 'Wildcards', file: 'BackupDrone' },
   king: { folder: 'Kings', file: 'King' },
 };
 
-export function pieceArtSrc(defId: string, color: Color): string {
+/** Prototype art tier: upgrades every 2 mutations, capped at 6 (tier 3). */
+export function prototypeTier(gained: number | undefined): number {
+  return Math.max(0, Math.min(3, Math.floor((gained ?? 0) / 2)));
+}
+
+export function pieceArtSrc(defId: string, color: Color, tier = 0): string {
   const art = PIECE_ART[defId] ?? PIECE_ART.pawn;
   const tone = color === 'white' ? 'White' : 'Black';
-  return `/Chesspansion/${art.folder}/${art.file}${tone}.png`;
+  const stage = defId === 'prototype' && tier > 0 ? String(tier) : '';
+  return `/Chesspansion/${art.folder}/${art.file}${stage}${tone}.png`;
 }
 
 export function PieceIcon({
@@ -46,14 +56,16 @@ export function PieceIcon({
   color,
   className = '',
   title,
+  tier = 0,
 }: {
   defId: string;
   color: Color;
   className?: string;
   title?: string;
+  tier?: number;
 }) {
   const id = PIECE_ART[defId] ? defId : 'pawn';
-  const src = pieceArtSrc(id, color);
+  const src = pieceArtSrc(id, color, tier);
   return (
     <span
       className={`piece-icon piece-icon-art piece-art-${id} ${color} ${className}`.trim()}

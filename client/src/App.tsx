@@ -1,20 +1,53 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import { io, Socket } from 'socket.io-client';
-import { listMoves as engineListMoves, availableAbilities as engineAbilities } from '@shared/engine/game.ts';
+import {
+  listMoves as engineListMoves,
+  availableAbilities as engineAbilities,
+  ultimateSuckTargets,
+  ultimateSuckLandings,
+  draftBanBlockReason,
+  draftBannedIds,
+  BANS_PER_COLOR,
+} from '@shared/engine/game.ts';
 import {
   applyClientAction,
   createLobbyState,
+  forceTimeoutMove,
   getDraftOptions,
   publicState,
+  seatDisplayName,
   startDraft,
+  syncTurnTimer,
+  turnTimerExpired,
   CARD_REGISTRY,
   PIECES,
+  TURN_TIMER_OPTIONS,
 } from '@shared/index.ts';
 import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
+import {
+  EvolutionPicker,
+  MutationToast,
+  PrototypeBoardBadges,
+  PrototypeInspector,
+  type FormId,
+  type MutationToastData,
+  type ProtoView,
+} from './PrototypeHud';
 import { spellsUnlocked, isMagicDisabled, reaperCapturesUntilRest, vampireNightRadius, opposite } from '@shared/utils.ts';
-import { CosmicBackdrop, FxToggle, KnowledgeToggle, useFxEnabled, useKnowledgeEnabled } from './CosmicFx';
+import { LobbyBrowser } from './LobbyBrowser';
+import { TurnClock, type TurnTimerView } from './TurnClock';
+import {
+  CosmicBackdrop,
+  FxToggle,
+  KnowledgeToggle,
+  useAnonymousRule,
+  useBanPhaseRule,
+  useTurnTimerRule,
+  useFxEnabled,
+  useKnowledgeEnabled,
+} from './CosmicFx';
 import {
   AudioToggles,
   playCardCastSfx,
@@ -32,9 +65,12 @@ import {
   playResultTrack,
   stopResultTrack,
   playDayToNightSfx,
+  playAbilitySfx,
+  playDraftBanSfx,
   playDraftOrderSfx,
   playDraftPickSfx,
   playDraftSelectSfx,
+  playErrorBuzzSfx,
   playLobbyCreatedSfx,
   playMatchJoinSfx,
   playMoveSfx,
@@ -46,7 +82,7 @@ import {
   useUiButtonSfx,
   resetStuckAudio,
 } from './AudioControl';
-import { PieceIcon } from './PieceIcon';
+import { PieceIcon, prototypeTier } from './PieceIcon';
 import { getPieceInfo } from './pieceInfo';
 import { getObstacleInfo } from './obstacleInfo';
 import { RulesModal } from './RulesModal';
@@ -60,6 +96,15 @@ import './App.css';
 
 type Color = 'white' | 'black';
 type Coord = { row: number; col: number };
+
+const PROTO_PROMPT_LABELS: Record<string, string> = {
+  teleport_relay: 'Teleport here',
+  magnetic_leap: 'Magnetic Leap here',
+  quantum_drive: 'Quantum Drive here',
+  drone_launcher: 'Deploy Drone here',
+  razor_limbs: 'Razor Limbs step',
+  chain_assault: 'Chain Assault',
+};
 
 interface Piece {
   id: string;
@@ -85,6 +130,7 @@ interface Piece {
   magicBegoneUsed?: number;
   timekeeperCycleUsed?: boolean;
   timekeeperRecallUsed?: boolean;
+  proto?: ProtoView;
 }
 
 interface AbilityInfo {
@@ -118,6 +164,7 @@ interface GameState {
       openingRedrawUsed: boolean;
       connected: boolean;
       magicDisabledUntilCycle?: number;
+      lastPlayedCardDefId?: string;
     }
   >;
   turn: Color;
@@ -138,6 +185,7 @@ interface GameState {
     defId?: string;
     color?: Color;
   };
+  abilityFx?: Array<{ seq: number; id: string }>;
   pendingPrompt: null | {
     type: string;
     color?: Color;
@@ -152,10 +200,19 @@ interface GameState {
     remaining?: number;
     abilityId?: string;
     from?: Coord;
+    targetId?: string;
+    skippable?: boolean;
+    actorColor?: Color;
   };
+  reactorAction?: { color: Color; pieceId: string };
+  rules?: { banPhase: boolean; anonymous?: boolean; turnTimerSeconds?: number };
+  turnTimer?: TurnTimerView;
   draft: null | {
     pickingColor: Color;
     blackChoseFirstPicker: boolean | null;
+    stage?: 'ban' | 'pick';
+    bans?: Record<Color, string[]>;
+    lastBan?: { color: Color; defId: string };
     lastPick?: {
       color: Color;
       defId: string;
@@ -248,22 +305,29 @@ function gameTurnInfo(
   if (state.phase === 'draft' && state.draft) {
     if (state.draft.blackChoseFirstPicker == null) {
       if (you === 'black') {
-        return { yours: true, label: localMode ? 'Black chooses' : 'Your choice', detail: 'Who drafts first?' };
+        return {
+          yours: true,
+          label: localMode ? 'Black chooses' : 'Your choice',
+          detail: state.rules?.banPhase === false ? 'Who drafts first?' : 'Who bans and drafts first?',
+        };
       }
       return { yours: false, label: 'Waiting', detail: 'Black picks draft order' };
     }
     const picking = state.draft.pickingColor;
     const pickName = picking === 'white' ? 'White' : 'Black';
+    const banning = state.draft.stage === 'ban';
     return {
       yours: picking === you,
       label: localMode
         ? picking === you
-          ? `${pickName} picks`
+          ? `${pickName} ${banning ? 'bans' : 'picks'}`
           : `Pass to ${pickName}`
         : picking === you
-          ? 'Your pick'
-          : `${state.players[picking].name} is picking`,
-      detail: 'Army draft',
+          ? banning
+            ? 'Your ban'
+            : 'Your pick'
+          : `${state.players[picking].name} is ${banning ? 'banning' : 'picking'}`,
+      detail: banning ? 'Ban phase' : 'Army draft',
     };
   }
   if (state.phase === 'opening_draw') {
@@ -306,7 +370,9 @@ function turnStripContent(
     title: localMode ? 'Pass the device' : 'Waiting for opponent',
     detail:
       state.phase === 'draft'
-        ? 'Draft'
+        ? state.draft?.stage === 'ban'
+          ? 'Ban phase'
+          : 'Draft'
         : info?.detail
           ? info.detail
           : state.turnPhase ?? '',
@@ -315,6 +381,51 @@ function turnStripContent(
 
 function cardMeta(catalog: Catalog | null, defId: string) {
   return catalog?.cards.find((c) => c.id === defId);
+}
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const mql = window.matchMedia(query);
+    const onChange = () => setMatches(mql.matches);
+    onChange();
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, [query]);
+  return matches;
+}
+
+const CARD_CAST_FX_MS = 1900;
+
+interface CardCastView {
+  key: number;
+  defId: string | null;
+  name: string;
+  tone: 'gold' | 'violet';
+  label: string;
+}
+
+function CardCastFx({ cast, image }: { cast: CardCastView; image?: string }) {
+  return (
+    <div className={`card-cast-fx is-${cast.tone}`} role="status" aria-live="polite">
+      <div className="card-cast-wash" aria-hidden />
+      <div className="card-cast-sigil" aria-hidden />
+      <div className="card-cast-ring" aria-hidden />
+      <div className="card-cast-ring is-late" aria-hidden />
+      <div className="card-cast-sparks" aria-hidden>
+        {Array.from({ length: 12 }, (_, i) => (
+          <span key={i} style={{ '--spark-a': `${i * 30 + 8}deg` } as React.CSSProperties} />
+        ))}
+      </div>
+      <div className="card-cast-card">
+        <img src={image ?? '/cards/Back_Of_Card.png'} alt="" />
+      </div>
+      <div className="card-cast-caption">
+        <span className="card-cast-who">{cast.label}</span>
+        <strong className="card-cast-name">{cast.name}</strong>
+      </div>
+    </div>
+  );
 }
 
 function isAlliedTerritory(color: Color, pos: Coord): boolean {
@@ -389,9 +500,23 @@ export default function App() {
   useUiButtonSfx();
   const [rulesOpen, setRulesOpen] = useState(false);
   const [mobileSheet, setMobileSheet] = useState<null | 'table' | 'info' | 'more'>(null);
+  const wideLayout = useMediaQuery('(min-width: 961px)');
   const [socket, setSocket] = useState<Socket | null>(null);
   const [name, setName] = useState('');
-  const [joinCode, setJoinCode] = useState('');
+  const { banPhaseRule, setBanPhaseRule } = useBanPhaseRule();
+  const { anonymousRule, setAnonymousRule } = useAnonymousRule();
+  const { turnTimerRule, setTurnTimerRule } = useTurnTimerRule();
+  const turnTimerSeconds = (TURN_TIMER_OPTIONS as readonly number[]).includes(turnTimerRule) ? turnTimerRule : 0;
+  const lobbyRules = {
+    banPhase: banPhaseRule,
+    anonymous: anonymousRule,
+    ...(turnTimerSeconds ? { turnTimerSeconds } : {}),
+  };
+  const serverClockOffsetRef = useRef(0);
+  const [lobbyBrowserOpen, setLobbyBrowserOpen] = useState(false);
+  const [roomAccess, setRoomAccess] = useState<'open' | 'password'>('open');
+  const [roomPassword, setRoomPassword] = useState('');
+  const [hostedLocked, setHostedLocked] = useState(false);
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [localMode, setLocalMode] = useState(false);
   const localModeRef = useRef(false);
@@ -429,6 +554,7 @@ export default function App() {
   const lastDayNightSfxRef = useRef<string | null>(null);
   const lastHistorySfxRef = useRef<string | null>(null);
   const lastCaptureSfxKeyRef = useRef<string | null>(null);
+  const lastAbilityFxSeqRef = useRef(0);
   const lastGraveCountsRef = useRef<{ white: number; black: number } | null>(null);
   const lastHandIdsRef = useRef<string[] | null>(null);
   const lastCheckRef = useRef<Color | null | 'unset'>('unset');
@@ -437,6 +563,11 @@ export default function App() {
   const checkingThemeColorRef = useRef<Color | null>(null);
   const resultShownKeyRef = useRef<string | null>(null);
   const [checkAlert, setCheckAlert] = useState<null | 'received' | 'dealt'>(null);
+  const [cardCast, setCardCast] = useState<CardCastView | null>(null);
+  const cardCastSeqRef = useRef(0);
+  const protoHistorySeenRef = useRef<Map<string, { count: number; form?: string }> | null>(null);
+  const [mutationToasts, setMutationToasts] = useState<MutationToastData[]>([]);
+  const [evolvePickerFor, setEvolvePickerFor] = useState<string | null>(null);
   const [resultShow, setResultShow] = useState<null | {
     kind: 'victory' | 'loss';
     winnerName: string;
@@ -456,10 +587,13 @@ export default function App() {
     defId: string;
     pieceClass: string;
   } | null>(null);
+  const [draftBanFlash, setDraftBanFlash] = useState<{ color: Color; defId: string } | null>(null);
+  const lastDraftBanKeyRef = useRef<string | null>(null);
+  const [draftShake, setDraftShake] = useState<{ id: string; n: number } | null>(null);
   const [ceremony, setCeremony] = useState<
     | { kind: 'lobby'; code: string }
     | { kind: 'vs'; white: string; black: string }
-    | { kind: 'order'; whiteFirst: boolean }
+    | { kind: 'order'; whiteFirst: boolean; bans: boolean }
     | null
   >(null);
   const prevPhaseRef = useRef<string | null>(null);
@@ -468,8 +602,15 @@ export default function App() {
   useEffect(() => {
     const s = io(SOCKET_URL || undefined, { transports: ['websocket', 'polling'] });
     setSocket(s);
-    s.on('state', (payload: { state: GameState; you: Color; draftOptions: string[]; catalog: Catalog }) => {
+    s.on('state', (payload: {
+      state: GameState;
+      you: Color;
+      draftOptions: string[];
+      catalog: Catalog;
+      serverNow?: number;
+    }) => {
       if (localModeRef.current) return;
+      if (typeof payload.serverNow === 'number') serverClockOffsetRef.current = payload.serverNow - Date.now();
       const turnKey = `${payload.state.turn}:${payload.state.phase}:${payload.state.pendingPrompt?.type ?? ''}:${payload.you}`;
       if (prevTurnRef.current && prevTurnRef.current !== turnKey) {
         setConfirmKey(null);
@@ -578,6 +719,70 @@ export default function App() {
   }, [state?.draft?.lastPick]);
 
   useEffect(() => {
+    const lb = state?.draft?.lastBan;
+    if (!lb) return;
+    const key = `${lb.color}:${lb.defId}`;
+    if (key === lastDraftBanKeyRef.current) return;
+    lastDraftBanKeyRef.current = key;
+    setDraftBanFlash(lb);
+    playDraftBanSfx();
+    const timer = window.setTimeout(() => setDraftBanFlash(null), 900);
+    return () => window.clearTimeout(timer);
+  }, [state?.draft?.lastBan]);
+
+  useEffect(() => {
+    if (!draftShake) return;
+    const timer = window.setTimeout(() => setDraftShake(null), 450);
+    return () => window.clearTimeout(timer);
+  }, [draftShake]);
+
+  const draftRollTimersRef = useRef<number[]>([]);
+  const [draftRolling, setDraftRolling] = useState(false);
+  const stopDraftRoll = useCallback(() => {
+    draftRollTimersRef.current.forEach((t) => window.clearTimeout(t));
+    draftRollTimersRef.current = [];
+    setDraftRolling(false);
+  }, []);
+  const draftTurnKey = state?.draft
+    ? `${state.draft.stage ?? 'pick'}:${state.draft.pickingColor}:${state.draft.lastPick?.defId ?? ''}:${state.draft.lastBan?.defId ?? ''}`
+    : null;
+  useEffect(() => stopDraftRoll, [draftTurnKey, stopDraftRoll]);
+
+  /** Roulette across the given choices, then hand the winner to `onLand`. */
+  const rollDraftSelection = (choices: string[], onLand: (id: string) => void) => {
+    if (!choices.length) return;
+    stopDraftRoll();
+    setDraftRolling(true);
+    const finalId = choices[Math.floor(Math.random() * choices.length)];
+    const delays = [55, 60, 65, 75, 85, 100, 120, 145, 175, 215, 260];
+    let elapsed = 0;
+    let prev: string | null = null;
+    delays.forEach((delay, i) => {
+      elapsed += delay;
+      const last = i === delays.length - 1;
+      let id = finalId;
+      if (!last && choices.length > 1) {
+        do id = choices[Math.floor(Math.random() * choices.length)];
+        while (id === prev);
+      }
+      prev = id;
+      const timer = window.setTimeout(() => {
+        setInspectedId(`draft:${id}`);
+        playDraftSelectSfx();
+        document
+          .querySelector(`[data-draft-id="${id}"]`)
+          ?.scrollIntoView({ block: 'nearest', behavior: last ? 'smooth' : 'auto' });
+        if (last) {
+          draftRollTimersRef.current = [];
+          setDraftRolling(false);
+          onLand(id);
+        }
+      }, elapsed);
+      draftRollTimersRef.current.push(timer);
+    });
+  };
+
+  useEffect(() => {
     if (!state) return;
     const prev = prevPhaseRef.current;
     prevPhaseRef.current = state.phase;
@@ -604,7 +809,7 @@ export default function App() {
       prevFirstPickerRef.current = chose;
     } else if (state.phase === 'draft' && prevFirstPickerRef.current == null && chose != null) {
       prevFirstPickerRef.current = chose;
-      setCeremony({ kind: 'order', whiteFirst: chose });
+      setCeremony({ kind: 'order', whiteFirst: chose, bans: state.draft?.stage === 'ban' });
       playDraftOrderSfx(chose);
     } else {
       prevFirstPickerRef.current = chose;
@@ -624,9 +829,12 @@ export default function App() {
       : null;
 
     const handIds = state.players[you].hand.map((c) => c.instanceId);
+    const abilityEvents = state.abilityFx ?? [];
+    const latestAbilitySeq = abilityEvents[abilityEvents.length - 1]?.seq ?? 0;
 
     if (skipGameSfxRef.current) {
       skipGameSfxRef.current = false;
+      lastAbilityFxSeqRef.current = latestAbilitySeq;
       lastDayNightSfxRef.current = state.dayNight;
       lastHistorySfxRef.current = head;
       lastCaptureSfxKeyRef.current = captureKey;
@@ -683,13 +891,40 @@ export default function App() {
     }
 
     if (head && head !== lastHistorySfxRef.current) {
+      const prevHead = lastHistorySfxRef.current;
       lastHistorySfxRef.current = head;
-      const text = head.replace(/^\[[^\]]+\]\s*/, '');
-      if (text.includes(' played ')) playCardCastSfx();
-      else if (
-        text.includes('discarded to make room') ||
-        text.includes('redrew one opening') ||
-        text.includes('stolen card discarded')
+      const fresh: string[] = [];
+      for (const line of state.history.slice(0, 40)) {
+        if (line === prevHead) break;
+        fresh.push(line.replace(/^\[[^\]]+\]\s*/, ''));
+      }
+      const castMatch = fresh
+        .map((text) => /^(white|black) played (.+)$/.exec(text))
+        .find((m): m is RegExpExecArray => Boolean(m));
+      if (castMatch) {
+        const color = castMatch[1] as Color;
+        const name = castMatch[2];
+        const isLocal = localModeRef.current;
+        const mine = color === you;
+        const defId =
+          state.players[color].lastPlayedCardDefId ?? catalog?.cards.find((c) => c.name === name)?.id ?? null;
+        const casterName = state.players[color].name || (color === 'white' ? 'White' : 'Black');
+        playCardCastSfx(isLocal || mine, defId);
+        cardCastSeqRef.current += 1;
+        setCardCast({
+          key: cardCastSeqRef.current,
+          defId,
+          name,
+          tone: isLocal ? (color === 'white' ? 'gold' : 'violet') : mine ? 'gold' : 'violet',
+          label: isLocal ? `${color === 'white' ? 'White' : 'Black'} cast` : mine ? 'You cast' : `${casterName} cast`,
+        });
+      } else if (
+        fresh.some(
+          (text) =>
+            text.includes('discarded to make room') ||
+            text.includes('redrew one opening') ||
+            text.includes('stolen card discarded'),
+        )
       ) {
         playCardDiscardSfx();
       }
@@ -717,6 +952,58 @@ export default function App() {
       }
     }
     lastGraveCountsRef.current = graves;
+
+    if (latestAbilitySeq < lastAbilityFxSeqRef.current) {
+      lastAbilityFxSeqRef.current = latestAbilitySeq;
+    } else if (latestAbilitySeq > lastAbilityFxSeqRef.current) {
+      const fresh = [
+        ...new Set(abilityEvents.filter((e) => e.seq > lastAbilityFxSeqRef.current).map((e) => e.id)),
+      ].slice(0, 3);
+      lastAbilityFxSeqRef.current = latestAbilitySeq;
+      fresh.forEach((id, i) => {
+        if (i === 0) playAbilitySfx(id);
+        else window.setTimeout(() => playAbilitySfx(id), i * 240);
+      });
+    }
+  }, [state, you]);
+
+  useEffect(() => {
+    if (!state || !you) {
+      protoHistorySeenRef.current = null;
+      return;
+    }
+    const prev = protoHistorySeenRef.current;
+    const seen = new Map<string, { count: number; form?: string }>();
+    const fresh: MutationToastData[] = [];
+    for (const p of state.pieces) {
+      if (p.defId !== 'prototype' || !p.proto) continue;
+      const history = p.proto.history ?? [];
+      seen.set(p.id, { count: history.length, form: p.proto.form });
+      const before = prev?.get(p.id);
+      if (!before) continue;
+      history.slice(before.count).forEach((mutationId, i) => {
+        fresh.push({
+          key: `${p.id}:${before.count + i}:${Date.now()}`,
+          mutationId,
+          mine: p.color === you,
+          gained: before.count + i + 1,
+        });
+      });
+      if (p.proto.form && !before.form) {
+        fresh.push({
+          key: `${p.id}:form:${Date.now()}`,
+          formId: p.proto.form as FormId,
+          mine: p.color === you,
+          gained: p.proto.gained,
+        });
+      }
+    }
+    protoHistorySeenRef.current = seen;
+    if (!fresh.length) return;
+    setMutationToasts((cur) => [...cur, ...fresh].slice(-3));
+    for (const t of fresh) {
+      window.setTimeout(() => setMutationToasts((cur) => cur.filter((x) => x.key !== t.key)), 5000);
+    }
   }, [state, you]);
 
   useEffect(() => {
@@ -742,6 +1029,12 @@ export default function App() {
     const t = window.setTimeout(() => setCheckAlert(null), 2400);
     return () => window.clearTimeout(t);
   }, [checkAlert]);
+
+  useEffect(() => {
+    if (!cardCast) return;
+    const t = window.setTimeout(() => setCardCast(null), CARD_CAST_FX_MS);
+    return () => window.clearTimeout(t);
+  }, [cardCast]);
 
   useEffect(() => {
     setMessagesHidden(false);
@@ -827,21 +1120,56 @@ export default function App() {
     pushGameState(next, { actingAs, localPassDevice: true });
   };
 
+  const commitLocalState = (next: GameState, actingAs: Color) => {
+    syncTurnTimer(next as never, Date.now());
+    if (next.phase === 'ended' && next.winner) {
+      const seat = localActiveSeat(next);
+      const kind = next.winner === seat ? 'victory' : 'loss';
+      const winnerName =
+        next.players[next.winner]?.name || (next.winner === 'white' ? 'White' : 'Black');
+      resultShownKeyRef.current = `${next.winner}:${next.winReason ?? ''}`;
+      setResultShow({ kind, winnerName, reason: next.winReason ?? '' });
+      playResultTrack(kind);
+    }
+    applyLocalState(next, actingAs);
+  };
+
+  useEffect(() => {
+    if (!localMode || !state || state.phase !== 'playing') return;
+    const deadline = state.turnTimer?.deadline;
+    if (deadline == null) return;
+    const id = window.setTimeout(() => {
+      if (!turnTimerExpired(state as never, Date.now())) return;
+      try {
+        const next = forceTimeoutMove(state as never) as GameState;
+        if (next.turnTimer && turnTimerExpired(next as never, Date.now())) {
+          next.turnTimer.deadline = Date.now() + next.turnTimer.durationMs;
+        }
+        commitLocalState(next, state.turn);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    }, Math.max(0, deadline - Date.now()) + 30);
+    return () => window.clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localMode, state]);
+
+  const lastTimeoutLineRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const latest = state?.history?.slice(0, 12).find((line) => line.includes('ran out of time')) ?? null;
+    const previous = lastTimeoutLineRef.current;
+    lastTimeoutLineRef.current = latest;
+    if (previous === undefined || !latest || latest === previous) return;
+    const who = latest.includes('white ran out') ? 'White' : 'Black';
+    setStatus(`⏱ ${who} ran out of time — a random move was played.`);
+  }, [state?.history]);
+
   const send = (action: object) => {
     if (!state || !you) return;
     if (localMode) {
       try {
         const next = applyClientAction(state as never, you, action as never) as GameState;
-        if (next.phase === 'ended' && next.winner) {
-          const seat = localActiveSeat(next);
-          const kind = next.winner === seat ? 'victory' : 'loss';
-          const winnerName =
-            next.players[next.winner]?.name || (next.winner === 'white' ? 'White' : 'Black');
-          resultShownKeyRef.current = `${next.winner}:${next.winReason ?? ''}`;
-          setResultShow({ kind, winnerName, reason: next.winReason ?? '' });
-          playResultTrack(kind);
-        }
-        applyLocalState(next, you);
+        commitLocalState(next, you);
       } catch (e) {
         setError((e as Error).message);
       }
@@ -935,11 +1263,11 @@ export default function App() {
     clearTransientUi();
     setError(null);
 
-    let next = createLobbyState('LOCAL');
-    const whiteName = name.trim() || 'White';
+    let next = createLobbyState('LOCAL', Date.now(), lobbyRules);
+    serverClockOffsetRef.current = 0;
     next.players.white.connected = true;
     next.players.black.connected = true;
-    next.players.white.name = whiteName;
+    next.players.white.name = seatDisplayName(next as never, 'white', name);
     next.players.black.name = 'Black';
     next = startDraft(next);
 
@@ -949,7 +1277,9 @@ export default function App() {
     setState(next as GameState);
     setYou('black');
     prevTurnRef.current = `${next.turn}:${next.phase}: :black`;
-    setStatus('Local play — Black chooses who drafts first. Pass the device as seats change.');
+    setStatus(
+      `Local play — Black chooses who ${banPhaseRule ? 'bans and drafts' : 'drafts'} first. Pass the device as seats change.`,
+    );
     setCeremony({
       kind: 'vs',
       white: next.players.white.name,
@@ -958,6 +1288,8 @@ export default function App() {
   };
 
   const exitToHome = () => {
+    if (!localModeRef.current && roomCode) socket?.emit('leave_room', { code: roomCode });
+    setHostedLocked(false);
     localModeRef.current = false;
     setLocalMode(false);
     setRoomCode(null);
@@ -977,30 +1309,38 @@ export default function App() {
   };
 
   const createRoom = () => {
-    localModeRef.current = false;
-    setLocalMode(false);
-    socket?.emit('create_room', { name }, (res: { ok: boolean; code?: string; color?: Color; error?: string }) => {
-      if (!res.ok) return setError(res.error ?? 'Create failed');
-      setRoomCode(res.code!);
-      setYou(res.color!);
-      setStatus('Share the room code. Game starts when a second player joins.');
-    });
-  };
-
-  const joinRoom = () => {
+    const password = roomAccess === 'password' ? roomPassword.trim() : '';
+    if (roomAccess === 'password' && !password) {
+      setError('Enter a password, or set the room to Open.');
+      return;
+    }
     localModeRef.current = false;
     setLocalMode(false);
     socket?.emit(
-      'join_room',
-      { code: joinCode.trim(), name },
+      'create_room',
+      { name, rules: lobbyRules, password },
       (res: { ok: boolean; code?: string; color?: Color; error?: string }) => {
-        if (!res.ok) return setError(res.error ?? 'Join failed');
+        if (!res.ok) return setError(res.error ?? 'Create failed');
+        setError(null);
+        setHostedLocked(Boolean(password));
         setRoomCode(res.code!);
         setYou(res.color!);
-        setStatus('');
+        setStatus('Share the room code. Game starts when a second player joins.');
       },
     );
   };
+
+  const onLobbyJoined = useCallback((code: string, color: Color) => {
+    localModeRef.current = false;
+    setLocalMode(false);
+    setLobbyBrowserOpen(false);
+    setError(null);
+    setRoomCode(code);
+    setYou(color);
+    setStatus('');
+  }, []);
+
+  const closeLobbyBrowser = useCallback(() => setLobbyBrowserOpen(false), []);
 
   const board = useMemo(() => {
     const grid: Array<Array<Piece | null>> = Array.from({ length: 10 }, () => Array(10).fill(null));
@@ -1067,6 +1407,46 @@ export default function App() {
     return { barriers, destinations, fromKey };
   }, [state, you]);
 
+  const ultimateSuckHighlights = useMemo(() => {
+    const targets = new Set<string>();
+    const landings = new Set<string>();
+    let fromKey: string | null = null;
+    let crocKey: string | null = null;
+    if (!state || !you) return { targets, landings, fromKey, crocKey };
+    const prompt = state.pendingPrompt;
+    if (
+      prompt?.type !== 'ability_target' ||
+      prompt.abilityId !== 'ultimate_suck' ||
+      prompt.color !== you ||
+      !prompt.pieceId
+    ) {
+      return { targets, landings, fromKey, crocKey };
+    }
+    const croc = state.pieces.find((p) => p.id === prompt.pieceId);
+    if (croc) crocKey = `${croc.pos.row},${croc.pos.col}`;
+    for (const p of ultimateSuckTargets(state as never, prompt.pieceId)) {
+      targets.add(`${p.pos.row},${p.pos.col}`);
+    }
+    const target = prompt.targetId ? state.pieces.find((p) => p.id === prompt.targetId) : undefined;
+    if (target) {
+      fromKey = `${target.pos.row},${target.pos.col}`;
+      for (const c of ultimateSuckLandings(state as never, prompt.pieceId, target.id)) {
+        landings.add(`${c.row},${c.col}`);
+      }
+    }
+    return { targets, landings, fromKey, crocKey };
+  }, [state, you]);
+
+  const promptSquareOptions = useMemo(() => {
+    const keys = new Set<string>();
+    const prompt = state?.pendingPrompt;
+    if (!prompt || prompt.type !== 'ability_target' || prompt.color !== you) return keys;
+    for (const o of (prompt.options ?? []) as unknown[]) {
+      if (o && typeof o === 'object' && 'row' in o) keys.add(`${(o as Coord).row},${(o as Coord).col}`);
+    }
+    return keys;
+  }, [state, you]);
+
   const gamblerChoiceHighlights = useMemo(() => {
     const targets = new Set<string>();
     if (!state || !you) return targets;
@@ -1105,7 +1485,7 @@ export default function App() {
     setSpellConfirm(null);
     setFocusSpecial(null);
     clearBoardConfirm();
-    setStatus('Ability canceled.');
+    setStatus(state?.pendingPrompt?.skippable ? 'Skipped.' : 'Ability canceled.');
   };
 
   /** First click aims; second click on the same target confirms (double-click). */
@@ -1251,6 +1631,22 @@ export default function App() {
         return;
       }
       if (prompt.type === 'ability_target') {
+        if (promptSquareOptions.size) {
+          if (!promptSquareOptions.has(squareKey)) {
+            setStatus(prompt.message ?? 'Click a highlighted square');
+            return;
+          }
+          const piece = board[row][col];
+          const label = PROTO_PROMPT_LABELS[prompt.abilityId ?? ''] ?? 'Choose';
+          const summary =
+            piece && prompt.abilityId === 'chain_assault'
+              ? `Chain Assault: capture ${pieceMeta(catalog, piece.defId)?.name ?? piece.defId}?`
+              : `${label}: file ${col + 1}, rank ${10 - row}?`;
+          setSpellConfirm({ summary, mode: 'resolve_prompt', payload: { row, col } });
+          setStatus(summary);
+          clearBoardConfirm();
+          return;
+        }
         if (prompt.abilityId === 'enchant') {
           const piece = board[row][col];
           if (piece) {
@@ -1281,6 +1677,31 @@ export default function App() {
           setSpellConfirm({ summary, mode: 'resolve_prompt', payload: piece.id });
           setStatus(summary);
           clearBoardConfirm();
+          return;
+        }
+        if (prompt.abilityId === 'ultimate_suck') {
+          const piece = board[row][col];
+          if (ultimateSuckHighlights.landings.has(squareKey)) {
+            const target = state.pieces.find((p) => p.id === prompt.targetId);
+            const name = target ? pieceMeta(catalog, target.defId)?.name ?? target.defId : 'piece';
+            const victim = piece ? pieceMeta(catalog, piece.defId)?.name ?? piece.defId : null;
+            const summary = victim
+              ? `Launch ${name} into ${victim} (capture)?`
+              : `Launch ${name} to file ${col + 1}, rank ${10 - row}?`;
+            setSpellConfirm({ summary, mode: 'resolve_prompt', payload: { row, col } });
+            setStatus(summary);
+            clearBoardConfirm();
+            return;
+          }
+          if (piece && ultimateSuckHighlights.targets.has(squareKey)) {
+            send({ type: 'resolve_prompt', payload: piece.id });
+            return;
+          }
+          setStatus(
+            prompt.targetId
+              ? 'Ultimate Suck: click a highlighted landing square, or pick another piece'
+              : 'Ultimate Suck: click a highlighted piece within 2 tiles',
+          );
           return;
         }
         if (prompt.abilityId === 'barrier_shift') {
@@ -1673,25 +2094,119 @@ export default function App() {
               Display name
               <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Player" />
             </label>
+            <fieldset className="home-rules-options">
+              <legend>Lobby rules</legend>
+              <label className="home-rule-toggle">
+                <input
+                  type="checkbox"
+                  checked={banPhaseRule}
+                  onChange={(e) => setBanPhaseRule(e.target.checked)}
+                />
+                <span className="home-rule-switch" aria-hidden />
+                <span className="home-rule-text">
+                  <strong>Ban phase</strong>
+                  <em>Each player bans 2 pieces (max 1 per class) before drafting.</em>
+                </span>
+              </label>
+              <label className="home-rule-toggle">
+                <input
+                  type="checkbox"
+                  checked={anonymousRule}
+                  onChange={(e) => setAnonymousRule(e.target.checked)}
+                />
+                <span className="home-rule-switch" aria-hidden />
+                <span className="home-rule-text">
+                  <strong>Anonymous</strong>
+                  <em>Display names are hidden — players show as “White” and “Black”.</em>
+                </span>
+              </label>
+              <div className="home-rule-group">
+                <label className="home-rule-toggle">
+                  <input
+                    type="checkbox"
+                    checked={turnTimerSeconds > 0}
+                    onChange={(e) => setTurnTimerRule(e.target.checked ? 30 : 0)}
+                  />
+                  <span className="home-rule-switch" aria-hidden />
+                  <span className="home-rule-text">
+                    <strong>Chess but Fast ⏱</strong>
+                    <em>Each turn is timed. Run out and a random piece moves for you. No limit while in check.</em>
+                  </span>
+                </label>
+                {turnTimerSeconds > 0 && (
+                  <div className="home-access-seg home-timer-seg" role="radiogroup" aria-label="Seconds per turn">
+                    {TURN_TIMER_OPTIONS.map((secs) => (
+                      <button
+                        key={secs}
+                        type="button"
+                        role="radio"
+                        aria-checked={turnTimerSeconds === secs}
+                        className={turnTimerSeconds === secs ? 'is-active' : ''}
+                        onClick={() => setTurnTimerRule(secs)}
+                      >
+                        {secs === 60 ? '1 min' : `${secs}s`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="home-access">
+                <span className="home-access-label">
+                  <strong>Online room access</strong>
+                  <em>
+                    {roomAccess === 'open'
+                      ? 'Anyone in the lobby list can join.'
+                      : 'Players need the password to join.'}
+                  </em>
+                </span>
+                <div className="home-access-seg" role="radiogroup" aria-label="Online room access">
+                  {(['open', 'password'] as const).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      role="radio"
+                      aria-checked={roomAccess === mode}
+                      className={roomAccess === mode ? 'is-active' : ''}
+                      onClick={() => {
+                        setRoomAccess(mode);
+                        setError(null);
+                      }}
+                    >
+                      {mode === 'open' ? '🔓 Open' : '🔒 Password'}
+                    </button>
+                  ))}
+                </div>
+                {roomAccess === 'password' && (
+                  <input
+                    className="home-access-password"
+                    type="password"
+                    value={roomPassword}
+                    onChange={(e) => setRoomPassword(e.target.value)}
+                    placeholder="Room password"
+                    aria-label="Room password"
+                    maxLength={32}
+                    autoComplete="new-password"
+                  />
+                )}
+              </div>
+            </fieldset>
             <div className="home-actions">
               <button type="button" className="primary home-cta" onClick={startLocalGame}>
                 Local play
               </button>
               <button type="button" className="home-cta home-cta-secondary" onClick={createRoom}>
-                Create online room
+                Create online room{roomAccess === 'password' ? ' 🔒' : ''}
               </button>
-              <div className="home-join">
-                <input
-                  value={joinCode}
-                  onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                  placeholder="ROOM"
-                  maxLength={5}
-                  aria-label="Room code"
-                />
-                <button type="button" onClick={joinRoom}>
-                  Join
-                </button>
-              </div>
+              <button
+                type="button"
+                className="home-cta home-cta-secondary"
+                onClick={() => {
+                  setError(null);
+                  setLobbyBrowserOpen(true);
+                }}
+              >
+                Join lobby
+              </button>
             </div>
             {error && <p className="error">{error}</p>}
           </div>
@@ -1700,6 +2215,13 @@ export default function App() {
           </button>
         </main>
         <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
+        <LobbyBrowser
+          open={lobbyBrowserOpen}
+          onClose={closeLobbyBrowser}
+          socket={socket}
+          name={name}
+          onJoined={onLobbyJoined}
+        />
         {audioFxStack}
       </div>
     );
@@ -1712,6 +2234,106 @@ export default function App() {
     state.phase === 'draft' && draftOptions.length > 0
       ? draftInspectDefId ?? draftOptions[0]
       : null;
+  const draftBanning = state.phase === 'draft' && state.draft?.stage === 'ban';
+  const draftBanned = state.phase === 'draft' ? draftBannedIds(state as never) : [];
+  const draftMyTurn =
+    state.phase === 'draft' &&
+    state.draft?.blackChoseFirstPicker != null &&
+    state.draft.pickingColor === you;
+  const draftRandomChoices = draftMyTurn
+    ? draftOptions.filter(
+        (id) =>
+          !draftBanned.includes(id) && (!draftBanning || !draftBanBlockReason(state as never, you!, id)),
+      )
+    : [];
+
+  const promptDocked = wideLayout && showBoardKnowledge;
+  const promptFloat =
+    !messagesHidden &&
+    state.pendingPrompt?.type !== 'discard_to_draw' &&
+    state.pendingPrompt?.type !== 'opening_mulligan' &&
+    (status || error || state.pendingPrompt || spellConfirm) ? (
+      <div
+        key={[
+          status,
+          error ?? '',
+          state.pendingPrompt?.type ?? '',
+          state.pendingPrompt?.message ?? '',
+          spellConfirm?.summary ?? '',
+          confirmKey ?? '',
+        ].join('|')}
+        className={[
+          'board-prompt-float',
+          promptDocked ? 'is-docked' : '',
+          error ? 'is-error' : '',
+          spellConfirm || state.pendingPrompt || confirmKey ? 'is-action' : '',
+        ]
+          .filter(Boolean)
+          .join(' ')}
+        role="status"
+        aria-live="assertive"
+      >
+        <div className="board-prompt-float-head">
+          <p className="board-prompt-float-label">
+            {error ? 'Error' : spellConfirm || confirmKey ? 'Confirm' : state.pendingPrompt ? 'Action needed' : 'Message'}
+          </p>
+          <button
+            type="button"
+            className="msg-dismiss"
+            aria-label="Close message"
+            onClick={() => {
+              setMessagesHidden(true);
+              setError(null);
+              setStatus('');
+            }}
+          >
+            ×
+          </button>
+        </div>
+        <PlayPromptBanners
+          status={status}
+          error={error}
+          state={state}
+          you={you}
+          catalog={catalog}
+          gadgetKind={gadgetKind}
+          setGadgetKind={setGadgetKind}
+          setStatus={setStatus}
+          send={send}
+          cancelAbility={cancelAbility}
+        />
+        {spellConfirm && (
+          <div className="spell-confirm" role="dialog" aria-label="Confirm spell">
+            <p className="spell-confirm-summary">{spellConfirm.summary}</p>
+            <div className="spell-confirm-actions">
+              <button type="button" className="primary" onClick={confirmSpell}>
+                Confirm
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const promptType = state.pendingPrompt?.type;
+                  if (
+                    (promptType === 'gadget_choice' || promptType === 'ability_target') &&
+                    !state.pendingPrompt?.skippable
+                  ) {
+                    cancelAbility();
+                    return;
+                  }
+                  setSpellConfirm(null);
+                  setFocusSpecial(null);
+                  clearBoardConfirm();
+                  setStatus('Canceled.');
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    ) : null;
+  const sideColors: Color[] = flip ? ['white', 'black'] : ['black', 'white'];
 
   return (
     <div
@@ -1760,7 +2382,12 @@ export default function App() {
           onClose={() => setOverlayPeek(true)}
         />
       )}
-      <TurnStrip state={state} you={you} localMode={localMode} />
+      <TurnStrip
+        state={state}
+        you={you}
+        localMode={localMode}
+        clockOffsetMs={localMode ? 0 : serverClockOffsetRef.current}
+      />
       {resultShow && (
         <ResultCeremony
           kind={resultShow.kind}
@@ -1770,6 +2397,13 @@ export default function App() {
             stopResultTrack();
             setResultShow(null);
           }}
+        />
+      )}
+      {cardCast && (
+        <CardCastFx
+          key={cardCast.key}
+          cast={cardCast}
+          image={cardCast.defId ? cardMeta(catalog, cardCast.defId)?.image : undefined}
         />
       )}
       {checkAlert && (
@@ -1793,6 +2427,30 @@ export default function App() {
           </span>
         </div>
       )}
+      {evolvePickerFor &&
+        evolvePickerFor === selectedPiece &&
+        state.turn === you &&
+        abilities.some((a) => a.id.startsWith('form_')) && (
+          <EvolutionPicker
+            onClose={() => setEvolvePickerFor(null)}
+            onChoose={(form) => {
+              send({ type: 'use_ability', pieceId: evolvePickerFor, abilityId: `form_${form}` });
+              setEvolvePickerFor(null);
+              setFocusSpecial(null);
+            }}
+          />
+        )}
+      {mutationToasts.length > 0 && (
+        <div className="mutation-toasts" role="status" aria-live="polite">
+          {mutationToasts.map((t) => (
+            <MutationToast
+              key={t.key}
+              toast={t}
+              onClose={() => setMutationToasts((cur) => cur.filter((x) => x.key !== t.key))}
+            />
+          ))}
+        </div>
+      )}
       {(overlayPeek || messagesHidden) &&
         (state.pendingPrompt || spellConfirm) && (
           <button
@@ -1806,86 +2464,7 @@ export default function App() {
             Show message
           </button>
         )}
-      {!messagesHidden &&
-        state.pendingPrompt?.type !== 'discard_to_draw' &&
-        state.pendingPrompt?.type !== 'opening_mulligan' &&
-        (status || error || state.pendingPrompt || spellConfirm) && (
-        <div
-          key={[
-            status,
-            error ?? '',
-            state.pendingPrompt?.type ?? '',
-            state.pendingPrompt?.message ?? '',
-            spellConfirm?.summary ?? '',
-            confirmKey ?? '',
-          ].join('|')}
-          className={[
-            'board-prompt-float',
-            error ? 'is-error' : '',
-            spellConfirm || state.pendingPrompt || confirmKey ? 'is-action' : '',
-          ]
-            .filter(Boolean)
-            .join(' ')}
-          role="status"
-          aria-live="assertive"
-        >
-          <div className="board-prompt-float-head">
-            <p className="board-prompt-float-label">
-              {error ? 'Error' : spellConfirm || confirmKey ? 'Confirm' : state.pendingPrompt ? 'Action needed' : 'Message'}
-            </p>
-            <button
-              type="button"
-              className="msg-dismiss"
-              aria-label="Close message"
-              onClick={() => {
-                setMessagesHidden(true);
-                setError(null);
-                setStatus('');
-              }}
-            >
-              ×
-            </button>
-          </div>
-          <PlayPromptBanners
-            status={status}
-            error={error}
-            state={state}
-            you={you}
-            catalog={catalog}
-            gadgetKind={gadgetKind}
-            setGadgetKind={setGadgetKind}
-            setStatus={setStatus}
-            send={send}
-            cancelAbility={cancelAbility}
-          />
-          {spellConfirm && (
-            <div className="spell-confirm" role="dialog" aria-label="Confirm spell">
-              <p className="spell-confirm-summary">{spellConfirm.summary}</p>
-              <div className="spell-confirm-actions">
-                <button type="button" className="primary" onClick={confirmSpell}>
-                  Confirm
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const promptType = state.pendingPrompt?.type;
-                    if (promptType === 'gadget_choice' || promptType === 'ability_target') {
-                      cancelAbility();
-                      return;
-                    }
-                    setSpellConfirm(null);
-                    setFocusSpecial(null);
-                    clearBoardConfirm();
-                    setStatus('Canceled.');
-                  }}
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      {!promptDocked && promptFloat}
       <div className="shell-content">
       <header className="top">
         <div className="top-left">
@@ -1921,27 +2500,15 @@ export default function App() {
           </div>
         </div>
         <div className="top-right">
-          {you
-            ? (() => {
-                const turnInfo = gameTurnInfo(state, you, localMode);
-                if (!turnInfo) return null;
-                return (
-                  <div
-                    className={`turn-pill ${turnInfo.yours ? 'turn-yours' : 'turn-theirs'}`}
-                    role="status"
-                    aria-live="polite"
-                  >
-                    <span className="turn-pill-label">{turnInfo.label}</span>
-                    {turnInfo.detail ? <span className="turn-pill-phase">{turnInfo.detail}</span> : null}
-                    {state.phase === 'playing' && state.check ? (
-                      <span className={`turn-pill-check ${state.check === you ? 'is-you' : ''}`}>
-                        {state.check === you ? 'You are in check!' : `${state.check} in check`}
-                      </span>
-                    ) : null}
-                  </div>
-                );
-              })()
-            : null}
+          {promptDocked && (
+            <div className="top-controls">
+              <KnowledgeToggle
+                enabled={knowledgeEnabled}
+                onToggle={() => setKnowledgeEnabled((v) => !v)}
+              />
+              {audioFxStack}
+            </div>
+          )}
           {state.phase === 'ended' && (
             <span className="winner">
               {state.winner} wins ({state.winReason})
@@ -1975,6 +2542,23 @@ export default function App() {
           <p className="waiting-room-kicker">Lobby ready</p>
           <p className="waiting-room-code">{roomCode}</p>
           <p className="waiting-room-copy">Share this code. Waiting for an opponent to join…</p>
+          <p className="waiting-room-rules">
+            Ban phase: <strong>{state.rules?.banPhase === false ? 'Off' : 'On'}</strong>
+            {' · '}
+            Access: <strong>{hostedLocked ? '🔒 Password' : '🔓 Open'}</strong>
+            {state.rules?.anonymous && (
+              <>
+                {' · '}
+                <strong>Anonymous</strong>
+              </>
+            )}
+            {state.rules?.turnTimerSeconds ? (
+              <>
+                {' · '}
+                Chess but Fast: <strong>⏱ {state.rules.turnTimerSeconds}s/turn</strong>
+              </>
+            ) : null}
+          </p>
         </div>
       )}
 
@@ -1992,42 +2576,99 @@ export default function App() {
                 </div>
               )}
             </div>
-            {draftInspectDefId && state.draft.pickingColor === you && (
-              <button
-                type="button"
-                className="primary draft-confirm"
-                onClick={() => {
-                  send({ type: 'draft_pick', defId: draftInspectDefId });
-                  setInspectedId(null);
-                }}
-              >
-                Confirm {pieceMeta(catalog, draftInspectDefId)?.name ?? draftInspectDefId}
-              </button>
-            )}
+            {draftInspectDefId &&
+              state.draft.pickingColor === you &&
+              !draftBanned.includes(draftInspectDefId) &&
+              (() => {
+                const name = pieceMeta(catalog, draftInspectDefId)?.name ?? draftInspectDefId;
+                if (!draftBanning) {
+                  return (
+                    <button
+                      type="button"
+                      className="primary draft-confirm"
+                      disabled={draftRolling}
+                      onClick={() => {
+                        send({ type: 'draft_pick', defId: draftInspectDefId });
+                        setInspectedId(null);
+                      }}
+                    >
+                      Confirm {name}
+                    </button>
+                  );
+                }
+                const blocked = draftBanBlockReason(state as never, you!, draftInspectDefId);
+                return blocked ? (
+                  <p className="draft-info-wait muted">{blocked}.</p>
+                ) : (
+                  <button
+                    type="button"
+                    className="primary draft-confirm draft-ban-confirm"
+                    disabled={draftRolling}
+                    onClick={() => {
+                      send({ type: 'draft_ban', defId: draftInspectDefId });
+                      setInspectedId(null);
+                    }}
+                  >
+                    Ban {name}
+                  </button>
+                );
+              })()}
             {draftInspectDefId && state.draft.pickingColor !== you && (
-              <p className="draft-info-wait muted">Waiting for opponent to pick.</p>
+              <p className="draft-info-wait muted">
+                Waiting for opponent to {draftBanning ? 'ban' : 'pick'}.
+              </p>
             )}
           </aside>
 
           <section className="panel draft draft-stage">
-            <h2>Army draft</h2>
+            <h2>{draftBanning ? 'Ban phase' : 'Army draft'}</h2>
             <DraftArmyRoster
               state={state}
               catalog={catalog}
               pickFlash={draftPickFlash}
+              banFlash={draftBanFlash}
             />
             {state.draft.blackChoseFirstPicker != null && (
               <p className="draft-status draft-status-global">
                 {state.draft.pickingColor === you ? (
-                  <>
-                    <strong>Your pick</strong> — choose any class you have not drafted yet
-                  </>
+                  draftBanning ? (
+                    <>
+                      <strong>Your ban</strong> — {BANS_PER_COLOR - (state.draft.bans?.[you!]?.length ?? 0)} left, at
+                      most one per class. Banned pieces are off-limits for both players.
+                    </>
+                  ) : (
+                    <>
+                      <strong>Your pick</strong> — choose any class you have not drafted yet
+                    </>
+                  )
                 ) : (
                   <>
-                    <strong>{state.players[state.draft.pickingColor].name}</strong> is picking…
+                    <strong>{state.players[state.draft.pickingColor].name}</strong> is{' '}
+                    {draftBanning ? 'banning' : 'picking'}…
                   </>
                 )}
               </p>
+            )}
+            {draftMyTurn && draftRandomChoices.length > 0 && (
+              <div className="draft-random-row">
+                <button
+                  type="button"
+                  className={`draft-random-btn${draftBanning ? ' is-ban' : ''}${draftRolling ? ' is-rolling' : ''}`}
+                  disabled={draftRolling}
+                  onClick={() =>
+                    rollDraftSelection(draftRandomChoices, (id) => {
+                      send({ type: draftBanning ? 'draft_ban' : 'draft_pick', defId: id });
+                      setInspectedId(null);
+                    })
+                  }
+                  title={`${draftBanning ? 'Ban' : 'Draft'} a random piece`}
+                >
+                  <span className="draft-random-die" aria-hidden>
+                    🎲
+                  </span>
+                  {draftRolling ? 'Rolling…' : 'Random Selection'}
+                </button>
+              </div>
             )}
 
             {state.draft.blackChoseFirstPicker == null ? (
@@ -2038,22 +2679,27 @@ export default function App() {
                     className="primary"
                     onClick={() => send({ type: 'choose_first_picker', whitePicksFirst: true })}
                   >
-                    White picks first
+                    White goes first
                   </button>
                   <button
                     type="button"
                     className="primary"
                     onClick={() => send({ type: 'choose_first_picker', whitePicksFirst: false })}
                   >
-                    Black picks first
+                    Black goes first
                   </button>
                 </div>
               ) : (
-                <p className="draft-status">Waiting for Black to choose who drafts first…</p>
+                <p className="draft-status">
+                  Waiting for Black to choose who {state.rules?.banPhase === false ? 'drafts' : 'bans and drafts'}{' '}
+                  first…
+                </p>
               )
             ) : (
               <div className="draft-class-groups">
-                {DRAFT_ORDER.filter((cls) => !state.players[state.draft!.pickingColor].army[cls]).map(
+                {DRAFT_ORDER.filter(
+                  (cls) => draftBanning || !state.players[state.draft!.pickingColor].army[cls],
+                ).map(
                   (cls) => (
                     <div key={cls} className="draft-class-group">
                       <h3 className="draft-class-heading">{DRAFT_CLASS_LABELS[cls] ?? cls}</h3>
@@ -2063,18 +2709,31 @@ export default function App() {
                           const displayName = PIECES[id]?.name ?? p?.name ?? id;
                           const selected = draftInspectDefId === id;
                           const canPick = state.draft?.pickingColor === you;
+                          const banned = draftBanned.includes(id);
+                          const shaking = draftShake?.id === id;
                           return (
                             <button
-                              key={id}
+                              key={shaking ? `${id}-${draftShake!.n}` : id}
                               type="button"
+                              data-draft-id={id}
+                              aria-disabled={banned || undefined}
+                              title={banned ? `${displayName} is banned` : undefined}
                               className={[
                                 'draft-tile',
-                                selected ? 'selected' : '',
+                                selected && !banned ? 'selected' : '',
+                                selected && draftRolling ? 'is-rolling' : '',
                                 !canPick ? 'muted-pick' : '',
+                                banned ? 'is-banned' : '',
+                                shaking ? 'is-shaking' : '',
                               ]
                                 .filter(Boolean)
                                 .join(' ')}
                               onClick={() => {
+                                if (banned) {
+                                  playErrorBuzzSfx();
+                                  setDraftShake({ id, n: Date.now() });
+                                  return;
+                                }
                                 playDraftSelectSfx();
                                 setInspectedId(`draft:${id}`);
                               }}
@@ -2107,13 +2766,47 @@ export default function App() {
       {(state.phase === 'playing' || state.phase === 'opening_draw' || state.phase === 'ended') && (
         <div className="play-layout">
           <aside className="side">
-            <h2>{state.players.white.name} (white)</h2>
-            <Graveyard items={state.players.white.graveyard} catalog={catalog} color="white" />
-            <h2>{state.players.black.name} (black)</h2>
-            <Graveyard items={state.players.black.graveyard} catalog={catalog} color="black" />
-            <h2>Log</h2>
+            {promptDocked && promptFloat}
+            {sideColors.map((color) => {
+              const player = state.players[color];
+              const active = state.phase === 'playing' && state.turn === color;
+              const inCheck = state.phase === 'playing' && state.check === color;
+              const fallback = color === 'white' ? 'White' : 'Black';
+              return (
+                <section
+                  key={color}
+                  className={['player-card', `is-${color}`, active ? 'is-active' : '', inCheck ? 'is-check' : '']
+                    .filter(Boolean)
+                    .join(' ')}
+                >
+                  <header className="player-card-head">
+                    <span className="player-card-dot" aria-hidden />
+                    <span className="player-card-name">{player.name || fallback}</span>
+                    {!localMode && color === you && <span className="player-card-tag">You</span>}
+                    {!localMode && !player.connected && <span className="player-card-tag is-offline">Offline</span>}
+                    {active && (
+                      <span className={`player-card-turn${inCheck ? ' is-check' : ''}`}>
+                        {inCheck ? 'In check' : 'To play'}
+                      </span>
+                    )}
+                  </header>
+                  <p className="player-card-meta">
+                    <span>
+                      <strong>{player.hand.length}</strong> in hand
+                    </span>
+                    <span>
+                      <strong>{player.graveyard.length}</strong> fallen
+                    </span>
+                  </p>
+                  {player.graveyard.length > 0 && (
+                    <Graveyard items={player.graveyard} catalog={catalog} color={color} />
+                  )}
+                </section>
+              );
+            })}
+            <h2 className="side-log-title">Battle log</h2>
             <ul className="log">
-              {state.history.slice(0, 14).map((h, i) => {
+              {state.history.slice(0, 40).map((h, i) => {
                 const match = h.match(/^\[([^\]]+)\]\s*(.*)$/);
                 const time = match?.[1];
                 const text = match?.[2] ?? h;
@@ -2137,6 +2830,7 @@ export default function App() {
                 state.phase === 'playing' && state.check === you ? 'board-in-check' : '',
                 checkAlert === 'received' ? 'board-check-flash' : '',
                 checkAlert === 'dealt' ? 'board-check-dealt-flash' : '',
+                cardCast ? `board-cast-flash board-cast-${cardCast.tone}` : '',
               ]
                 .filter(Boolean)
                 .join(' ')}
@@ -2158,6 +2852,10 @@ export default function App() {
                   const barrierPick = barrierShiftHighlights.barriers.has(key);
                   const barrierFrom = barrierShiftHighlights.fromKey === key;
                   const barrierDest = barrierShiftHighlights.destinations.has(key);
+                  const suckTarget = ultimateSuckHighlights.targets.has(key);
+                  const suckFrom = ultimateSuckHighlights.fromKey === key;
+                  const suckLanding = ultimateSuckHighlights.landings.has(key);
+                  const suckCroc = ultimateSuckHighlights.crocKey === key;
                   const gamblerTarget = gamblerChoiceHighlights.has(key);
                   const toks = state.tokens.filter((t) => t.pos.row === row && t.pos.col === col);
                   const meta = piece ? pieceMeta(catalog, piece.defId) : null;
@@ -2221,7 +2919,11 @@ export default function App() {
                           : '',
                         barrierPick || barrierFrom ? 'barrier-source' : '',
                         barrierDest ? 'barrier-target' : '',
+                        suckCroc ? 'suck-croc' : '',
+                        suckFrom ? 'suck-from' : suckTarget ? 'suck-target' : '',
+                        suckLanding ? (piece ? 'suck-landing suck-capture' : 'suck-landing') : '',
                         gamblerTarget ? 'gambler-target' : '',
+                        promptSquareOptions.has(key) ? (piece ? 'proto-option proto-option-capture' : 'proto-option') : '',
                         sliding ? 'sq-sliding' : '',
                         piece?.defId === 'reaper' &&
                           ((piece.charges ?? 0) > 0 || (piece.disabledTurns ?? 0) > 0)
@@ -2333,7 +3035,13 @@ export default function App() {
                             .filter(Boolean)
                             .join(' · ')}
                         >
-                          <PieceIcon defId={piece.defId} color={piece.color} title={meta?.name ?? piece.defId} />
+                          <PieceIcon
+                            defId={piece.defId}
+                            color={piece.color}
+                            title={meta?.name ?? piece.defId}
+                            tier={piece.defId === 'prototype' ? prototypeTier(piece.proto?.gained) : 0}
+                          />
+                          {piece.defId === 'prototype' && <PrototypeBoardBadges proto={piece.proto} />}
                           {piece.defId === 'gambler' && (
                             <span
                               className={`gambler-style ${state.dayNight === 'night' ? 'is-night' : 'is-day'}`}
@@ -2432,8 +3140,18 @@ export default function App() {
             </div>
 
             <div className="ability-bar" aria-live="polite">
+              {selectedPiece && state.turn === you && abilities.some((a) => a.id.startsWith('form_')) && (
+                <button
+                  type="button"
+                  className="primary evolve-btn"
+                  title="Compare the three Final Evolution forms"
+                  onClick={() => setEvolvePickerFor(selectedPiece)}
+                >
+                  <strong>🧬 Final Evolution</strong>
+                </button>
+              )}
               {selectedPiece && abilities.length > 0 && state.turn === you
-                ? abilities.map((a) => (
+                ? abilities.filter((a) => !a.id.startsWith('form_')).map((a) => (
                     <button
                       key={a.id}
                       type="button"
@@ -2442,7 +3160,7 @@ export default function App() {
                       title={a.hint}
                       onClick={() => {
                         if (a.passive) {
-                          if (a.id === 'bloodlust' || a.id === 'identity_theft') {
+                          if (a.id === 'bloodlust' || a.id === 'identity_theft' || a.id === 'mut_status') {
                             setFocusSpecial(null);
                             setStatus(a.hint ?? a.name);
                             return;
@@ -2657,7 +3375,7 @@ export default function App() {
                   </div>
                 )}
 
-              {activeCardDef && (
+              {activeCardDef && !wideLayout && (
                 <div className="card-details">
                   <h3>{activeCardDef.name}</h3>
                   <ul>
@@ -2677,6 +3395,23 @@ export default function App() {
           <aside className="play-dock" aria-live="polite">
             <div className="play-dock-box">
               <p className="play-dock-label">Info</p>
+              {activeCardDef && wideLayout && (
+                <div className="card-details dock-card-details">
+                  <img
+                    src={cardMeta(catalog, activeCardDef.id)?.image ?? '/cards/Back_Of_Card.png'}
+                    alt=""
+                  />
+                  <div>
+                    <p className="dock-card-kicker">Selected card</p>
+                    <h3>{activeCardDef.name}</h3>
+                    <ul>
+                      {activeCardDef.description.map((d) => (
+                        <li key={d}>{d}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              )}
               {you &&
                 state.turn === you &&
                 state.phase === 'playing' &&
@@ -2718,6 +3453,7 @@ export default function App() {
                     copiedMoveDefId: inspectedPiece.copiedMoveDefId,
                     coOccupantId: inspectedPiece.coOccupantId,
                     hasPigBuddy: pigHostIds.has(inspectedPiece.id),
+                    proto: inspectedPiece.proto,
                     effects: inspectedPiece.effects,
                   }}
                   onClose={() => {
@@ -2743,13 +3479,13 @@ export default function App() {
       )}
 
       </div>
-      {showBoardKnowledge && (
+      {showBoardKnowledge && !promptDocked && (
         <KnowledgeToggle
           enabled={knowledgeEnabled}
           onToggle={() => setKnowledgeEnabled((v) => !v)}
         />
       )}
-      {audioFxStack}
+      {!promptDocked && audioFxStack}
       <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
       {showBoardKnowledge && (
         <>
@@ -2916,7 +3652,7 @@ function MatchCeremony({
   ceremony:
     | { kind: 'lobby'; code: string }
     | { kind: 'vs'; white: string; black: string }
-    | { kind: 'order'; whiteFirst: boolean };
+    | { kind: 'order'; whiteFirst: boolean; bans: boolean };
   onDone: () => void;
 }) {
   useEffect(() => {
@@ -2946,7 +3682,7 @@ function MatchCeremony({
           <>
             <p className="match-ceremony-kicker">Draft order</p>
             <p className={`match-order-title ${ceremony.whiteFirst ? 'white' : 'black'}`}>
-              {ceremony.whiteFirst ? 'White picks first' : 'Black picks first'}
+              {ceremony.whiteFirst ? 'White' : 'Black'} {ceremony.bans ? 'bans & picks' : 'picks'} first
             </p>
           </>
         )}
@@ -2959,11 +3695,14 @@ function TurnStrip({
   state,
   you,
   localMode = false,
+  clockOffsetMs = 0,
 }: {
   state: GameState;
   you: Color | null;
   localMode?: boolean;
+  clockOffsetMs?: number;
 }) {
+  const showClock = Boolean(state.turnTimer && state.phase === 'playing');
   const { mode, title, detail } = turnStripContent(state, you, localMode);
   const youInCheck = Boolean(you && state.phase === 'playing' && state.check === you);
   const check =
@@ -2976,10 +3715,20 @@ function TurnStrip({
 
   return (
     <div
-      className={`turn-strip is-${mode}${youInCheck ? ' is-check' : ''}`}
+      className={`turn-strip is-${mode}${youInCheck ? ' is-check' : ''}${showClock ? ' has-clock' : ''}`}
       role="status"
       aria-live="polite"
     >
+      {showClock && state.turnTimer && (
+        <TurnClock
+          timer={state.turnTimer}
+          turn={state.turn}
+          turnCount={state.turnCount ?? 0}
+          you={you}
+          localMode={localMode}
+          offsetMs={clockOffsetMs}
+        />
+      )}
       <div
         className={`turn-strip-layer ${mode === 'yours' ? 'is-on' : ''}`}
         aria-hidden={mode !== 'yours'}
@@ -3109,10 +3858,12 @@ function DraftArmyRoster({
   state,
   catalog,
   pickFlash,
+  banFlash,
 }: {
   state: GameState;
   catalog: Catalog | null;
   pickFlash: { color: Color; defId: string; pieceClass: string } | null;
+  banFlash: { color: Color; defId: string } | null;
 }) {
   return (
     <div className="draft-armies">
@@ -3153,6 +3904,33 @@ function DraftArmyRoster({
               );
             })}
           </div>
+          {state.rules?.banPhase !== false && (
+          <div className="draft-bans" aria-label={`${state.players[color].name} bans`}>
+            <span className="draft-bans-label">Bans</span>
+            {Array.from({ length: BANS_PER_COLOR }, (_, i) => {
+              const banId = state.draft?.bans?.[color]?.[i];
+              const meta = banId ? pieceMeta(catalog, banId) : null;
+              const flashing = banId && banFlash?.color === color && banFlash.defId === banId;
+              return (
+                <span
+                  key={i}
+                  className={['draft-ban-slot', banId ? 'filled' : 'empty', flashing ? 'draft-ban-flash' : '']
+                    .filter(Boolean)
+                    .join(' ')}
+                  title={meta ? `${meta.name} (banned)` : 'Ban not used yet'}
+                >
+                  {banId ? (
+                    <span className="banned-icon">
+                      <PieceIcon defId={banId} color={color} title={meta?.name} />
+                    </span>
+                  ) : (
+                    '—'
+                  )}
+                </span>
+              );
+            })}
+          </div>
+          )}
         </div>
       ))}
     </div>
@@ -3187,6 +3965,7 @@ function PieceInfoBody({
     copiedMoveDefId?: string;
     coOccupantId?: string;
     hasPigBuddy?: boolean;
+    proto?: Piece['proto'];
     effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
 }) {
@@ -3201,7 +3980,12 @@ function PieceInfoBody({
     <>
       <div className="piece-info-head">
         <div className="piece-info-icon-wrap">
-          <PieceIcon defId={defId} color={previewColor} title={info.name} />
+          <PieceIcon
+            defId={defId}
+            color={previewColor}
+            title={info.name}
+            tier={defId === 'prototype' ? prototypeTier(live?.proto?.gained) : 0}
+          />
         </div>
         <div>
           <p className="piece-info-class">{info.classLabel}</p>
@@ -3314,6 +4098,7 @@ function PieceInfoBody({
           ))}
         </div>
       )}
+      {live && defId === 'prototype' && <PrototypeInspector proto={live.proto} />}
     </>
   );
 }
@@ -3345,6 +4130,7 @@ function PieceInfoTile({
     copiedMoveDefId?: string;
     coOccupantId?: string;
     hasPigBuddy?: boolean;
+    proto?: Piece['proto'];
     effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
   locked?: boolean;
@@ -3782,7 +4568,7 @@ function PlayPromptBanners({
             {state.pendingPrompt.message}
             <span className="prompt-actions">
               <button type="button" onClick={cancelAbility}>
-                Cancel
+                {state.pendingPrompt.skippable ? 'Skip' : 'Cancel'}
               </button>
             </span>
           </div>

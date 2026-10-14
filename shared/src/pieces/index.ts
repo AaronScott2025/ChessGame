@@ -10,6 +10,7 @@ import {
   sameCoord,
   chebyshev,
   vampireNightRadius,
+  webTokenAt,
 } from '../utils.js';
 import {
   areaMoves,
@@ -24,6 +25,7 @@ import {
   rayMoves,
   standardPawnMoves,
 } from './helpers.js';
+import { droneMoves, prototypeMoves } from './prototype.js';
 
 const ORTH: { row: number; col: number }[] = [
   { row: 1, col: 0 },
@@ -173,7 +175,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'nwaP',
     class: 'pawn',
     symbol: '♙',
-    promoteOptions: ['horse', 'snake', 'pig', 'archer', 'bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti', 'demon', 'mimic'],
+    promoteOptions: ['horse', 'snake', 'pig', 'archer', 'bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti', 'crocodile', 'demon', 'mimic'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, true)),
   },
   rogue: {
@@ -181,7 +183,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Rogue',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti'],
+    promoteOptions: ['bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti', 'crocodile'],
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
@@ -355,6 +357,13 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♜',
     getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ORTH, 2)),
   },
+  crocodile: {
+    id: 'crocodile',
+    name: 'Crocodile',
+    class: 'rook',
+    symbol: '♜',
+    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ORTH, 2)),
+  },
   yeti: {
     id: 'yeti',
     name: 'Yeti',
@@ -481,7 +490,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Spider Queen',
     class: 'queen',
     symbol: '♛',
-    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ALL8, 4)),
+    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ALL8, webTokenAt(s, p.pos) ? 4 : 3)),
   },
   angel: {
     id: 'angel',
@@ -639,6 +648,27 @@ export const PIECES: Record<string, PieceDefinition> = {
       return filterLegal(p, s, copied);
     },
   },
+  prototype: {
+    id: 'prototype',
+    name: 'Prototype',
+    class: 'wildcard',
+    symbol: '♞',
+    getMoves: (p, s) => prototypeMoves(p, s),
+  },
+  drone: {
+    id: 'drone',
+    name: 'Drone',
+    class: 'wildcard',
+    symbol: '♟',
+    getMoves: (p, s) => droneMoves(p, s),
+  },
+  backup_drone: {
+    id: 'backup_drone',
+    name: 'Backup Drone',
+    class: 'wildcard',
+    symbol: '♟',
+    getMoves: (p, s) => filterLegal(p, s, areaMoves(p, s, 1)),
+  },
   timekeeper: {
     id: 'timekeeper',
     name: 'TimeKeeper',
@@ -671,10 +701,10 @@ export const PIECES: Record<string, PieceDefinition> = {
 
 export const VARIANTS_BY_CLASS: Record<string, string[]> = {
   pawn: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'],
-  rook: ['rook', 'stoneman', 'gnome', 'yeti'],
+  rook: ['rook', 'stoneman', 'gnome', 'yeti', 'crocodile'],
   knight: ['horse', 'snake', 'pig', 'archer'],
   bishop: ['bishop', 'scamman', 'wizard', 'worm'],
-  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper'],
+  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype'],
   queen: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
   king: ['king'],
 };

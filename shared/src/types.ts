@@ -74,6 +74,37 @@ export interface PieceState {
   timekeeperCycleUsed?: boolean;
   /** TimeKeeper: Chrono Recall (spawn send) already used. */
   timekeeperRecallUsed?: boolean;
+  /** Prototype: mutation state. */
+  proto?: PrototypeState;
+}
+
+export type PrototypeForm = 'assault' | 'fortress' | 'phantom';
+
+export interface PrototypeState {
+  /** Total mutations gained (upgrades + instabilities); drives Final Evolution and art tier. */
+  gained: number;
+  /** Permanent upgrades in the order they were gained. */
+  upgrades: string[];
+  /** Every mutation rolled (upgrades and instabilities), oldest first. */
+  history?: string[];
+  form?: PrototypeForm;
+  hull: number;
+  shield: number;
+  /** Fortress Bulwark: capture blocks left this day/night phase. */
+  bulwark?: number;
+  chainUses: number;
+  quantumUses: number;
+  teleportCooldown: number;
+  empCooldown: number;
+  reactorTurns: number;
+  droneLaunched?: boolean;
+  /** Instability windows, in owner turns remaining. */
+  surge: number;
+  motor: number;
+  thermal: number;
+  lockdown: number;
+  /** Post-capture follow-up sequence in progress (Chain Assault / Razor Limbs). */
+  followup?: { chainDone: boolean; razorLeft: number };
 }
 
 export interface TokenState {
@@ -121,6 +152,11 @@ export interface PlayerState {
 export interface DraftState {
   pickingColor: Color;
   blackChoseFirstPicker: boolean | null;
+  /** Bans come first; absent means picking (drafts started before bans existed). */
+  stage?: 'ban' | 'pick';
+  /** Pieces banned by each color. A ban removes the piece for both sides. */
+  bans?: Record<Color, string[]>;
+  lastBan?: { color: Color; defId: string };
   lastPick?: {
     color: Color;
     defId: string;
@@ -162,6 +198,42 @@ export interface GameState {
   };
   pendingPrompt: PendingPrompt | null;
   rngSeed: number;
+  /** Optional rules chosen by the lobby host. */
+  rules?: GameRules;
+  turnTimer?: TurnTimerState;
+  /** Recent ability triggers (newest last), used by clients to play ability sound effects. */
+  abilityFx?: AbilityFxEvent[];
+  /** Adaptive Reactor: an extra Prototype-only, non-capturing action is in progress. */
+  reactorAction?: { color: Color; pieceId: string };
+}
+
+export interface GameRules {
+  /** Each player bans 2 pieces (max 1 per class) before drafting. */
+  banPhase: boolean;
+  /** Display names are forced to "White" and "Black". */
+  anonymous?: boolean;
+  /** Chess but Fast: seconds per turn, or absent for no timer. */
+  turnTimerSeconds?: TurnTimerSeconds;
+}
+
+export const TURN_TIMER_OPTIONS = [60, 45, 30, 15] as const;
+export type TurnTimerSeconds = (typeof TURN_TIMER_OPTIONS)[number];
+
+export const DEFAULT_RULES: GameRules = { banPhase: true };
+
+/** Live per-turn clock for Chess but Fast. A null deadline means the clock is paused. */
+export interface TurnTimerState {
+  /** Identifies the turn this clock belongs to (`turnCount:color`). */
+  key: string;
+  durationMs: number;
+  deadline: number | null;
+  remainingMs: number;
+  paused: null | 'check' | 'waiting';
+}
+
+export interface AbilityFxEvent {
+  seq: number;
+  id: string;
 }
 
 export type PendingPrompt =
@@ -213,6 +285,13 @@ export type PendingPrompt =
       abilityId: string;
       message: string;
       selected?: unknown[];
+      targetId?: string;
+      /** Clickable squares for generic square-pick prompts. */
+      options?: Coord[];
+      /** Cancel means "skip" (the action still finishes) instead of undoing. */
+      skippable?: boolean;
+      /** Player whose turn resumes after this prompt (e.g. Reactive Plating during the attacker's turn). */
+      actorColor?: Color;
       resumeTurnPhase?: TurnPhase;
     }
   | {
@@ -240,6 +319,7 @@ export type PendingPrompt =
 export type ClientAction =
   | { type: 'set_name'; name: string }
   | { type: 'choose_first_picker'; whitePicksFirst: boolean }
+  | { type: 'draft_ban'; defId: string }
   | { type: 'draft_pick'; defId: string }
   | { type: 'opening_keep' }
   | { type: 'opening_redraw'; instanceId: string }
