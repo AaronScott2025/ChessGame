@@ -35,10 +35,6 @@ export function fortifyBlocksCapture(attacker: PieceState, victim: PieceState): 
   return Boolean(hasEffect(victim, 'fortify')) && (attacker.class === 'pawn' || attacker.class === 'knight');
 }
 
-export function yetiBlocksPawnCapture(attacker: PieceState, victim: PieceState): boolean {
-  return victim.defId === 'yeti' && attacker.class === 'pawn';
-}
-
 export function emptyOrEnemy(
   state: GameState,
   pos: Coord,
@@ -50,7 +46,7 @@ export function emptyOrEnemy(
   const occ = pieceAt(state, pos);
   if (!occ) return { to: pos };
   if (occ.color !== color && !hasEffect(occ, 'invincible') && !hasEffect(occ, 'pause')) {
-    if (attacker && (fortifyBlocksCapture(attacker, occ) || yetiBlocksPawnCapture(attacker, occ))) {
+    if (attacker && fortifyBlocksCapture(attacker, occ)) {
       return null;
     }
     return { to: pos, capture: true };
@@ -84,8 +80,7 @@ export function rayMoves(
         occ.color !== piece.color &&
         !hasEffect(occ, 'invincible') &&
         !hasEffect(occ, 'pause') &&
-        !fortifyBlocksCapture(piece, occ) &&
-        !yetiBlocksPawnCapture(piece, occ)
+        !fortifyBlocksCapture(piece, occ)
       ) {
         moves.push({ to, capture: true });
       }

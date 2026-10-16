@@ -1,4 +1,11 @@
-import { FINAL_FORMS } from '@shared/pieces/prototype.ts';
+import {
+  FORME_DURATION,
+  FORME_FIELD_COOLDOWN,
+  FORME_ORDER,
+  FORME_SWAP_COOLDOWN,
+  FORMES,
+  TIMED_PERK,
+} from '@shared/pieces/prototype.ts';
 
 export interface PieceInfo {
   id: string;
@@ -100,7 +107,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'gnome',
     name: 'Gnome',
     classLabel: 'Rook',
-    movement: ['Moves up to 2 squares horizontally or vertically.'],
+    movement: ['Moves up to 3 squares horizontally or vertically.'],
     abilities: [
       'Gadget Deploy (once per game): place Ice Floor, Spring Board, or Gnome Hole on an adjacent empty tile.',
       'Ice Floor: pieces that land there slide one more tile in their arrival direction (cannot slide onto or capture a king).',
@@ -112,11 +119,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'yeti',
     name: 'Yeti',
     classLabel: 'Rook',
-    movement: ['Moves 1 square horizontally or vertically.'],
+    movement: ['Moves up to 3 squares horizontally, or up to 2 squares vertically.'],
     abilities: [
       'Giga Stomp (once per game): stomp 3 tiles in any direction. Removes every allied and enemy piece in that line. The Yeti does not move. Kings are immune.',
     ],
-    notes: ['Cannot be captured by any pawn variant.'],
   },
   crocodile: {
     id: 'crocodile',
@@ -151,13 +157,13 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     name: 'Pig',
     classLabel: 'Knight',
     movement: [
-      'Moves in an L shape (2 then 1). Cannot jump over enemy pieces or barriers (allies on the long leg do not block).',
+      'Day: moves in an L shape (2 then 1). Cannot jump over enemy pieces or barriers (allies on the long leg do not block).',
+      'Night: moves 1 tile in any direction (a 1×1 area).',
     ],
     abilities: [
-      'Best Buddy: may share a tile with an allied non-king piece that sits on a normal L (2–1) landing (same path rules as movement — not a teleport).',
-      'If that shared tile is captured, both pieces fall and the Pig’s owner gains 3 bonus turns.',
+      'Best Buddy (day): may share a tile with an allied non-king piece that sits on a normal L (2–1) landing (same path rules as movement — not a teleport).',
+      'If that shared tile is captured, the Pig dies in the host’s place, the host is shoved to the nearest adjacent empty tile, and the Pig’s owner gains 2 bonus turns. If no adjacent tile is free, both fall.',
     ],
-    notes: ['Can only act during the day.'],
   },
   archer: {
     id: 'archer',
@@ -180,7 +186,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'scamman',
     name: 'Fleece',
     classLabel: 'Bishop',
-    movement: ['Moves 1 square diagonally.'],
+    movement: ['Moves up to 3 squares diagonally.'],
     abilities: [
       'Fraudulent Fate: any non-pawn that captures this piece becomes a basic Pawn.',
       'Identity Theft (once): after capturing a piece, activate whenever you want to permanently move like that piece (movement only, not specials). Later captures replace the stored identity until you activate.',
@@ -190,7 +196,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'wizard',
     name: 'Wizard',
     classLabel: 'Bishop',
-    movement: ['Moves up to 2 squares diagonally.'],
+    movement: ['Moves up to 3 squares diagonally.'],
     abilities: [
       'Enchant: give an adjacent piece +1 movement for 2 turns (4-turn cooldown).',
       'Magic Be-gone (2× per game): if both of your Wizards are alive, silence the opponent’s spells and magical abilities until the next day/night change (up to 5 turns). Uses your turn. Ends early if either of your Wizards dies.',
@@ -202,7 +208,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Bishop',
     movement: ['Moves exactly 2 squares orthogonally. The in-between square must be empty.'],
     abilities: [
-      'Burrow: after the 2-step, if an allied piece is ahead and adjacent to that landing, may go to any square up to 1 tile from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
+      'Burrow: after the 2-step, if an allied piece is ahead and adjacent to that landing, may go to any square up to 1 tile orthogonally or 2 tiles diagonally from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
     ],
   },
   queen: {
@@ -268,10 +274,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
   snail: {
     id: 'snail',
     name: 'Snail',
-    classLabel: 'Queen',
+    classLabel: 'Wildcard',
     movement: ['Moves 1 tile in any direction.'],
     abilities: [
-      'Trail: may move a maximum of 8 tiles per game. After that, it is immobilized permanently.',
+      'Trail: may move a maximum of 5 tiles per game. After that, it is immobilized permanently.',
       'If this piece captures, every enemy piece of that same class is also removed, whatever its variant (for example, capturing a Pawn also takes every enemy Rogue, nwaP, or Crystalite).',
     ],
   },
@@ -285,6 +291,22 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Every 3 Blood Tokens adds 1 tile of night radius (3 → 2×2), up to a 5×5 area.',
     ],
     abilities: ['Blood Token: gains 1 Blood Token each time it captures a piece (day or night).'],
+  },
+  president: {
+    id: 'president',
+    name: 'President',
+    classLabel: 'Queen',
+    movement: ['Moves 1 tile in any direction (like a King).'],
+    abilities: [
+      'Executive Order: at the start of each day (including the first), choose 1 of 3 random laws, or skip until the next dawn. The law binds both players until the next dawn, through the whole night.',
+      'Laws include frozen edge pawns, every knight forced to move like a Horse, a 3-square speed limit, no retreating, no captures on the middle ranks, a ban on magic, and more.',
+      'Some laws benefit both sides: two spells per turn, pawns stepping sideways, reviving each side’s latest fallen piece, or an amnesty that clears freezes and cooldowns.',
+    ],
+    notes: [
+      'Movement laws are lifted for a player whose King is in check, and never leave a side with no piece able to move.',
+      'If both players field a President, each enacts a law and both apply.',
+      'A law stays in force until dawn even if the President falls, but no new law is enacted without a President.',
+    ],
   },
   prince_princess: {
     id: 'prince_princess',
@@ -307,7 +329,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'demon',
     name: 'Demon',
     classLabel: 'Wildcard',
-    movement: ['Moves 1 tile in any direction.'],
+    movement: ['Moves up to 2 tiles vertically, or 1 tile horizontally or diagonally.'],
     abilities: ['Soul Syphon: capturing an enemy converts it to your side.'],
     notes: ['Cannot move during the day.'],
   },
@@ -345,11 +367,6 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     ],
     abilities: [
       'Temporal Shift (once): skip to the opposite phase, or revert the last day/night change. Affects day/night pieces; does not undo card draws.',
-      'Chrono Recall (once per game): send any allied or enemy piece in clear line of sight back to its spawn square (must be empty).',
-    ],
-    notes: [
-      'Chrono Recall cannot leave your King in check.',
-      'Line of sight is a straight unobstructed path in any direction.',
     ],
   },
   prototype: {
@@ -357,40 +374,30 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     name: 'The Prototype',
     classLabel: 'Wildcard',
     movement: [
-      'Moves like a Knight (L-shape), but pieces on the long leg block it until it mutates Spider Chassis.',
-      'Movement bonuses lengthen the long leg of the L.',
+      'Depends on its forme (eye color). Starts in Speed Forme.',
+      ...FORME_ORDER.map(
+        (id) =>
+          `${FORMES[id].name} (${FORMES[id].eyes} eyes): ${FORMES[id].perks.filter((p) => p !== TIMED_PERK).join(' ')}`,
+      ),
     ],
     abilities: [
-      'Adaptive Evolution: gains a random mutation each time it captures an enemy and each time it survives a night. Mutations are permanent.',
-      'Offensive: Razor Limbs (step 1 after capturing), Execution Protocol (lunge-capture one square past an L landing), Chain Assault (once: capture an adjacent enemy after capturing), Overclock Weapons (captures ignore defenses).',
-      'Mobility: Vector Thrusters (1-square diagonal moves), Spider Chassis (jump over pieces), Teleport Relay (every 3 turns, teleport within 4), Magnetic Leap (pull next to an enemy within 3), Quantum Drive (once: blink anywhere).',
-      'Defensive: Reinforced Hull (ignore the first capture), Reactive Plating (knock adjacent enemies 1 square away at the end of their turn), Self-Repair Nanites (shake off Frozen/Stunned/Immobilized/Webbed each turn), Energy Shield (first enemy ability/spell fails), Backup Core (leave a Backup Drone on death).',
-      'Utility: Gravity Field (adjacent enemies lose 1 movement), EMP Burst (every 4 turns, disable enemy abilities within 2), Drone Launcher (once: deploy a Drone), Battlefield Scanner (+1 movement per adjacent enemy, max +3), Adaptive Reactor (every 3rd turn, an extra non-capturing action).',
-      'Instability: Power Surge (must advance on the nearest enemy), Motor Failure (only 1-square moves), Logic Conflict (instantly glitches to a random empty square within 2), Thermal Overload (cannot capture next turn), Core Fracture (cannot move, capture or use abilities next turn).',
-      'Final Evolution (6 mutations): permanently choose one form. Free action.',
-      ...Object.values(FINAL_FORMS).map((f) => `${f.icon} ${f.name}: ${f.summary} ${f.perks.join(' ')}`),
+      `Forme Swap: switch this Prototype to another forme without using your turn. ${FORME_SWAP_COOLDOWN}-turn cooldown, shared by both of your Prototypes (only one can swap at a time).`,
+      'Neither Prototype can move on the turn you swap.',
+      `Attack, Defense and Temporal Forme each last ${FORME_DURATION} turns (the swap turn plus ${FORME_DURATION - 1} more). Then the Prototype shuts down for 1 turn and returns to Speed Forme.`,
     ],
     notes: [
-      'Its armor visibly upgrades every 2 mutations, up to 6 (cosmetic only).',
-      'Follow-ups (Chain Assault, Razor Limbs) are skipped if the capture gives check.',
-      'Gravity Field does not affect Kings or Knights.',
+      `Defense drones and entering Temporal Forme each have a ${FORME_FIELD_COOLDOWN}-turn cooldown.`,
+      'Temporal Forme cannot freeze Kings, and frozen pieces still give check.',
+      'Attack Forme’s bonus move is skipped if the capture gives check.',
     ],
   },
   drone: {
     id: 'drone',
-    name: 'Drone',
+    name: 'Attack Drone',
     classLabel: 'Wildcard',
     movement: ['Moves up to 2 squares orthogonally (cannot capture this way).'],
     abilities: ['Captures like a King: any adjacent enemy.'],
-    notes: ['Deployed by the Prototype’s Drone Launcher.'],
-  },
-  backup_drone: {
-    id: 'backup_drone',
-    name: 'Backup Drone',
-    classLabel: 'Wildcard',
-    movement: ['Moves 1 square in any direction.'],
-    abilities: [],
-    notes: ['Left behind when a Prototype with Backup Core is destroyed.'],
+    notes: ['Deployed by a Prototype in Defense Forme when a nearby ally is captured.'],
   },
   king: {
     id: 'king',

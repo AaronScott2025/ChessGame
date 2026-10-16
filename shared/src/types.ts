@@ -72,39 +72,22 @@ export interface PieceState {
   gamblerPrevStyleDefId?: string;
   /** TimeKeeper: day/night skip or revert already used. */
   timekeeperCycleUsed?: boolean;
-  /** TimeKeeper: Chrono Recall (spawn send) already used. */
-  timekeeperRecallUsed?: boolean;
-  /** Prototype: mutation state. */
+  /** Prototype: forme state. */
   proto?: PrototypeState;
 }
 
-export type PrototypeForm = 'assault' | 'fortress' | 'phantom';
+export type PrototypeForm = 'speed' | 'attack' | 'defense' | 'temporal';
 
 export interface PrototypeState {
-  /** Total mutations gained (upgrades + instabilities); drives Final Evolution and art tier. */
-  gained: number;
-  /** Permanent upgrades in the order they were gained. */
-  upgrades: string[];
-  /** Every mutation rolled (upgrades and instabilities), oldest first. */
-  history?: string[];
-  form?: PrototypeForm;
-  hull: number;
-  shield: number;
-  /** Fortress Bulwark: capture blocks left this day/night phase. */
-  bulwark?: number;
-  chainUses: number;
-  quantumUses: number;
-  teleportCooldown: number;
-  empCooldown: number;
-  reactorTurns: number;
-  droneLaunched?: boolean;
-  /** Instability windows, in owner turns remaining. */
-  surge: number;
-  motor: number;
-  thermal: number;
-  lockdown: number;
-  /** Post-capture follow-up sequence in progress (Chain Assault / Razor Limbs). */
-  followup?: { chainDone: boolean; razorLeft: number };
+  form: PrototypeForm;
+  /** Owner turns until Defense Forme can deploy another Attack Drone. */
+  droneCooldown: number;
+  /** Owner turns until Temporal Forme can be entered again. */
+  temporalCooldown: number;
+  /** Owner turns left in a non-Speed forme, counting the current one. */
+  formeTurns?: number;
+  /** The forme ran out: the Prototype is shut down this turn, then returns to Speed Forme. */
+  rebooting?: boolean;
 }
 
 export interface TokenState {
@@ -147,6 +130,10 @@ export interface PlayerState {
   lastPlayedCardDefId?: string;
   /** Opponent Magic Be-gone: silenced until this cycleCount (cleared on day/night flip). */
   magicDisabledUntilCycle?: number;
+  /** Prototype Forme Swap: own turns until it can be used again. */
+  formeSwapCooldown?: number;
+  /** `turnCount` of the turn a Forme Swap was used; no Prototype may move that turn. */
+  formeSwapTurn?: number;
 }
 
 export interface DraftState {
@@ -203,8 +190,23 @@ export interface GameState {
   turnTimer?: TurnTimerState;
   /** Recent ability triggers (newest last), used by clients to play ability sound effects. */
   abilityFx?: AbilityFxEvent[];
-  /** Adaptive Reactor: an extra Prototype-only, non-capturing action is in progress. */
-  reactorAction?: { color: Color; pieceId: string };
+  /** Attack Forme: after capturing, the Prototype takes a bonus Knight move. */
+  bonusMove?: { color: Color; pieceId: string };
+  /** President laws in force for both players until the next dawn. */
+  laws?: ActiveLaw[];
+  /** Presidents still to choose a law this dawn; opened one at a time as a prompt. */
+  lawOffers?: LawOffer[];
+}
+
+export interface ActiveLaw {
+  id: string;
+  by: Color;
+}
+
+export interface LawOffer {
+  color: Color;
+  pieceId: string;
+  options: string[];
 }
 
 export interface GameRules {
@@ -313,6 +315,14 @@ export type PendingPrompt =
       color: Color;
       pieceId: string;
       options: Coord[];
+      message: string;
+    }
+  | {
+      type: 'law_choice';
+      color: Color;
+      pieceId: string;
+      /** Law ids offered this dawn. */
+      options: string[];
       message: string;
     };
 

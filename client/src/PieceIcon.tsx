@@ -28,6 +28,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   reaper: { folder: 'Queens', file: 'Reaper' },
   snail: { folder: 'Queens', file: 'Snail' },
   vampire: { folder: 'Queens', file: 'Vampire' },
+  president: { folder: 'Queens', file: 'President' },
   prince_princess: { folder: 'Wildcards', file: 'PrincePrincess' },
   demon: { folder: 'Wildcards', file: 'Demon' },
   mimic: { folder: 'Wildcards', file: 'Mimic' },
@@ -35,19 +36,21 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   timekeeper: { folder: 'Wildcards', file: 'TimeKeeper' },
   prototype: { folder: 'Wildcards', file: 'Prototype' },
   drone: { folder: 'Wildcards', file: 'Drone' },
-  backup_drone: { folder: 'Wildcards', file: 'BackupDrone' },
   king: { folder: 'Kings', file: 'King' },
 };
 
-/** Prototype art tier: upgrades every 2 mutations, capped at 6 (tier 3). */
-export function prototypeTier(gained: number | undefined): number {
-  return Math.max(0, Math.min(3, Math.floor((gained ?? 0) / 2)));
-}
+/** Prototype art per forme; the eye color shows the active forme. */
+const PROTOTYPE_FORME_ART: Record<string, string> = {
+  speed: 'Speed',
+  attack: 'Attack',
+  defense: 'Defense',
+  temporal: 'Temporal',
+};
 
-export function pieceArtSrc(defId: string, color: Color, tier = 0): string {
+export function pieceArtSrc(defId: string, color: Color, forme?: string): string {
   const art = PIECE_ART[defId] ?? PIECE_ART.pawn;
   const tone = color === 'white' ? 'White' : 'Black';
-  const stage = defId === 'prototype' && tier > 0 ? String(tier) : '';
+  const stage = defId === 'prototype' ? PROTOTYPE_FORME_ART[forme ?? 'speed'] ?? 'Speed' : '';
   return `/Chesspansion/${art.folder}/${art.file}${stage}${tone}.png`;
 }
 
@@ -56,16 +59,17 @@ export function PieceIcon({
   color,
   className = '',
   title,
-  tier = 0,
+  forme,
 }: {
   defId: string;
   color: Color;
   className?: string;
   title?: string;
-  tier?: number;
+  /** Prototype only: the active forme, which picks the eye color. */
+  forme?: string;
 }) {
   const id = PIECE_ART[defId] ? defId : 'pawn';
-  const src = pieceArtSrc(id, color, tier);
+  const src = pieceArtSrc(id, color, forme);
   return (
     <span
       className={`piece-icon piece-icon-art piece-art-${id} ${color} ${className}`.trim()}

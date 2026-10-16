@@ -12,19 +12,23 @@ import type {
 import { BOARD_SIZE, DEFAULT_RULES, MAX_HAND, TURN_TIMER_OPTIONS } from '../types.js';
 import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS, rollGamblerStyles } from '../pieces/index.js';
 import {
+  activeForm,
   ensureProto,
-  FINAL_EVOLUTION_AT,
-  FINAL_FORMS,
-  finalFormHint,
-  MUTATIONS,
-  protoHas,
-  protoLockedDown,
-  protoRng,
-  rollMutationId,
+  FORME_DURATION,
+  FORME_FIELD_COOLDOWN,
+  FORME_ORDER,
+  FORME_RADIUS,
+  FORME_SWAP_COOLDOWN,
+  FORMES,
+  formeRooted,
+  protoForm,
+  prototypeBonusMoves,
+  temporalFrozen,
 } from '../pieces/prototype.js';
 import type { MoveOption } from '../pieces/helpers.js';
-import { chebyshevPathBlocked, isKnightLanding, isPigLShape, yetiBlocksPawnCapture } from '../pieces/helpers.js';
+import { chebyshevPathBlocked, isKnightLanding, isPigLShape } from '../pieces/helpers.js';
 import { buildDeck, discardCard, drawCard, getCardDef } from '../cards/index.js';
+import { LAWS, lawActive, rollLawOptions } from '../laws.js';
 import {
   abilityFx,
   addEffect,
@@ -32,7 +36,6 @@ import {
   barriersAdjacent,
   chebyshev,
   cloneState,
-  clearLineOfSight,
   endBestBuddy,
   frontRow,
   getKing,
@@ -52,6 +55,7 @@ import {
   movementBonus,
   spellsUnlocked,
   isMagicDisabled,
+  isFrozen,
   nextDayNightFlipCycle,
   bothOwnWizardsAlive,
   magicBegoneUses,
@@ -152,6 +156,10 @@ function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
       return yours
         ? 'Choose a Gnome Hole destination first, or skip'
         : 'Waiting for opponent to choose a Gnome Hole destination';
+    case 'law_choice':
+      return yours
+        ? 'Your President must enact a law first'
+        : 'Waiting for the opposing President to enact a law';
     default:
       return yours ? 'Finish the current choice first' : 'Waiting for opponent to finish their choice';
   }
@@ -323,7 +331,7 @@ export function draftPick(state: GameState, color: Color, defId: string): GameSt
 
 function initialCharges(defId: string): number | undefined {
   if (defId === 'reaper') return 0;
-  if (defId === 'snail') return 8;
+  if (defId === 'snail') return 5;
   if (defId === 'vampire') return 0;
   return undefined;
 }
@@ -438,6 +446,7 @@ export function openingKeep(state: GameState, color: Color): GameState {
     next.turnPhase = spellsUnlocked(next) ? 'spell' : 'move';
     pushSnapshot(next);
     log(next, 'Game start — White to play. Spell cards unlock at the first night.');
+    queueLawOffers(next);
   }
   return next;
 }
@@ -520,21 +529,19 @@ function concludeAbilityTurn(state: GameState, color: Color): GameState {
 
 function applyDayNightSideEffects(state: GameState, entering: 'day' | 'night', drawCards: boolean): void {
   clearMagicBegone(state);
-  for (const p of state.pieces) {
-    if (p.defId === 'prototype' && p.proto?.form === 'fortress') p.proto.bulwark = 1;
-  }
   if (entering === 'day') {
     if (drawCards) {
       for (const c of ['white', 'black'] as Color[]) {
         tryDrawWithHandLimit(state, c);
       }
       log(state, 'New day — both players draw 1');
-      prototypeNightSurvival(state);
     }
     const dayRng = mulberry32(state.rngSeed + state.cycleCount * 9973 + 42);
     const rolls = rollGamblerStyles(state, dayRng);
     for (const line of rolls) log(state, line);
     if (rolls.length) abilityFx(state, 'lucky_draw');
+    repealLaws(state);
+    queueLawOffers(state);
   }
   if (entering === 'night') {
     if (state.cycleCount === 5) log(state, 'First night — spell cards are now available');
@@ -571,6 +578,181 @@ function reaperHarvestIfDue(state: GameState, reaper: PieceState): void {
   abilityFx(state, 'reaper_harvest');
 }
 
+function repealLaws(state: GameState): void {
+  if (!state.laws?.length) return;
+  const names = state.laws.map((l) => LAWS[l.id]?.name ?? l.id).join(', ');
+  state.laws = [];
+  log(state, `Dawn — the old law expires (${names})`);
+}
+
+/** Each side's first President holds a dawn session: 3 random laws to choose from. */
+function queueLawOffers(state: GameState): void {
+  const offers: NonNullable<GameState['lawOffers']> = [];
+  for (const color of ['white', 'black'] as Color[]) {
+    const president = state.pieces.find((p) => p.defId === 'president' && p.color === color);
+    if (!president) continue;
+    const rng = mulberry32(state.rngSeed + state.cycleCount * 7717 + (color === 'white' ? 131 : 262));
+    offers.push({ color, pieceId: president.id, options: rollLawOptions(rng) });
+  }
+  state.lawOffers = offers.length ? offers : undefined;
+}
+
+/** Open the next President's law choice once nothing else is pending. Mutates `state`. */
+export function openQueuedLawPrompt(state: GameState): void {
+  while (state.phase === 'playing' && !state.pendingPrompt && state.lawOffers?.length) {
+    const offer = state.lawOffers.shift()!;
+    if (!state.lawOffers.length) state.lawOffers = undefined;
+    if (!state.pieces.some((p) => p.id === offer.pieceId && p.color === offer.color)) continue;
+    state.pendingPrompt = {
+      type: 'law_choice',
+      color: offer.color,
+      pieceId: offer.pieceId,
+      options: offer.options,
+      message: 'Your President convenes at dawn — enact one law, or skip until the next dawn. A law binds both players until the next dawn.',
+    };
+    abilityFx(state, 'president_session');
+  }
+}
+
+function enactLaw(state: GameState, color: Color, lawId: string): void {
+  const law = LAWS[lawId];
+  if (!law) throw new Error('Unknown law');
+  state.laws = [...(state.laws ?? []).filter((l) => l.id !== lawId), { id: lawId, by: color }];
+  log(state, `${color} President enacted ${law.name}: ${law.text}`);
+  abilityFx(state, 'president_law');
+  if (law.id === 'stimulus') {
+    tryDrawWithHandLimit(state, 'white');
+    tryDrawWithHandLimit(state, 'black');
+  }
+  if (law.id === 'magic_ban' && state.turnPhase === 'spell') state.turnPhase = 'move';
+  if (law.id === 'arcane_subsidy') {
+    const mover = state.players[state.turn];
+    mover.maxSpellsThisTurn = Math.max(mover.maxSpellsThisTurn, 2);
+  }
+  if (law.id === 'healthcare_act') {
+    lawRevive(state, color);
+    lawRevive(state, opposite(color));
+  }
+  if (law.id === 'general_amnesty') grantAmnesty(state);
+  // A mandate can reshape attacks and deliver check on the spot.
+  const checked = refreshCheckState(state);
+  if (checked === state.turn && !hasEscapeFromCheck(state, state.turn)) {
+    state.phase = 'ended';
+    state.winner = opposite(state.turn);
+    state.winReason = 'Checkmate';
+  }
+}
+
+/** Healthcare Act: the newest graveyard entry returns on its owner's home ranks, nearest the centre. */
+function lawRevive(state: GameState, color: Color): void {
+  const gy = state.players[color].graveyard;
+  const idx = gy.map((g) => g.class !== 'king').lastIndexOf(true);
+  if (idx < 0) return;
+  const entry = gy[idx]!;
+  const spots: Coord[] = [];
+  for (const row of [backRow(color), frontRow(color)]) {
+    for (let col = 0; col < BOARD_SIZE; col++) spots.push({ row, col });
+  }
+  spots.sort((a, b) => Math.abs(a.col - 4.5) - Math.abs(b.col - 4.5));
+  const def = getPieceDef(entry.defId);
+  for (const spot of spots) {
+    if (pieceAt(state, spot) || state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, spot))) continue;
+    const revived: PieceState = {
+      id: `law_revived_${color}_${entry.defId}_${state.turnCount}_${idx}`,
+      defId: entry.defId,
+      class: def.class,
+      color,
+      pos: spot,
+      hasMoved: false,
+      startPos: spot,
+      effects: [],
+      charges: initialCharges(entry.defId),
+      reviveCount: entry.defId === 'angel' ? 0 : undefined,
+    };
+    state.pieces.push(revived);
+    // A revived piece must not land giving check out of turn.
+    if (isInCheck(state, opposite(color))) {
+      state.pieces.pop();
+      continue;
+    }
+    gy.splice(idx, 1);
+    log(state, `Healthcare Act — ${color} ${def.name} returns to the field`);
+    return;
+  }
+  log(state, `Healthcare Act — no room for ${color}'s ${def.name}`);
+}
+
+/** General Amnesty: disabling effects lift and cooldowns reset. Pause keeps its frozen half with its shield. */
+function grantAmnesty(state: GameState): void {
+  for (const piece of state.pieces) {
+    piece.abilityCooldown = 0;
+    if (hasEffect(piece, 'pause')) continue;
+    piece.effects = piece.effects.filter((e) => !DISABLING_EFFECTS.includes(e.kind));
+    piece.disabledTurns = 0;
+  }
+}
+
+const LAW_FREEZES = ['edge_pawns', 'wildcard_curfew', 'queens_grounded', 'house_arrest'];
+
+function lawFreezes(state: GameState, piece: PieceState, active: Set<string>): boolean {
+  if (active.has('edge_pawns') && piece.class === 'pawn') {
+    const { row, col } = piece.pos;
+    if (row === 0 || col === 0 || row === BOARD_SIZE - 1 || col === BOARD_SIZE - 1) return true;
+  }
+  if (active.has('wildcard_curfew') && piece.class === 'wildcard') return true;
+  if (active.has('queens_grounded') && piece.class === 'queen' && piece.defId !== 'president') return true;
+  if (active.has('house_arrest') && piece.class === 'king') return true;
+  return false;
+}
+
+/** Laws never leave a side with nothing to move: freezes lapse if every unfrozen piece is stuck. */
+function freezesLeaveAMove(state: GameState, color: Color, active: Set<string>): boolean {
+  return state.pieces.some((p) => {
+    if (p.color !== color || lawFreezes(state, p, active)) return false;
+    try {
+      const def = getPieceDef(lawMandateFor(state, p) ?? p.defId);
+      if (def.canAct && !lawMandateFor(state, p) && !def.canAct(p, state)) return false;
+      return def.getMoves(p, state).length > 0;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** The variant whose movement a law forces this piece to use, if any. */
+function lawMandateFor(state: GameState, piece: PieceState): string | null {
+  for (const l of state.laws ?? []) {
+    const m = LAWS[l.id]?.mandate;
+    if (m && m.class === piece.class && m.defId !== piece.defId) return m.defId;
+  }
+  return null;
+}
+
+const NON_RELOCATING_SPECIALS = new Set(['archer_shot', 'death_stare', 'giga_stomp']);
+
+function applyLawRestrictions(state: GameState, piece: PieceState, moves: MoveOption[]): MoveOption[] {
+  const active = new Set((state.laws ?? []).filter((l) => LAWS[l.id]?.kind === 'restrict').map((l) => l.id));
+  if (!active.size) return moves;
+  if (isInCheck(state, piece.color)) return moves;
+  if (lawFreezes(state, piece, active)) {
+    const freezing = new Set(LAW_FREEZES.filter((id) => active.has(id)));
+    if (freezesLeaveAMove(state, piece.color, freezing)) return [];
+  }
+  return moves.filter((m) => {
+    const relocates = !m.special || !NON_RELOCATING_SPECIALS.has(m.special);
+    if (active.has('speed_limit') && !m.special && chebyshev(piece.pos, m.to) > 3) return false;
+    if (active.has('no_retreat') && relocates && piece.class !== 'king') {
+      const backward = piece.color === 'white' ? m.to.row > piece.pos.row : m.to.row < piece.pos.row;
+      if (backward) return false;
+    }
+    if (active.has('neutral_zone') && (m.to.row === 4 || m.to.row === 5)) {
+      const occ = pieceAt(state, m.to);
+      if (m.capture || (occ && occ.color !== piece.color)) return false;
+    }
+    return true;
+  });
+}
+
 function flipDayNight(state: GameState, drawCards: boolean): 'day' | 'night' {
   state.previousDayNight = state.dayNight;
   state.dayNight = state.dayNight === 'day' ? 'night' : 'day';
@@ -588,21 +770,6 @@ function revertDayNight(state: GameState): void {
   log(state, `Time reverts — it is now ${state.dayNight}`);
   applyDayNightSideEffects(state, state.dayNight, false);
   refreshCheckState(state);
-}
-
-function assertTimekeeperDisplacementSafe(
-  state: GameState,
-  color: Color,
-  target: PieceState,
-  dest: Coord,
-  action: string,
-): void {
-  const trial = cloneState(state);
-  const tp = trial.pieces.find((p) => p.id === target.id);
-  if (!tp) throw new Error('Target gone');
-  endBestBuddy(trial, tp, tp.pos);
-  tp.pos = { ...dest };
-  assertOwnKingSafe(trial, color, action);
 }
 
 function squareBlockedForDisplacement(state: GameState, pos: Coord): boolean {
@@ -631,7 +798,6 @@ function travelPortalOnce(state: GameState, piece: PieceState, color: Color): Pi
     if (occ.id === piece.id || occ.color === color) return undefined;
     if (hasEffect(occ, 'invincible') || hasEffect(occ, 'pause')) return undefined;
     if (hasEffect(occ, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) return undefined;
-    if (hullProtects(piece, occ)) return undefined;
   }
   if (endBestBuddy(state, piece, piece.pos)) log(state, 'Best Buddy ended');
   piece.pos = { ...dest };
@@ -653,9 +819,16 @@ function simulatePortalHop(state: GameState, piece: PieceState): void {
 export function listMoves(state: GameState, pieceId: string, options?: { forAttack?: boolean }): MoveOption[] {
   const piece = state.pieces.find((p) => p.id === pieceId);
   if (!piece) return [];
+  if (piece.defId === 'prototype' && formeRooted(piece)) return [];
   const def = getPieceDef(piece.defId);
-  if (def.canAct && !def.canAct(piece, state)) return [];
-  let moves = def.getMoves(piece, state);
+  const mandated = lawMandateFor(state, piece);
+  let moves: MoveOption[];
+  if (mandated) {
+    moves = getPieceDef(mandated).getMoves(piece, state).filter((m) => !m.special);
+  } else {
+    if (def.canAct && !def.canAct(piece, state)) return [];
+    moves = def.getMoves(piece, state);
+  }
 
   // Blink return
   const blink = hasEffect(piece, 'blink');
@@ -683,19 +856,32 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
     );
   });
 
-  if (hasEffect(piece, 'emp')) moves = moves.filter((m) => !m.special || !EMP_BLOCKED_SPECIALS.has(m.special));
-  if (gravityPenalized(state, piece)) moves = applyGravity(piece, moves);
-
   // Giga Stomp does not attack (the King is immune, and the Yeti does not move).
   // Counting those squares as attacks puts the king in a false check and can
   // leave Giga Stomp as the Yeti's only legal action.
   if (options?.forAttack) return moves.filter((m) => m.special !== 'giga_stomp');
 
-  const reactor = state.reactorAction;
-  if (reactor && reactor.color === piece.color) {
-    if (reactor.pieceId !== piece.id) return [];
-    moves = moves.filter((m) => !m.special && !pieceAt(state, m.to));
+  // Frozen pieces still threaten their squares (above); they just cannot move.
+  if (temporalFrozen(state, piece)) return [];
+  if (piece.defId === 'prototype' && state.players[piece.color].formeSwapTurn === state.turnCount) return [];
+
+  if (lawActive(state, 'infrastructure_act') && piece.class === 'pawn') {
+    const stuck = isFrozen(piece) || (piece.disabledTurns ?? 0) > 0 || hasEffect(piece, 'cannot_move');
+    for (const dc of stuck ? [] : [-1, 1]) {
+      const to = { row: piece.pos.row, col: piece.pos.col + dc };
+      if (!inBounds(to) || pieceAt(state, to) || moves.some((m) => sameCoord(m.to, to))) continue;
+      if (state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, to))) continue;
+      moves.push({ to });
+    }
   }
+
+  const bonus = state.bonusMove;
+  if (bonus && bonus.color === piece.color) {
+    if (bonus.pieceId !== piece.id) return [];
+    moves = prototypeBonusMoves(piece, state).filter((m) => pieceAt(state, m.to)?.class !== 'king');
+  }
+
+  moves = applyLawRestrictions(state, piece, moves);
 
   // Filter moves that leave own king in check
   return moves.filter((m) => {
@@ -703,10 +889,6 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
       const trial = cloneState(state);
       const tp = trial.pieces.find((p) => p.id === pieceId)!;
       const occ = pieceAt(trial, m.to);
-      if (occ && hullProtects(tp, occ) && (!m.special || m.special === 'death_stare' || m.special === 'archer_shot')) {
-        // Reinforced Hull: the attacker stays where it is
-        return !isInCheck(trial, piece.color);
-      }
       if (occ && occ.color !== tp.color) {
         trial.pieces = trial.pieces.filter((p) => p.id !== occ.id);
       }
@@ -878,6 +1060,18 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       hint: 'After moving, leaves a 3-tile web row at the square it left (center, left, and right of travel). Skips allied tiles. Two rows max; the oldest vanishes. Pieces that move onto or through a web are stuck 3 turns. Kings and Spider Queens cannot be webbed.',
     });
   }
+  if (piece.defId === 'president') {
+    const ownLaw = (state.laws ?? []).find((l) => l.by === piece.color);
+    out.push({
+      id: 'executive_order',
+      name: ownLaw ? `Executive Order (${LAWS[ownLaw.id]?.name ?? ownLaw.id})` : 'Executive Order',
+      ready: true,
+      passive: true,
+      hint: ownLaw
+        ? `In force until the next dawn: ${LAWS[ownLaw.id]?.text ?? ''}`
+        : 'At the start of each day, choose 1 of 3 random laws (or skip). It binds both players until the next dawn.',
+    });
+  }
   if (piece.defId === 'reaper') {
     const charges = piece.charges ?? 0;
     if (charges >= 1) {
@@ -947,7 +1141,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       name: 'Best Buddy',
       ready: true,
       passive: true,
-      hint: 'Click an allied non-king on a highlighted L (2–1) square — same range as Pig movement.',
+      hint: 'Day only: click an allied non-king on a highlighted L (2–1) square. If the shared tile is attacked, the Pig dies instead, the host is shoved to an adjacent tile, and you gain 2 bonus turns.',
     });
   }
   if (piece.defId === 'timekeeper') {
@@ -962,24 +1156,12 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
           ? 'Once: skip day↔night now, or revert the last phase change (no card draw changes).'
           : 'Once: skip to the opposite phase now (no card draw). Revert unlocks after any phase change.',
     });
-    out.push({
-      id: 'chrono_recall',
-      name: 'Chrono Recall',
-      ready: !piece.timekeeperRecallUsed && !inCheck,
-      hint: inCheck
-        ? 'Cannot use while in check'
-        : 'Once per game: click any piece in clear line of sight to send it to its spawn square (must be empty).',
-    });
   }
   if (piece.defId === 'prototype') out.push(...prototypeAbilityList(state, piece));
 
-  const reactor = state.reactorAction;
-  const reactorLocked = Boolean(reactor && reactor.color === piece.color && reactor.pieceId !== piece.id);
-  if (hasEffect(piece, 'emp') || reactorLocked) {
-    const hint = reactorLocked ? 'Only the Prototype can act during its Reactor action' : 'Disabled by EMP Burst until the enemy’s next turn';
-    return out.map((a) =>
-      a.passive || a.id === 'reactor_end' ? a : { ...a, ready: false, hint },
-    );
+  if (state.bonusMove?.color === piece.color) {
+    const hint = 'Only the Prototype’s bonus Knight move is available right now';
+    return out.map((a) => (a.passive || a.id === 'bonus_end' ? a : { ...a, ready: false, hint }));
   }
   return out;
 }
@@ -1021,7 +1203,6 @@ export function useAbility(
       'revive',
       'barrier_shift',
       'temporal_shift',
-      'chrono_recall',
     ];
     if (magical.includes(abilityId)) throw new Error('Magic is silenced (Magic Be-gone)');
   }
@@ -1030,27 +1211,20 @@ export function useAbility(
   if (!avail?.ready) throw new Error('Ability not available');
 
   if (piece.defId === 'prototype') {
-    if (abilityId === 'mut_status') throw new Error('Mutation status is informational');
-    if (abilityId === 'reactor_end') {
-      log(next, 'Reactor action skipped');
+    if (abilityId === 'forme_status') throw new Error('Forme status is informational');
+    if (abilityId === 'bonus_end') {
+      log(next, 'Attack Forme bonus move skipped');
       return endTurn(next, color, false);
     }
-    const form = PROTO_FORMS[abilityId];
-    if (form) {
-      chooseFinalForm(next, piece, form);
+    const forme = FORME_ORDER.find((f) => abilityId === `forme_${f}`);
+    if (forme) {
+      swapForme(next, color, piece, forme);
       next.turnPhase = resumeTurnPhase;
-      return next;
-    }
-    if (abilityId === 'emp_burst') return finishEmpBurst(next, color, piece);
-    if (PROTO_MOVE_ABILITIES.has(abilityId)) {
-      const to = targets as Coord | undefined;
-      if (to && typeof to === 'object' && 'row' in to) return finishPrototypeAbility(next, color, piece, abilityId, to);
-      const options = prototypeSafeOptions(next, piece, abilityId);
-      if (!options.length) throw new Error('No destination keeps your king safe');
-      const label = avail.name.replace(/\s*\(.*\)$/, '');
-      openPrototypePrompt(next, color, piece, abilityId, options, `${label}: click a highlighted square`, {
-        resumeTurnPhase,
-      });
+      refreshCheckState(next);
+      if (next.check === opposite(color)) {
+        log(next, 'Check from a Forme Swap — turn passes');
+        return endTurn(next, color, true);
+      }
       return next;
     }
   }
@@ -1157,22 +1331,6 @@ export function useAbility(
       return next;
     }
     return finishTemporalShift(next, color, pieceId, mode);
-  }
-
-  if (abilityId === 'chrono_recall') {
-    const targetId = targets as string | undefined;
-    if (!targetId) {
-      next.pendingPrompt = {
-        type: 'ability_target',
-        color,
-        pieceId,
-        abilityId: 'chrono_recall',
-        message: 'Chrono Recall: click a piece in clear line of sight to send it to its spawn square',
-        resumeTurnPhase,
-      };
-      return next;
-    }
-    return finishChronoRecall(next, color, pieceId, targetId);
   }
 
   if (abilityId === 'ultimate_suck') {
@@ -1429,40 +1587,6 @@ function finishTemporalShift(
   return concludeAbilityTurn(state, color);
 }
 
-function finishChronoRecall(
-  state: GameState,
-  color: Color,
-  pieceId: string,
-  targetId: string,
-): GameState {
-  const tk = state.pieces.find((p) => p.id === pieceId);
-  if (!tk || tk.defId !== 'timekeeper') throw new Error('Only a TimeKeeper can use Chrono Recall');
-  if (tk.timekeeperRecallUsed) throw new Error('Chrono Recall already used');
-  const target = state.pieces.find((p) => p.id === targetId);
-  if (!target) throw new Error('Invalid target');
-  if (!clearLineOfSight(state, tk.pos, target.pos)) {
-    throw new Error('Target must be in clear line of sight');
-  }
-  const dest = { ...target.startPos };
-  if (squareBlockedForDisplacement(state, dest)) {
-    throw new Error('Spawn square is obstructed');
-  }
-  assertTimekeeperDisplacementSafe(state, color, target, dest, 'Chrono Recall');
-  if (shieldBlocks(state, target, color)) {
-    tk.timekeeperRecallUsed = true;
-    state.pendingPrompt = null;
-    return concludeAbilityTurn(state, color);
-  }
-  endBestBuddy(state, target, target.pos);
-  target.pos = dest;
-  snareInWeb(state, target);
-  tk.timekeeperRecallUsed = true;
-  state.pendingPrompt = null;
-  log(state, `${getPieceDef(target.defId).name} recalled to its spawn square`);
-  abilityFx(state, 'chrono_recall');
-  return concludeAbilityTurn(state, color);
-}
-
 const ULTIMATE_SUCK_REACH = 2;
 const ULTIMATE_SUCK_LAUNCH = 3;
 const ULTIMATE_SUCK_COOLDOWN = 6;
@@ -1532,11 +1656,6 @@ function finishUltimateSuck(
   if (!ultimateSuckLandings(state, pieceId, targetId).some((c) => sameCoord(c, to))) {
     throw new Error('Launch must be exactly 3 tiles in a clear straight line');
   }
-  if (shieldBlocks(state, target, color)) {
-    croc.abilityCooldown = ULTIMATE_SUCK_COOLDOWN;
-    state.pendingPrompt = null;
-    return concludeAbilityTurn(state, color);
-  }
   const occ = pieceAt(state, to);
   const victimName = occ ? getPieceDef(occ.defId).name : undefined;
   if (occ && !captureBestBuddyPair(state, to, color)) removePiece(state, occ, color);
@@ -1565,326 +1684,13 @@ function finishUltimateSuck(
   return concludeAbilityTurn(state, color);
 }
 
-const PROTO_TELEPORT_RANGE = 4;
-const PROTO_MAGNET_RANGE = 3;
-const PROTO_EMP_RADIUS = 2;
-const PROTO_MOVE_ABILITIES = new Set(['teleport_relay', 'magnetic_leap', 'quantum_drive', 'drone_launcher']);
-const PROTO_FOLLOWUPS = new Set(['chain_assault', 'razor_limbs']);
-const PROTO_FORMS: Record<string, PrototypeForm> = {
-  form_assault: 'assault',
-  form_fortress: 'fortress',
-  form_phantom: 'phantom',
-};
-const EMP_BLOCKED_SPECIALS = new Set(['ancient_shuffle', 'giga_stomp', 'best_buddy', 'swap_of_fates', 'death_stare']);
+/** Disabling effects lifted by General Amnesty. */
+const DISABLING_EFFECTS = ['frozen', 'stunned', 'immobilized', 'webbed'];
 
-function overclocked(attacker: PieceState | undefined): boolean {
-  return Boolean(attacker && attacker.defId === 'prototype' && protoHas(attacker, 'overclock_weapons'));
-}
-
-/** Reinforced Hull or Fortress Bulwark can still soak a capture from this attacker. */
-function hullProtects(attacker: PieceState | undefined, target: PieceState): boolean {
-  if (target.defId !== 'prototype' || !target.proto) return false;
-  if (attacker && attacker.color === target.color) return false;
-  if (overclocked(attacker)) return false;
-  const p = target.proto;
-  if (p.form === 'fortress' && (p.bulwark ?? 0) > 0) return true;
-  return p.hull > 0 && protoHas(target, 'reinforced_hull');
-}
-
-/** Spend whichever capture guard is up (Bulwark first, since it recharges); returns its name. */
-function spendCaptureGuard(state: GameState, target: PieceState): string {
-  const p = target.proto!;
-  if (p.form === 'fortress' && (p.bulwark ?? 0) > 0) {
-    p.bulwark = (p.bulwark ?? 1) - 1;
-    abilityFx(state, 'reinforced_hull');
-    return 'Fortress Bulwark';
-  }
-  p.hull = 0;
-  abilityFx(state, 'reinforced_hull');
-  return 'Reinforced Hull';
-}
-
-/** Fortress form or a charged Energy Shield turns away enemy abilities and spells. */
-function protoWarded(target: PieceState | undefined, byColor: Color): boolean {
-  if (!target || target.defId !== 'prototype' || target.color === byColor || !target.proto) return false;
-  if (target.proto.form === 'fortress') return true;
-  return target.proto.shield > 0 && protoHas(target, 'energy_shield');
-}
-
-function shieldBlocks(state: GameState, target: PieceState | undefined, byColor: Color): boolean {
-  if (!protoWarded(target, byColor)) return false;
-  const p = target!.proto!;
-  if (p.form === 'fortress') {
-    log(state, 'The Fortress Prototype shrugged off the effect');
-  } else {
-    p.shield -= 1;
-    log(state, `Energy Shield absorbed the effect (${p.shield} charge${p.shield === 1 ? '' : 's'} left)`);
-  }
-  abilityFx(state, 'energy_shield');
-  return true;
-}
-
-function grantProtoUpgrade(piece: PieceState, id: string): void {
-  const p = ensureProto(piece);
-  if (!p.upgrades.includes(id)) p.upgrades.push(id);
-  if (id === 'reinforced_hull') p.hull = 1;
-  if (id === 'energy_shield') p.shield = 1;
-}
-
-function applyInstability(state: GameState, piece: PieceState, id: string): void {
-  const p = ensureProto(piece);
-  // Counters tick at the end of the owner's turn; a mutation gained on the owner's turn must survive that tick.
-  const window = state.turn === piece.color ? 2 : 1;
-  if (id === 'power_surge') p.surge = window;
-  else if (id === 'motor_failure') p.motor = window;
-  else if (id === 'thermal_overload') p.thermal = window;
-  else if (id === 'core_fracture') p.lockdown = window;
-  else if (id === 'logic_conflict') shuntPrototype(state, piece);
-}
-
-/** Logic Conflict: hop to a random empty square within 2 that leaves neither King in check. */
-function shuntPrototype(state: GameState, piece: PieceState): void {
-  const spots: Coord[] = [];
-  for (let dr = -2; dr <= 2; dr++) {
-    for (let dc = -2; dc <= 2; dc++) {
-      const to = { row: piece.pos.row + dr, col: piece.pos.col + dc };
-      if ((dr === 0 && dc === 0) || !inBounds(to) || !protoSquareOpen(state, to)) continue;
-      const trial = cloneState(state);
-      const tp = trial.pieces.find((p) => p.id === piece.id);
-      if (!tp) continue;
-      endBestBuddy(trial, tp, tp.pos);
-      tp.pos = { ...to };
-      if (isInCheck(trial, piece.color) || isInCheck(trial, opposite(piece.color))) continue;
-      spots.push(to);
-    }
-  }
-  if (!spots.length) {
-    log(state, 'Logic Conflict — the Prototype twitched but had nowhere to go');
-    return;
-  }
-  const dest = spots[Math.floor(protoRng(state, piece, 2)() * spots.length)];
-  endBestBuddy(state, piece, piece.pos);
-  piece.pos = { ...dest };
-  snareInWeb(state, piece);
-  log(state, 'Logic Conflict — the Prototype glitched to a new square');
-}
-
-function gainMutation(state: GameState, piece: PieceState, reason: string): void {
-  if (piece.defId !== 'prototype' || !state.pieces.some((p) => p.id === piece.id)) return;
-  const id = rollMutationId(state, piece);
-  const p = ensureProto(piece);
-  p.gained += 1;
-  p.history = [...(p.history ?? []), id];
-  const info = MUTATIONS[id];
-  if (info.kind === 'instability') {
-    applyInstability(state, piece, id);
-    abilityFx(state, 'mutation_unstable');
-  } else {
-    grantProtoUpgrade(piece, id);
-    abilityFx(state, 'mutation');
-  }
-  log(state, `Prototype mutated (${reason}): ${info.icon} ${info.name}`);
-  if (p.gained === FINAL_EVOLUTION_AT && !p.form) {
-    log(state, 'The Prototype is ready for its Final Evolution');
-    abilityFx(state, 'final_evolution_ready');
-  }
-}
-
-function prototypeNightSurvival(state: GameState): void {
-  for (const piece of [...state.pieces]) {
-    if (piece.defId !== 'prototype') continue;
-    gainMutation(state, piece, 'survived the night');
-  }
-}
-
-/** End of `color`'s turn: count down Prototype windows and cooldowns. */
-function tickPrototypes(state: GameState, color: Color): void {
-  for (const piece of state.pieces) {
-    if (piece.defId !== 'prototype' || piece.color !== color || !piece.proto) continue;
-    const p = piece.proto;
-    if (p.surge > 0) p.surge -= 1;
-    if (p.motor > 0) p.motor -= 1;
-    if (p.thermal > 0) p.thermal -= 1;
-    if (p.lockdown > 0) p.lockdown -= 1;
-    if (p.teleportCooldown > 0) p.teleportCooldown -= 1;
-    if (p.empCooldown > 0) p.empCooldown -= 1;
-  }
-}
-
-/** End of `mover`'s turn: enemy Reactive Plating knocks their adjacent non-King pieces 1 square away. */
-function reactivePlatingKnockback(state: GameState, mover: Color): void {
-  for (const proto of state.pieces) {
-    if (proto.defId !== 'prototype' || proto.color === mover || !protoHas(proto, 'reactive_plating')) continue;
-    let pushed = 0;
-    const checkedBefore = { white: isInCheck(state, 'white'), black: isInCheck(state, 'black') };
-    for (const victim of [...state.pieces]) {
-      if (victim.color !== mover || victim.class === 'king' || chebyshev(victim.pos, proto.pos) !== 1) continue;
-      const to = {
-        row: victim.pos.row + Math.sign(victim.pos.row - proto.pos.row),
-        col: victim.pos.col + Math.sign(victim.pos.col - proto.pos.col),
-      };
-      if (!inBounds(to) || !protoSquareOpen(state, to)) continue;
-      const trial = cloneState(state);
-      const tv = trial.pieces.find((p) => p.id === victim.id)!;
-      endBestBuddy(trial, tv, tv.pos);
-      tv.pos = { ...to };
-      if ((!checkedBefore.white && isInCheck(trial, 'white')) || (!checkedBefore.black && isInCheck(trial, 'black'))) {
-        continue;
-      }
-      endBestBuddy(state, victim, victim.pos);
-      victim.pos = { ...to };
-      snareInWeb(state, victim);
-      pushed += 1;
-    }
-    if (pushed) {
-      log(state, `Reactive Plating knocked back ${pushed} piece${pushed === 1 ? '' : 's'}`);
-      abilityFx(state, 'reactive_plating');
-    }
-  }
-}
-
-const NANITE_CLEANSED = ['frozen', 'stunned', 'immobilized', 'webbed'];
-
-/** Start of `color`'s turn: their EMP fields collapse; Self-Repair Nanites shake off disabling effects. */
-function startPrototypeTurn(state: GameState, color: Color): void {
-  for (const piece of state.pieces) {
-    const emp = hasEffect(piece, 'emp');
-    if (emp && emp.data?.by === color) removeEffects(piece, 'emp');
-  }
-  for (const piece of state.pieces) {
-    if (piece.defId !== 'prototype' || piece.color !== color || !protoHas(piece, 'self_repair')) continue;
-    // Pause pairs Frozen with invincibility; stripping half of it would leave an invincible, mobile piece.
-    if (hasEffect(piece, 'pause')) continue;
-    const before = piece.effects.length;
-    piece.effects = piece.effects.filter((e) => !NANITE_CLEANSED.includes(e.kind));
-    if (piece.effects.length < before) {
-      log(state, 'Self-Repair Nanites shook off the disabling effects');
-      abilityFx(state, 'self_repair');
-    }
-  }
-}
-
-function triggerAdaptiveReactor(state: GameState, color: Color): boolean {
-  const proto = state.pieces.find(
-    (p) => p.color === color && p.defId === 'prototype' && protoHas(p, 'adaptive_reactor'),
-  );
-  if (!proto?.proto) return false;
-  proto.proto.reactorTurns += 1;
-  if (proto.proto.reactorTurns % 3 !== 0) return false;
-  if (protoLockedDown(proto) || hasEffect(proto, 'emp') || (proto.disabledTurns ?? 0) > 0) return false;
-  if (isInCheck(state, color) || isInCheck(state, opposite(color))) return false;
-  state.reactorAction = { color, pieceId: proto.id };
-  state.turnPhase = 'move';
-  log(state, 'Adaptive Reactor — the Prototype takes an extra action (no capturing)');
-  abilityFx(state, 'adaptive_reactor');
-  return true;
-}
-
-function gravityPenalized(state: GameState, piece: PieceState): boolean {
-  if (piece.class === 'king' || piece.class === 'knight') return false;
-  return state.pieces.some(
-    (p) =>
-      p.defId === 'prototype' &&
-      p.color !== piece.color &&
-      protoHas(p, 'gravity_field') &&
-      chebyshev(p.pos, piece.pos) <= (p.proto?.form === 'fortress' ? 2 : 1),
-  );
-}
-
-/** Gravity Field: along each straight line, the farthest reachable square is lost. */
-function applyGravity(piece: PieceState, moves: MoveOption[]): MoveOption[] {
-  const groups = new Map<string, MoveOption[]>();
-  for (const m of moves) {
-    if (m.special) continue;
-    const dr = m.to.row - piece.pos.row;
-    const dc = m.to.col - piece.pos.col;
-    if (!(dr === 0 || dc === 0 || Math.abs(dr) === Math.abs(dc))) continue;
-    const key = `${Math.sign(dr)},${Math.sign(dc)}`;
-    const g = groups.get(key) ?? [];
-    g.push(m);
-    groups.set(key, g);
-  }
-  const drop = new Set<MoveOption>();
-  for (const g of groups.values()) {
-    if (g.length < 2) continue;
-    const far = Math.max(...g.map((m) => chebyshev(m.to, piece.pos)));
-    for (const m of g) if (chebyshev(m.to, piece.pos) === far) drop.add(m);
-  }
-  return drop.size ? moves.filter((m) => !drop.has(m)) : moves;
-}
-
-function protoSquareOpen(state: GameState, pos: Coord): boolean {
-  return !squareBlockedForDisplacement(state, pos);
-}
-
-function relocationKeepsKingSafe(state: GameState, piece: PieceState, to: Coord): boolean {
-  const trial = cloneState(state);
-  const tp = trial.pieces.find((p) => p.id === piece.id);
-  if (!tp) return false;
-  endBestBuddy(trial, tp, tp.pos);
-  tp.pos = { ...to };
-  return Boolean(getKing(trial, piece.color)) && !isInCheck(trial, piece.color);
-}
-
-function protoMobilityLocked(piece: PieceState): boolean {
-  return (piece.proto?.motor ?? 0) > 0 || (piece.proto?.surge ?? 0) > 0;
-}
-
-/** Raw (not king-safety filtered) destinations for a Prototype ability. */
-function prototypeAbilityOptions(state: GameState, piece: PieceState, abilityId: string): Coord[] {
-  const out: Coord[] = [];
-  const scan = (pred: (c: Coord) => boolean) => {
-    for (let row = 0; row < BOARD_SIZE; row++) {
-      for (let col = 0; col < BOARD_SIZE; col++) {
-        const c = { row, col };
-        if (!sameCoord(c, piece.pos) && protoSquareOpen(state, c) && pred(c)) out.push(c);
-      }
-    }
-  };
-  if (abilityId === 'teleport_relay') scan((c) => chebyshev(c, piece.pos) <= PROTO_TELEPORT_RANGE);
-  else if (abilityId === 'quantum_drive') scan(() => true);
-  else if (abilityId === 'drone_launcher') scan((c) => chebyshev(c, piece.pos) === 1);
-  else if (abilityId === 'magnetic_leap') {
-    const enemies = state.pieces.filter(
-      (p) => p.color !== piece.color && chebyshev(p.pos, piece.pos) <= PROTO_MAGNET_RANGE,
-    );
-    scan((c) => enemies.some((e) => chebyshev(e.pos, c) === 1));
-  } else if (abilityId === 'razor_limbs') {
-    scan((c) => chebyshev(c, piece.pos) === 1);
-  } else if (abilityId === 'chain_assault') {
-    const overclock = overclocked(piece);
-    for (const e of state.pieces) {
-      if (e.color === piece.color || e.class === 'king' || chebyshev(e.pos, piece.pos) !== 1) continue;
-      if (!overclock && (hasEffect(e, 'invincible') || hasEffect(e, 'pause'))) continue;
-      out.push({ ...e.pos });
-    }
-  }
-  return out;
-}
-
-function prototypeSafeOptions(state: GameState, piece: PieceState, abilityId: string): Coord[] {
-  const raw = prototypeAbilityOptions(state, piece, abilityId);
-  if (abilityId === 'drone_launcher') {
-    return raw.filter((c) => {
-      const trial = cloneState(state);
-      trial.pieces.push(makeDrone(piece, c, 'drone'));
-      return !isInCheck(trial, piece.color);
-    });
-  }
-  if (abilityId === 'chain_assault') {
-    return raw.filter((c) => {
-      const trial = cloneState(state);
-      trial.pieces = trial.pieces.filter((p) => !sameCoord(p.pos, c));
-      return !isInCheck(trial, piece.color);
-    });
-  }
-  return raw.filter((c) => relocationKeepsKingSafe(state, piece, c));
-}
-
-function makeDrone(owner: PieceState, pos: Coord, defId: 'drone' | 'backup_drone'): PieceState {
+function makeDrone(state: GameState, owner: PieceState, pos: Coord): PieceState {
   return {
-    id: `${defId}_${owner.id}_${Date.now().toString(36)}`,
-    defId,
+    id: `drone_${owner.id}_${state.turnCount}_${Date.now().toString(36)}`,
+    defId: 'drone',
     class: 'wildcard',
     color: owner.color,
     pos: { ...pos },
@@ -1894,302 +1700,157 @@ function makeDrone(owner: PieceState, pos: Coord, defId: 'drone' | 'backup_drone
   };
 }
 
+/** Why this Prototype's owner cannot Forme Swap right now, or null if they can. */
+function formeSwapBlocker(state: GameState, piece: PieceState): string | null {
+  if (state.turn !== piece.color) return 'Only on your turn';
+  if (state.bonusMove) return 'Not during a bonus move';
+  if ((piece.disabledTurns ?? 0) > 0) return 'This Prototype is disabled';
+  if (piece.proto?.rebooting) return 'This Prototype is rebooting';
+  const cd = state.players[piece.color].formeSwapCooldown ?? 0;
+  if (cd > 0) return `Forme Swap recharging: ${cd} more of your turn${cd === 1 ? '' : 's'}`;
+  return null;
+}
+
+function swapForme(state: GameState, color: Color, piece: PieceState, forme: PrototypeForm): void {
+  const p = ensureProto(piece);
+  if (p.form === forme) throw new Error(`Already in ${FORMES[forme].name}`);
+  const blocked = formeSwapBlocker(state, piece);
+  if (blocked) throw new Error(blocked);
+  if (forme === 'temporal') {
+    if (p.temporalCooldown > 0) throw new Error(`Temporal Forme recharging: ${p.temporalCooldown} more of your turns`);
+    p.temporalCooldown = FORME_FIELD_COOLDOWN;
+  }
+  p.form = forme;
+  p.formeTurns = forme === 'speed' ? undefined : FORME_DURATION;
+  const player = state.players[color];
+  player.formeSwapCooldown = FORME_SWAP_COOLDOWN;
+  player.formeSwapTurn = state.turnCount;
+  log(state, `${color} Prototype swapped to ${FORMES[forme].name}`);
+  abilityFx(state, `forme_${forme}`);
+}
+
 function prototypeAbilityList(
   state: GameState,
   piece: PieceState,
 ): Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> {
   const out: Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> = [];
-  const p = piece.proto;
-  const gained = p?.gained ?? 0;
-  const owned = p?.upgrades ?? [];
-  const statusBits: string[] = [];
-  if (p?.form) statusBits.push(`Form: ${p.form}`);
-  if (p?.surge) statusBits.push('Power Surge');
-  if (p?.motor) statusBits.push('Motor Failure');
-  if (p?.thermal) statusBits.push('Thermal Overload');
-  if (p?.lockdown) statusBits.push('Core Fracture');
+  const form = protoForm(piece);
+  const info = FORMES[form];
+  const droneCd = piece.proto?.droneCooldown ?? 0;
+  const temporalCd = piece.proto?.temporalCooldown ?? 0;
+  const status: string[] = [];
+  const rebooting = Boolean(piece.proto?.rebooting);
+  const turnsLeft = piece.proto?.formeTurns ?? 0;
+  if (rebooting) status.push('Rebooting: shut down this turn, then back to Speed Forme');
+  else if (form !== 'speed' && turnsLeft > 0) {
+    status.push(turnsLeft === 1 ? 'Last turn in this forme' : `${turnsLeft} turns left in this forme`);
+  }
+  if (form === 'defense' && !rebooting) status.push(droneCd > 0 ? `Drone recharging: ${droneCd}` : 'Drone ready');
+  if (temporalCd > 0) status.push(`Temporal Forme recharging: ${temporalCd}`);
   out.push({
-    id: 'mut_status',
-    name: `Mutations: ${gained}${gained >= FINAL_EVOLUTION_AT ? ' (max form)' : ''}`,
+    id: 'forme_status',
+    name: rebooting ? 'Rebooting' : `${info.icon} ${info.name}${form !== 'speed' && turnsLeft > 0 ? ` (${turnsLeft})` : ''}`,
     ready: true,
     passive: true,
-    hint:
-      (owned.length ? owned.map((id) => `${MUTATIONS[id]?.icon ?? ''} ${MUTATIONS[id]?.name ?? id}`).join(', ') : 'No mutations yet') +
-      (statusBits.length ? ` · ${statusBits.join(' · ')}` : '') +
-      ' · Mutates on each capture and each night survived.',
+    hint: `${rebooting ? '' : `${info.summary} ${info.perks.join(' ')}`}${status.length ? ` · ${status.join(' · ')}` : ''}`.replace(/^ · /, ''),
   });
 
-  const online = !protoLockedDown(piece) && (piece.disabledTurns ?? 0) <= 0;
-  const offlineHint = protoLockedDown(piece) ? 'Core Fracture: locked down this turn' : undefined;
-  const mobilityHint = protoMobilityLocked(piece) ? 'Instability — mobility mutations are locked this turn' : undefined;
-  const inReactor = state.reactorAction?.pieceId === piece.id;
+  if (state.bonusMove?.pieceId === piece.id) {
+    out.push({ id: 'bonus_end', name: 'End Bonus Move', ready: true, hint: 'Skip the Attack Forme bonus move and end your turn.' });
+    return out;
+  }
 
-  if (protoHas(piece, 'teleport_relay')) {
-    const cd = p?.teleportCooldown ?? 0;
+  const blocked = formeSwapBlocker(state, piece);
+  for (const f of FORME_ORDER) {
+    if (f === form) continue;
+    const next = FORMES[f];
+    const reason =
+      blocked ?? (f === 'temporal' && temporalCd > 0 ? `Temporal Forme recharging: ${temporalCd} more of your turns` : null);
     out.push({
-      id: 'teleport_relay',
-      name: cd > 0 ? `Teleport Relay (${cd})` : 'Teleport Relay',
-      ready: online && cd <= 0 && !protoMobilityLocked(piece) && prototypeAbilityOptions(state, piece, 'teleport_relay').length > 0,
-      hint: offlineHint ?? mobilityHint ?? (cd > 0 ? `Recharging: ${cd} more of your turns` : 'Teleport to an empty square within 4 tiles. Uses your turn.'),
+      id: `forme_${f}`,
+      name: `Swap: ${next.icon} ${next.name.replace(' Forme', '')}`,
+      ready: !reason,
+      hint:
+        reason ??
+        `${next.summary} ${next.perks.join(' ')} Free action: no Prototype can move this turn, then a ${FORME_SWAP_COOLDOWN}-turn cooldown.`,
     });
-  }
-  if (protoHas(piece, 'magnetic_leap')) {
-    out.push({
-      id: 'magnetic_leap',
-      name: 'Magnetic Leap',
-      ready: online && !protoMobilityLocked(piece) && prototypeAbilityOptions(state, piece, 'magnetic_leap').length > 0,
-      hint: offlineHint ?? mobilityHint ?? 'Pull yourself next to an enemy within 3 tiles (no capture). Uses your turn.',
-    });
-  }
-  if (protoHas(piece, 'quantum_drive')) {
-    const left = 1 - (p?.quantumUses ?? 0);
-    out.push({
-      id: 'quantum_drive',
-      name: `Quantum Drive (${Math.max(0, left)})`,
-      ready: online && left > 0 && !protoMobilityLocked(piece),
-      hint: offlineHint ?? mobilityHint ?? 'Blink to any empty square on the board. Uses your turn.',
-    });
-  }
-  if (protoHas(piece, 'emp_burst') && !inReactor) {
-    const cd = p?.empCooldown ?? 0;
-    out.push({
-      id: 'emp_burst',
-      name: cd > 0 ? `EMP Burst (${cd})` : 'EMP Burst',
-      ready: online && cd <= 0,
-      hint: offlineHint ?? (cd > 0 ? `Recharging: ${cd} more of your turns` : 'Disable enemy abilities within 2 tiles until your next turn. Uses your turn.'),
-    });
-  }
-  if (protoHas(piece, 'drone_launcher') && !p?.droneLaunched) {
-    out.push({
-      id: 'drone_launcher',
-      name: 'Drone Launcher',
-      ready: online && prototypeAbilityOptions(state, piece, 'drone_launcher').length > 0,
-      hint: offlineHint ?? 'Once: deploy a Drone on an adjacent empty square. Uses your turn.',
-    });
-  }
-  if (gained >= FINAL_EVOLUTION_AT && !p?.form && !inReactor) {
-    for (const form of Object.values(FINAL_FORMS)) {
-      out.push({
-        id: `form_${form.id}`,
-        name: `Evolve: ${form.icon} ${form.name}`,
-        ready: true,
-        hint: finalFormHint(form.id),
-      });
-    }
-  }
-  if (inReactor) {
-    out.push({ id: 'reactor_end', name: 'End Reactor Action', ready: true, hint: 'Skip the extra action and end your turn.' });
   }
   return out;
 }
 
-function chooseFinalForm(state: GameState, piece: PieceState, form: PrototypeForm): void {
-  const p = ensureProto(piece);
-  p.form = form;
-  if (form === 'fortress') p.bulwark = 1;
-  log(state, `The Prototype evolved into its ${FINAL_FORMS[form].icon} ${FINAL_FORMS[form].name} form!`);
-  abilityFx(state, 'final_evolution');
+/** End of `color`'s turn: count down Forme Swap, forme cooldowns, and timed formes. */
+function tickPrototypes(state: GameState, color: Color): void {
+  const player = state.players[color];
+  if ((player.formeSwapCooldown ?? 0) > 0) player.formeSwapCooldown = player.formeSwapCooldown! - 1;
+  for (const piece of state.pieces) {
+    if (piece.defId !== 'prototype' || piece.color !== color || !piece.proto) continue;
+    const p = piece.proto;
+    if (p.droneCooldown > 0) p.droneCooldown -= 1;
+    if (p.temporalCooldown > 0) p.temporalCooldown -= 1;
+    if (p.rebooting) {
+      p.rebooting = false;
+      p.form = 'speed';
+      p.formeTurns = undefined;
+      log(state, `${color} Prototype rebooted into ${FORMES.speed.name}`);
+      abilityFx(state, 'forme_speed');
+    } else if (p.form !== 'speed' && (p.formeTurns ?? 0) > 0) {
+      p.formeTurns = p.formeTurns! - 1;
+      if (p.formeTurns <= 0) {
+        p.rebooting = true;
+        log(state, `${color} Prototype's ${FORMES[p.form].name} ran out — it shuts down for a turn`);
+        abilityFx(state, 'forme_reboot');
+      }
+    }
+  }
 }
 
-function openPrototypePrompt(
-  state: GameState,
-  color: Color,
-  piece: PieceState,
-  abilityId: string,
-  options: Coord[],
-  message: string,
-  extra?: { skippable?: boolean; actorColor?: Color; resumeTurnPhase?: GameState['turnPhase'] },
-): void {
-  state.pendingPrompt = {
-    type: 'ability_target',
-    color,
-    pieceId: piece.id,
-    abilityId,
-    message,
-    options,
-    ...(extra?.skippable ? { skippable: true } : {}),
-    ...(extra?.actorColor ? { actorColor: extra.actorColor } : {}),
-    resumeTurnPhase: extra?.resumeTurnPhase ?? state.turnPhase,
-  };
+/** Defense Forme: an ally captured within reach is replaced by an Attack Drone on its starting square. */
+function defenseDroneResponse(state: GameState, victim: PieceState, byColor: Color): void {
+  if (victim.color === byColor || victim.class === 'king') return;
+  for (const proto of state.pieces) {
+    if (proto.defId !== 'prototype' || proto.color !== victim.color || activeForm(proto) !== 'defense') continue;
+    if ((proto.proto?.droneCooldown ?? 0) > 0 || chebyshev(proto.pos, victim.pos) > FORME_RADIUS) continue;
+    const spot = victim.startPos;
+    if (!spot || sameCoord(spot, victim.pos) || squareBlockedForDisplacement(state, spot)) continue;
+    state.pieces.push(makeDrone(state, proto, spot));
+    // The drone must not land giving check out of turn.
+    if (isInCheck(state, byColor)) {
+      state.pieces.pop();
+      continue;
+    }
+    ensureProto(proto).droneCooldown = FORME_FIELD_COOLDOWN;
+    log(state, `Defense Forme — an Attack Drone deploys on ${squareName(spot)}`);
+    abilityFx(state, 'defense_drone');
+    return;
+  }
 }
 
-/** Queue the next post-capture follow-up (Chain Assault, then Razor Limbs). Returns true if a prompt opened. */
-function nextPrototypeFollowup(state: GameState, piece: PieceState, color: Color): boolean {
-  const p = piece.proto;
-  if (!p || !state.pieces.some((x) => x.id === piece.id)) return false;
-  if (protoLockedDown(piece) || state.reactorAction) {
-    p.followup = undefined;
+/** Attack Forme: a capture earns one bonus Knight move with the same Prototype. */
+function offerAttackBonus(state: GameState, piece: PieceState, color: Color, tookPiece: boolean): boolean {
+  if (!tookPiece || state.bonusMove || state.phase !== 'playing' || state.pendingPrompt) return false;
+  if (piece.defId !== 'prototype' || activeForm(piece) !== 'attack') return false;
+  if (!state.pieces.some((p) => p.id === piece.id)) return false;
+  state.bonusMove = { color, pieceId: piece.id };
+  if (!listMoves(state, piece.id).length) {
+    state.bonusMove = undefined;
     return false;
   }
-  const f = p.followup ?? {
-    chainDone: false,
-    razorLeft: protoHas(piece, 'razor_limbs') ? 1 : 0,
-  };
-  p.followup = f;
-  if (!f.chainDone) {
-    f.chainDone = true;
-    if (protoHas(piece, 'chain_assault') && p.chainUses < 1) {
-      const opts = prototypeSafeOptions(state, piece, 'chain_assault');
-      if (opts.length) {
-        openPrototypePrompt(state, color, piece, 'chain_assault', opts, 'Chain Assault: capture an adjacent enemy (or Skip)', {
-          skippable: true,
-        });
-        return true;
-      }
-    }
-  }
-  while (f.razorLeft > 0) {
-    f.razorLeft -= 1;
-    const opts = prototypeSafeOptions(state, piece, 'razor_limbs');
-    if (opts.length) {
-      openPrototypePrompt(state, color, piece, 'razor_limbs', opts, 'Razor Limbs: move 1 square (no capture), or Skip', {
-        skippable: true,
-      });
-      return true;
-    }
-  }
-  p.followup = undefined;
-  return false;
+  state.turnPhase = 'move';
+  log(state, 'Attack Forme — the Prototype takes a bonus Knight move');
+  abilityFx(state, 'attack_bonus');
+  return true;
 }
 
-/** Reinforced Hull / Fortress Bulwark soaks a capture: the attacker stays put and the turn ends. */
-function absorbWithHull(state: GameState, color: Color, attacker: PieceState, target: PieceState): GameState {
-  const guard = spendCaptureGuard(state, target);
-  attacker.hasMoved = true;
-  state.lastMove = {
-    pieceId: attacker.id,
-    from: { ...attacker.pos },
-    to: { ...attacker.pos },
-    defId: attacker.defId,
-    color,
-  } as GameState['lastMove'];
-  log(state, `${guard} absorbed the ${getPieceDef(attacker.defId).name}'s attack!`);
-  return concludeAbilityTurn(state, color);
-}
-
-function finishPrototypeFollowup(state: GameState, color: Color, piece: PieceState): GameState {
-  if (nextPrototypeFollowup(state, piece, color)) return state;
-  return concludeAbilityTurn(state, color);
-}
-
-function resolvePrototypePrompt(state: GameState, color: Color, payload: unknown, skip: boolean): GameState {
-  const prompt = state.pendingPrompt;
-  if (!prompt || prompt.type !== 'ability_target') throw new Error('No prompt');
-  const piece = state.pieces.find((p) => p.id === prompt.pieceId);
-  const abilityId = prompt.abilityId;
-  state.pendingPrompt = null;
-
-  if (!piece) return concludeAbilityTurn(state, color);
-
-  if (abilityId === 'chain_assault' || abilityId === 'razor_limbs') {
-    if (!skip) {
-      const dest = payload as Coord;
-      if (!prompt.options?.some((o) => sameCoord(o, dest))) throw new Error('Pick a highlighted square');
-      if (abilityId === 'chain_assault') {
-        const victim = pieceAt(state, dest);
-        if (!victim || victim.color === color) throw new Error('No enemy there');
-        piece.proto!.chainUses += 1;
-        abilityFx(state, 'chain_assault');
-        if (hullProtects(piece, victim)) {
-          log(state, `${spendCaptureGuard(state, victim)} absorbed the Chain Assault!`);
-        } else if (!captureBestBuddyPair(state, dest, color)) {
-          const name = getPieceDef(victim.defId).name;
-          if (removePiece(state, victim, color, { overclock: overclocked(piece) })) {
-            log(state, `Chain Assault — ${name} captured`);
-            state.lastMove = {
-              pieceId: piece.id,
-              from: { ...piece.pos },
-              to: { ...piece.pos },
-              capturedId: victim.id,
-              defId: piece.defId,
-              color,
-            } as GameState['lastMove'];
-            gainMutation(state, piece, 'capture');
-          }
-        }
-        if (state.phase === 'ended') return state;
-      } else {
-        endBestBuddy(state, piece, piece.pos);
-        piece.pos = { ...dest };
-        snareInWeb(state, piece);
-        log(state, 'Razor Limbs — the Prototype repositions');
-        abilityFx(state, 'razor_limbs');
-      }
-    }
-    if (isInCheck(state, opposite(color))) {
-      piece.proto!.followup = undefined;
-      return concludeAbilityTurn(state, color);
-    }
-    return finishPrototypeFollowup(state, color, piece);
-  }
-
-  if (skip) {
-    const resume = prompt.resumeTurnPhase;
-    if (resume === 'spell' || resume === 'move') state.turnPhase = resume;
-    return state;
-  }
-  return finishPrototypeAbility(state, color, piece, abilityId, payload as Coord);
-}
-
-function finishPrototypeAbility(
-  state: GameState,
-  color: Color,
-  piece: PieceState,
-  abilityId: string,
-  to: Coord,
-): GameState {
-  const p = ensureProto(piece);
-  if (!prototypeSafeOptions(state, piece, abilityId).some((c) => sameCoord(c, to))) {
-    throw new Error('Pick a highlighted square');
-  }
-  if (abilityId === 'drone_launcher') {
-    state.pieces.push(makeDrone(piece, to, 'drone'));
-    p.droneLaunched = true;
-    log(state, 'Drone Launcher — a Drone deploys');
-    abilityFx(state, 'drone_launcher');
-    return concludeAbilityTurn(state, color);
-  }
-  const from = { ...piece.pos };
-  endBestBuddy(state, piece, piece.pos);
-  piece.pos = { ...to };
-  snareInWeb(state, piece);
-  if (abilityId === 'teleport_relay') {
-    p.teleportCooldown = 3;
-    log(state, 'Teleport Relay!');
-  } else if (abilityId === 'quantum_drive') {
-    p.quantumUses += 1;
-    log(state, 'Quantum Drive — the Prototype blinks across the board');
-  } else {
-    log(state, 'Magnetic Leap — the Prototype pulls itself in');
-  }
-  abilityFx(state, abilityId);
-  state.lastMove = { pieceId: piece.id, from, to: { ...piece.pos }, defId: piece.defId, color } as GameState['lastMove'];
-  return concludeAbilityTurn(state, color);
-}
-
-function finishEmpBurst(state: GameState, color: Color, piece: PieceState): GameState {
-  const p = ensureProto(piece);
-  p.empCooldown = 4;
-  let hit = 0;
-  for (const e of state.pieces) {
-    if (e.color === color || chebyshev(e.pos, piece.pos) > PROTO_EMP_RADIUS) continue;
-    if (shieldBlocks(state, e, color)) continue;
-    removeEffects(e, 'emp');
-    addEffect(e, { id: `emp_${e.id}`, kind: 'emp', data: { by: color } });
-    hit += 1;
-  }
-  log(state, `EMP Burst — ${hit} enemy piece${hit === 1 ? '' : 's'} disabled`);
-  abilityFx(state, 'emp_burst');
-  return concludeAbilityTurn(state, color);
-}
-
+/** A free Forme Swap can rescue a side from check (e.g. leaving Temporal Forme unfreezes blockers). */
 function prototypeAbilitySaves(state: GameState, color: Color): boolean {
   for (const piece of state.pieces) {
     if (piece.defId !== 'prototype' || piece.color !== color) continue;
     for (const a of prototypeAbilityList(state, piece)) {
-      if (!a.ready || !PROTO_MOVE_ABILITIES.has(a.id)) continue;
-      if (hasEffect(piece, 'emp')) continue;
-      if (prototypeSafeOptions(state, piece, a.id).length) return true;
+      if (!a.ready || a.id === 'forme_status' || !a.id.startsWith('forme_')) continue;
+      const trial = cloneState(state);
+      const tp = trial.pieces.find((p) => p.id === piece.id)!;
+      swapForme(trial, color, tp, a.id.slice('forme_'.length) as PrototypeForm);
+      if (hasLegalBoardMoves(trial, color)) return true;
     }
   }
   return false;
@@ -2347,6 +2008,35 @@ function moveAbilityFxId(
   return null;
 }
 
+/** Board square in Chesspansion notation: files a–j left to right, ranks 1–10 from White's side. */
+export function squareName(pos: Coord): string {
+  return `${'abcdefghij'[pos.col] ?? '?'}${10 - pos.row}`;
+}
+
+function describeMove(
+  color: Color,
+  piece: PieceState,
+  from: Coord,
+  target: Coord,
+  special: string | undefined,
+  captured: PieceState | undefined,
+): string {
+  const name = getPieceDef(piece.defId).name;
+  const victim = captured ? `${captured.color} ${getPieceDef(captured.defId).name}` : null;
+  if (special === 'death_stare' || special === 'archer_shot') {
+    const verb = special === 'archer_shot' ? 'shot' : 'stared down';
+    return victim
+      ? `${color} ${name} ${squareName(from)} ${verb} ${victim} on ${squareName(target)}`
+      : `${color} ${name} ${squareName(from)} ${verb} ${squareName(target)}`;
+  }
+  const label = special ? ` (${special.replace(/_/g, ' ')})` : '';
+  const takes = victim ? `, takes ${victim}` : '';
+  if (sameCoord(from, piece.pos)) {
+    return `${color} ${name} on ${squareName(from)} used ${special ? special.replace(/_/g, ' ') : 'its move'}${takes}`;
+  }
+  return `${color} ${name} ${squareName(from)} → ${squareName(piece.pos)}${takes}${label}`;
+}
+
 export function applyMove(
   state: GameState,
   color: Color,
@@ -2403,11 +2093,6 @@ export function applyMove(
     }
   }
 
-  if (!move.special || move.special === 'death_stare' || move.special === 'archer_shot') {
-    const struck = pieceAt(next, to);
-    if (struck && hullProtects(piece, struck)) return absorbWithHull(next, color, piece, struck);
-  }
-
   // cancel recall if moves
   if (hasEffect(piece, 'recall')) removeEffects(piece, 'recall');
   // enchant fails if moves
@@ -2429,6 +2114,7 @@ export function applyMove(
   next.tokens = next.tokens.filter((t) => !(t.kind === 'blink' && sameCoord(t.pos, to)));
 
   let captured: PieceState | undefined;
+  let tookPiece = false;
 
   if (move.special === 'castle_swap' && move.meta?.withId) {
     const other = next.pieces.find((p) => p.id === move.meta!.withId)!;
@@ -2493,9 +2179,7 @@ export function applyMove(
         victims.push(occ);
       }
     }
-    for (const v of victims) {
-      if (!shieldBlocks(next, v, color)) removePiece(next, v, color);
-    }
+    for (const v of victims) removePiece(next, v, color);
     piece.gigaStompUsed = true;
     log(next, 'Giga Stomp!');
   } else if (move.special === 'portal_travel') {
@@ -2508,6 +2192,7 @@ export function applyMove(
     // Capturing a Best Buddy square removes pig + host and grants bonus turns
     if (captureBestBuddyPair(next, to, color)) {
       captured = undefined;
+      tookPiece = true;
     }
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     piece.pos = { ...to };
@@ -2528,22 +2213,20 @@ export function applyMove(
     }
   }
 
-  const overclock = overclocked(piece);
-  let protoCaptured = false;
+  log(next, describeMove(color, piece, from, to, move.special, captured && captured.color !== color ? captured : undefined));
+
   if (captured && captured.color !== color) {
-    if (yetiBlocksPawnCapture(piece, captured)) {
-      throw new Error('Yeti cannot be captured by pawns');
-    }
+    tookPiece = true;
     // fortify vs pawn/knight
-    if (!overclock && hasEffect(captured, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) {
+    if (hasEffect(captured, 'fortify') && (piece.class === 'pawn' || piece.class === 'knight')) {
       throw new Error('Target is fortified against pawns/knights');
     }
-    if (!overclock && (hasEffect(captured, 'invincible') || hasEffect(captured, 'pause'))) {
+    if (hasEffect(captured, 'invincible') || hasEffect(captured, 'pause')) {
       throw new Error('Target is invincible');
     }
 
     // ScamMan fraud
-    if (captured.defId === 'scamman' && piece.class !== 'pawn' && !overclock) {
+    if (captured.defId === 'scamman' && piece.class !== 'pawn') {
       piece.defId = 'pawn';
       piece.class = 'pawn';
       log(next, `${piece.id} was fleeced into a pawn!`);
@@ -2569,7 +2252,7 @@ export function applyMove(
       captured = undefined;
     } else {
       const victimSnapshot = { ...captured };
-      protoCaptured = removePiece(next, captured, color, { overclock });
+      removePiece(next, captured, color);
       if (victimSnapshot.class === 'king' && isInCheck(next, color)) {
         throw new Error('Cannot capture the king while remaining in check');
       }
@@ -2613,8 +2296,7 @@ export function applyMove(
       if (
         victimSnapshot.defId === 'spider' &&
         !isAlliedTerritory(victimSnapshot.color, victimSnapshot.pos) &&
-        !immuneToWeb(piece) &&
-        !overclock
+        !immuneToWeb(piece)
       ) {
         addEffect(piece, {
           id: `web_${piece.id}_${Date.now()}`,
@@ -2683,8 +2365,6 @@ export function applyMove(
     }
   }
 
-  if (protoCaptured && piece.defId === 'prototype') gainMutation(next, piece, 'capture');
-
   // Prince & Princess mirror
   if (piece.defId === 'prince_princess' && piece.linkedPieceId) {
     const other = next.pieces.find((p) => p.id === piece.linkedPieceId);
@@ -2696,9 +2376,7 @@ export function applyMove(
       if (!inBounds(mirror)) throw new Error('Mirror move illegal');
       const occ = pieceAt(next, mirror);
       if (occ && occ.color === color) throw new Error('Mirror blocked');
-      if (occ && occ.color !== color && !removePiece(next, occ, color)) {
-        throw new Error('Mirror blocked by Reinforced Hull');
-      }
+      if (occ && occ.color !== color) removePiece(next, occ, color);
       other.pos = mirror;
       abilityFx(next, 'dance_of_romance');
       snareInWeb(next, other);
@@ -2745,10 +2423,10 @@ export function applyMove(
     piece.defId === 'snail' &&
     next.pieces.some((p) => p.id === piece.id)
   ) {
-    piece.charges = Math.max(0, (piece.charges ?? 8) - 1);
+    piece.charges = Math.max(0, (piece.charges ?? 5) - 1);
     if ((piece.charges ?? 0) <= 0) {
       addEffect(piece, { id: `snail_imm_${piece.id}`, kind: 'immobilized' });
-      log(next, 'The Snail has used all 8 tiles and is immobilized');
+      log(next, 'The Snail has used all 5 tiles and is immobilized');
       abilityFx(next, 'snail_exhausted');
     }
   }
@@ -2785,17 +2463,6 @@ export function applyMove(
 
   retireSpidersAtFarEdge(next);
 
-  if (
-    protoCaptured &&
-    piece.defId === 'prototype' &&
-    next.phase === 'playing' &&
-    !isInCheck(next, color) &&
-    !isInCheck(next, opposite(color))
-  ) {
-    if (piece.proto) piece.proto.followup = undefined;
-    if (nextPrototypeFollowup(next, piece, color)) return next;
-  }
-
   // Promotion
   const promoteRow = color === 'white' ? 0 : BOARD_SIZE - 1;
   if (
@@ -2819,6 +2486,8 @@ export function applyMove(
     log(next, `${enemy} is in check — turn ends immediately`);
     return endTurn(next, color, true);
   }
+
+  if (offerAttackBonus(next, piece, color, tookPiece)) return next;
 
   return endTurn(next, color, false);
 }
@@ -2851,17 +2520,7 @@ function retireSpidersAtFarEdge(state: GameState): void {
   }
 }
 
-/** Returns false when the piece survived (Reinforced Hull). */
-function removePiece(state: GameState, piece: PieceState, byColor: Color, opts?: { overclock?: boolean }): boolean {
-  if (
-    piece.defId === 'prototype' &&
-    byColor !== piece.color &&
-    !opts?.overclock &&
-    hullProtects(undefined, piece)
-  ) {
-    log(state, `${spendCaptureGuard(state, piece)} absorbed a lethal blow!`);
-    return false;
-  }
+function removePiece(state: GameState, piece: PieceState, byColor: Color): void {
   endBestBuddy(state, piece, piece.pos);
   for (const p of state.pieces) {
     if (p.coOccupantId === piece.id) p.coOccupantId = undefined;
@@ -2893,27 +2552,20 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color, opts?:
     }
   }
 
-  if (piece.defId === 'prototype' && protoHas(piece, 'backup_core') && !opts?.overclock) {
-    const spot = pieceAt(state, piece.pos) ? nearestEmptyAround(state, piece.pos) : { ...piece.pos };
-    if (spot) {
-      state.pieces.push(makeDrone(piece, spot, 'backup_drone'));
-      log(state, 'Backup Core — a Backup Drone boots up');
-      abilityFx(state, 'backup_core');
-    }
-  }
-
   // win check
   if (piece.class === 'king') {
     state.phase = 'ended';
     state.winner = byColor;
     state.winReason = 'King captured';
+    return;
   }
+  defenseDroneResponse(state, piece, byColor);
   void isAlliedTerritory;
-  return true;
 }
 
 /**
- * If a Best Buddy pair shares `at`, remove both and grant the Pig's owner 3 bonus turns.
+ * If a Best Buddy pair shares `at`, the Pig falls in the host's place: the host is displaced to the
+ * nearest adjacent empty tile (or falls too if boxed in) and the Pig's owner gains 2 bonus turns.
  * Returns true when a pair was resolved (caller should not also remove a single capture).
  */
 function captureBestBuddyPair(state: GameState, at: Coord, byColor: Color): boolean {
@@ -2949,12 +2601,36 @@ function captureBestBuddyPair(state: GameState, at: Coord, byColor: Color): bool
 
   const pigOwner = pig.color;
   removePiece(state, pig, byColor);
+  state.players[pigOwner].bonusTurns = (state.players[pigOwner].bonusTurns ?? 0) + 2;
   // Host may already be gone if pig removal cascaded somehow; re-find
   const stillHost = state.pieces.find((p) => p.id === host!.id);
-  if (stillHost) removePiece(state, stillHost, byColor);
-
-  state.players[pigOwner].bonusTurns = (state.players[pigOwner].bonusTurns ?? 0) + 3;
-  log(state, `Best Buddy pair captured — both fall (${pigOwner} gains +3 bonus turns)`);
+  if (!stillHost) {
+    log(state, `Best Buddy — the Pig fell (${pigOwner} gains +2 bonus turns)`);
+    return true;
+  }
+  stillHost.coOccupantId = undefined;
+  const spots: Coord[] = [];
+  for (let dr = -1; dr <= 1; dr++) {
+    for (let dc = -1; dc <= 1; dc++) {
+      const spot = { row: at.row + dr, col: at.col + dc };
+      if ((dr || dc) && inBounds(spot) && !squareBlockedForDisplacement(state, spot)) spots.push(spot);
+    }
+  }
+  // Prefer a tile where the shoved host doesn't check the capturer out of turn.
+  const safe = spots.find((spot) => {
+    stillHost.pos = spot;
+    const checks = isInCheck(state, byColor);
+    stillHost.pos = { ...at };
+    return !checks;
+  });
+  const dest = safe ?? spots[0];
+  if (dest) {
+    stillHost.pos = { ...dest };
+    log(state, `Best Buddy — the Pig took the hit; ${getPieceDef(stillHost.defId).name} was shoved aside (${pigOwner} gains +2 bonus turns)`);
+  } else {
+    removePiece(state, stillHost, byColor);
+    log(state, `Best Buddy — boxed in, both fall (${pigOwner} gains +2 bonus turns)`);
+  }
   return true;
 }
 
@@ -2999,24 +2675,12 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
 
   // Cannot cast abilities on enemy king — enforced per-card
 
-  if (next.reactorAction) throw new Error('Spells cannot be cast during a Reactor action');
+  if (next.bonusMove) throw new Error('Spells cannot be cast during a bonus move');
 
   const rng = mulberry32(next.rngSeed + next.turnCount * 31);
-  const beforePlay = cloneState(next);
   const result = def.play({ state: next, player: color, card, rng }, targets);
   // Cards may replace the whole board (e.g. Rewind) — always honor returned state
-  let out = result.state;
-  if (result.done) {
-    const shielded = targets
-      .filter((t): t is string => typeof t === 'string')
-      .map((id) => beforePlay.pieces.find((p) => p.id === id))
-      .find((p) => protoWarded(p, color));
-    if (shielded) {
-      out = beforePlay;
-      if (out.pendingPrompt?.type === 'card_target') out.pendingPrompt = null;
-      shieldBlocks(out, shielded, color);
-    }
-  }
+  const out = result.state;
 
   if (!result.done) {
     if (!out.pendingPrompt) {
@@ -3074,9 +2738,6 @@ export function cancelPrompt(state: GameState, color: Color): GameState {
     throw new Error('This choice cannot be canceled');
   }
   const next = cloneState(state);
-  if (prompt.type === 'ability_target' && prompt.skippable) {
-    return resolvePrototypePrompt(next, color, null, true);
-  }
   const resume = prompt.resumeTurnPhase;
   next.pendingPrompt = null;
   if (resume === 'spell' || resume === 'move') next.turnPhase = resume;
@@ -3157,6 +2818,20 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     return next;
   }
 
+  if (prompt.type === 'law_choice') {
+    if (prompt.color !== color) throw new Error('Not your prompt');
+    if (payload === null || payload === 'skip') {
+      next.pendingPrompt = null;
+      log(next, `${color} President declined to enact a law this cycle`);
+      return next;
+    }
+    const lawId = payload as string;
+    if (!prompt.options.includes(lawId)) throw new Error('Choose one of the offered laws');
+    next.pendingPrompt = null;
+    enactLaw(next, color, lawId);
+    return next;
+  }
+
   if (prompt.type === 'gadget_choice') {
     if (prompt.color !== color) throw new Error('Not your prompt');
     const data = payload as { kind: string; pos: Coord };
@@ -3166,11 +2841,6 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
 
   if (prompt.type === 'ability_target') {
     if (prompt.color !== color) throw new Error('Not your prompt');
-    if (PROTO_FOLLOWUPS.has(prompt.abilityId) || PROTO_MOVE_ABILITIES.has(prompt.abilityId)) {
-      const skip = payload === null || payload === 'skip';
-      if (skip && !prompt.skippable) throw new Error('Pick a highlighted square');
-      return resolvePrototypePrompt(next, color, payload, skip);
-    }
     if (prompt.abilityId === 'enchant') {
       next.pendingPrompt = null;
       return finishWizardEnchant(next, color, prompt.pieceId, payload as string);
@@ -3201,10 +2871,6 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (prompt.abilityId === 'temporal_shift') {
       next.pendingPrompt = null;
       return finishTemporalShift(next, color, prompt.pieceId, payload as 'skip' | 'revert');
-    }
-    if (prompt.abilityId === 'chrono_recall') {
-      next.pendingPrompt = null;
-      return finishChronoRecall(next, color, prompt.pieceId, payload as string);
     }
     if (prompt.abilityId === 'ultimate_suck') {
       if (typeof payload === 'string') {
@@ -3442,8 +3108,7 @@ function applyGambler(
 function gadgetCannotCapture(occ: PieceState): boolean {
   return (
     occ.class === 'king' ||
-    Boolean(hasEffect(occ, 'invincible') || hasEffect(occ, 'pause')) ||
-    hullProtects(undefined, occ)
+    Boolean(hasEffect(occ, 'invincible') || hasEffect(occ, 'pause'))
   );
 }
 
@@ -3718,17 +3383,7 @@ function hasEscapeFromCheck(state: GameState, color: Color): boolean {
 export function endTurn(state: GameState, color: Color, fromCheck: boolean): GameState {
   retireSpidersAtFarEdge(state);
   const next = state;
-  const finishingReactor = next.reactorAction?.color === color;
-  next.reactorAction = undefined;
-  if (
-    !finishingReactor &&
-    !fromCheck &&
-    next.phase === 'playing' &&
-    !next.pendingPrompt &&
-    triggerAdaptiveReactor(next, color)
-  ) {
-    return next;
-  }
+  next.bonusMove = undefined;
   tickEffectsOnTurnEnd(next, color);
 
   next.players[color].spellsThisTurn = 0;
@@ -3762,7 +3417,6 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
       flipDayNight(next, true);
     }
   }
-  reactivePlatingKnockback(next, color);
   tickPrototypes(next, color);
 
   let nextColor = opposite(color);
@@ -3783,8 +3437,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
 
   next.turn = nextColor;
   next.turnPhase = spellsUnlocked(next) && !isMagicDisabled(next, nextColor) ? 'spell' : 'move';
-  next.players[nextColor].maxSpellsThisTurn = 1;
-  startPrototypeTurn(next, nextColor);
+  next.players[nextColor].maxSpellsThisTurn = lawActive(next, 'arcane_subsidy') ? 2 : 1;
 
   pushSnapshot(next);
 

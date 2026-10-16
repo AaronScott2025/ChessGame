@@ -85,6 +85,29 @@ function wormBurrowFromAlly(
   return out;
 }
 
+/** First Burrow ally: rays up to `orth` tiles orthogonally and `diag` tiles diagonally (clear path). */
+function wormBurrowRays(
+  state: GameState,
+  ally: PieceState,
+  piece: PieceState,
+  orth: number,
+  diag: number,
+): NonNullable<ReturnType<typeof emptyOrEnemy>>[] {
+  const out: NonNullable<ReturnType<typeof emptyOrEnemy>>[] = [];
+  for (const [dirs, range] of [[ORTH, orth], [DIAG, diag]] as const) {
+    for (const d of dirs) {
+      for (let i = 1; i <= range; i++) {
+        const dest = { row: ally.pos.row + d.row * i, col: ally.pos.col + d.col * i };
+        if (!inBounds(dest) || sameCoord(dest, piece.pos)) break;
+        const opt = emptyOrEnemy(state, dest, piece.color, piece);
+        if (opt) out.push(opt);
+        if (!opt || opt.capture) break;
+      }
+    }
+  }
+  return out;
+}
+
 function wormAlliesBeside(state: GameState, pos: Coord, piece: PieceState): PieceState[] {
   const allies: PieceState[] = [];
   for (const d of ALL8) {
@@ -101,17 +124,17 @@ function wormAllyIsAhead(piece: PieceState, landing: Coord, ally: PieceState): b
 }
 
 /**
- * 2 orthogonal, then Burrow: up to 1 from the first ally, then 1 from each
- * further ally that sits ahead of a square you can already reach.
+ * 2 orthogonal, then Burrow: from the first ally, up to 1 orthogonally or 2 diagonally;
+ * then 1 from each further ally that sits ahead of a square you can already reach.
  */
 function wormMoves(piece: PieceState, state: GameState): MoveOption[] {
-  const hop = 2 + movementBonus(piece);
-  const firstRadius = 1 + movementBonus(piece);
-  const chainRadius = 1 + movementBonus(piece);
+  const bonus = movementBonus(piece);
+  const hop = 2 + bonus;
+  const chainRadius = 1 + bonus;
   const moves: NonNullable<ReturnType<typeof emptyOrEnemy>>[] = [];
   const seenLand = new Set<string>();
   const usedAllies = new Set<string>();
-  const allyQ: Array<{ ally: PieceState; radius: number }> = [];
+  const allyQ: Array<{ ally: PieceState; first: boolean }> = [];
 
   const addMove = (opt: NonNullable<ReturnType<typeof emptyOrEnemy>>) => {
     const k = coordKey(opt.to);
@@ -121,15 +144,15 @@ function wormMoves(piece: PieceState, state: GameState): MoveOption[] {
     return true;
   };
 
-  const enqueueAlly = (ally: PieceState, radius: number) => {
+  const enqueueAlly = (ally: PieceState, first: boolean) => {
     if (usedAllies.has(ally.id)) return;
     usedAllies.add(ally.id);
-    allyQ.push({ ally, radius });
+    allyQ.push({ ally, first });
   };
 
-  const chainFromLanding = (landing: Coord, radius: number) => {
+  const chainFromLanding = (landing: Coord, first: boolean) => {
     for (const ally of wormAlliesBeside(state, landing, piece)) {
-      if (wormAllyIsAhead(piece, landing, ally)) enqueueAlly(ally, radius);
+      if (wormAllyIsAhead(piece, landing, ally)) enqueueAlly(ally, first);
     }
   };
 
@@ -139,24 +162,23 @@ function wormMoves(piece: PieceState, state: GameState): MoveOption[] {
     const opt = emptyOrEnemy(state, dest, piece.color, piece);
     if (!opt) continue;
     addMove(opt);
-    if (!opt.capture) chainFromLanding(dest, firstRadius);
+    if (!opt.capture) chainFromLanding(dest, true);
   }
 
   while (allyQ.length) {
-    const { ally, radius } = allyQ.shift()!;
-    const nextRadius = chainRadius;
-    for (const opt of wormBurrowFromAlly(state, ally, piece, radius)) {
+    const { ally, first } = allyQ.shift()!;
+    const reach = first
+      ? wormBurrowRays(state, ally, piece, 1 + bonus, 2 + bonus)
+      : wormBurrowFromAlly(state, ally, piece, chainRadius);
+    for (const opt of reach) {
       addMove(opt);
-      if (!opt.capture) chainFromLanding(opt.to, nextRadius);
+      if (!opt.capture) chainFromLanding(opt.to, false);
     }
   }
 
   return moves;
 }
 
-function dayOnly(_p: PieceState, state: GameState) {
-  return state.dayNight === 'day';
-}
 function nightOnly(_p: PieceState, state: GameState) {
   return state.dayNight === 'night';
 }
@@ -167,7 +189,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Pawn',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, false)),
   },
   nwap: {
@@ -220,7 +242,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Leapfrog',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president'],
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
@@ -355,7 +377,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Gnome',
     class: 'rook',
     symbol: '♜',
-    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ORTH, 2)),
+    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, ORTH, 3)),
   },
   crocodile: {
     id: 'crocodile',
@@ -370,7 +392,10 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'rook',
     symbol: '♜',
     getMoves: (p, s) => {
-      const moves = filterLegal(p, s, rayMoves(p, s, ORTH, 1));
+      const moves = filterLegal(p, s, [
+        ...rayMoves(p, s, ORTH.filter((d) => d.row === 0), 3),
+        ...rayMoves(p, s, ORTH.filter((d) => d.col === 0), 2),
+      ]);
       if (!p.gigaStompUsed) {
         const stomps: MoveOption[] = [];
         for (const d of ALL8) {
@@ -414,8 +439,8 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Pig',
     class: 'knight',
     symbol: '♞',
-    canAct: dayOnly,
     getMoves: (p, s) => {
+      if (s.dayNight === 'night') return filterLegal(p, s, areaMoves(p, s, 1));
       const moves = knightMoves(p, s, 2, 1, false, true);
       // Best Buddy: only allies on the Pig’s normal L landings (same path rules as movement)
       for (const to of knightTargetCoords(p, s, 2, 1, false, true)) {
@@ -461,7 +486,7 @@ export const PIECES: Record<string, PieceDefinition> = {
           return filterLegal(p, s, copied);
         }
       }
-      return filterLegal(p, s, rayMoves(p, s, DIAG, 1));
+      return filterLegal(p, s, rayMoves(p, s, DIAG, 3));
     },
   },
   wizard: {
@@ -469,7 +494,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Wizard',
     class: 'bishop',
     symbol: '♝',
-    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, DIAG, 2)),
+    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, DIAG, 3)),
   },
   worm: {
     id: 'worm',
@@ -557,7 +582,7 @@ export const PIECES: Record<string, PieceDefinition> = {
   snail: {
     id: 'snail',
     name: 'Snail',
-    class: 'queen',
+    class: 'wildcard',
     symbol: '♛',
     getMoves: (p, s) => {
       if (p.defId === 'snail' && (p.charges ?? 0) <= 0) return [];
@@ -575,6 +600,13 @@ export const PIECES: Record<string, PieceDefinition> = {
       }
       return filterLegal(p, s, areaMoves(p, s, vampireNightRadius(p.charges ?? 0)));
     },
+  },
+  president: {
+    id: 'president',
+    name: 'President',
+    class: 'queen',
+    symbol: '♛',
+    getMoves: (p, s) => filterLegal(p, s, areaMoves(p, s, 1)),
   },
   prince_princess: {
     id: 'prince_princess',
@@ -595,7 +627,13 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'wildcard',
     symbol: '♟',
     canAct: nightOnly,
-    getMoves: (p, s) => filterLegal(p, s, areaMoves(p, s, 1)),
+    getMoves: (p, s) => {
+      const moves = areaMoves(p, s, 1);
+      for (const m of rayMoves(p, s, ORTH.filter((d) => d.col === 0), 2)) {
+        if (!moves.some((x) => sameCoord(x.to, m.to))) moves.push(m);
+      }
+      return filterLegal(p, s, moves);
+    },
     onCapture: (attacker, victim, state) => {
       // convert victim
       victim.color = attacker.color;
@@ -657,17 +695,10 @@ export const PIECES: Record<string, PieceDefinition> = {
   },
   drone: {
     id: 'drone',
-    name: 'Drone',
+    name: 'Attack Drone',
     class: 'wildcard',
     symbol: '♟',
     getMoves: (p, s) => droneMoves(p, s),
-  },
-  backup_drone: {
-    id: 'backup_drone',
-    name: 'Backup Drone',
-    class: 'wildcard',
-    symbol: '♟',
-    getMoves: (p, s) => filterLegal(p, s, areaMoves(p, s, 1)),
   },
   timekeeper: {
     id: 'timekeeper',
@@ -704,8 +735,8 @@ export const VARIANTS_BY_CLASS: Record<string, string[]> = {
   rook: ['rook', 'stoneman', 'gnome', 'yeti', 'crocodile'],
   knight: ['horse', 'snake', 'pig', 'archer'],
   bishop: ['bishop', 'scamman', 'wizard', 'worm'],
-  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype'],
-  queen: ['queen', 'angel', 'ghost', 'reaper', 'snail', 'vampire', 'spider_queen'],
+  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype', 'snail'],
+  queen: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president'],
   king: ['king'],
 };
 

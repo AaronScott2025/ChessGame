@@ -1603,15 +1603,10 @@ const ABILITY_SFX: Record<string, FxLayer[]> = {
     tone('sine', 1568, 0.4, { to: 784, v: 0.08, vib: [9, 30] }),
     noise('bandpass', 2500, 0.3, { q: 4, v: 0.06 }),
   ],
-  // TimeKeeper — clock ticks into a warp; recall is a rewind sweep
+  // TimeKeeper — clock ticks into a warp
   temporal_shift: [
     ...[0, 0.14, 0.28, 0.42].map((at, i) => tone('square', i % 2 ? 1500 : 2000, 0.03, { at, v: 0.07 })),
     tone('sine', 300, 0.55, { to: 1200, at: 0.1, v: 0.09, vib: [7, 25] }),
-  ],
-  chrono_recall: [
-    tone('sawtooth', 1800, 0.45, { to: 180, v: 0.05 }),
-    noise('bandpass', 600, 0.45, { to: 4000, q: 1.5, a: 0.38, v: 0.12 }),
-    tone('sine', 440, 0.12, { to: 880, at: 0.42, v: 0.08 }),
   ],
   // Crocodile — vacuum inhale, launch, chomp
   ultimate_suck: [
@@ -1753,103 +1748,64 @@ const ABILITY_SFX: Record<string, FxLayer[]> = {
     tone('triangle', 622, 0.35, { at: 0.3, v: 0.08 }),
     tone('triangle', 523, 0.7, { to: 440, at: 0.6, v: 0.08, vib: [5, 6] }),
   ],
+  // President — three gavel raps call the session, then a brass fanfare when the law passes
+  president_session: [
+    ...[0, 0.2, 0.4].map((at) => noise('lowpass', 900, 0.06, { at, v: 0.2 })),
+    ...[0, 0.2, 0.4].map((at) => tone('sine', 190, 0.12, { to: 120, at, v: 0.12 })),
+  ],
+  president_law: [
+    noise('lowpass', 1100, 0.07, { v: 0.22 }),
+    tone('sine', 170, 0.16, { to: 100, v: 0.14 }),
+    tone('sawtooth', 392, 0.16, { at: 0.16, v: 0.05 }),
+    tone('sawtooth', 523, 0.16, { at: 0.3, v: 0.05 }),
+    tone('sawtooth', 659, 0.5, { at: 0.44, v: 0.05, vib: [5, 4] }),
+    tone('sawtooth', 523, 0.5, { at: 0.44, v: 0.035 }),
+    tone('triangle', 784, 0.5, { at: 0.44, v: 0.04 }),
+  ],
   // Gambler — dice rattle and a ding
   lucky_draw: [
     ...[0, 0.05, 0.11, 0.16, 0.24, 0.3].map((at) => noise('bandpass', 2400, 0.025, { at, q: 3, v: 0.12 })),
     tone('square', 1047, 0.12, { at: 0.38, v: 0.06 }),
     tone('square', 1568, 0.25, { at: 0.47, v: 0.06 }),
   ],
-  // Prototype — servo whines, data chirps, and an angry machine growl
-  mutation: [
-    tone('sawtooth', 110, 0.5, { to: 220, v: 0.08, vib: [30, 15] }),
-    ...[0.1, 0.16, 0.22, 0.28].map((at, i) => tone('square', 1400 + i * 300, 0.04, { at, v: 0.05 })),
-    tone('square', 440, 0.3, { to: 880, at: 0.34, v: 0.07 }),
-    noise('bandpass', 1800, 0.25, { to: 5000, at: 0.32, q: 3, v: 0.08 }),
+  // Prototype — a servo shift into each forme, then that forme's signature
+  forme_speed: [
+    ...[0, 0.06].map((at) => tone('square', 900, 0.04, { at, v: 0.05 })),
+    tone('sine', 300, 0.3, { to: 2400, at: 0.1, v: 0.1, vib: [40, 80] }),
+    noise('highpass', 3000, 0.3, { to: 9000, at: 0.1, v: 0.07 }),
   ],
-  mutation_unstable: [
-    tone('sawtooth', 180, 0.6, { to: 70, v: 0.1, vib: [17, 40] }),
-    ...[0, 0.12, 0.24].map((at) => noise('highpass', 3500, 0.05, { at, v: 0.14 })),
-    tone('square', 600, 0.08, { at: 0.36, v: 0.06 }),
-    tone('square', 300, 0.25, { at: 0.44, to: 150, v: 0.06 }),
+  forme_attack: [
+    ...[0, 0.06].map((at) => tone('square', 900, 0.04, { at, v: 0.05 })),
+    tone('sawtooth', 110, 0.45, { to: 220, at: 0.1, v: 0.09, vib: [30, 15] }),
+    noise('highpass', 5000, 0.12, { to: 9000, at: 0.3, v: 0.14 }),
   ],
-  final_evolution_ready: [
-    tone('square', 880, 0.1, { v: 0.06 }),
-    tone('square', 880, 0.1, { at: 0.18, v: 0.06 }),
-    tone('square', 1320, 0.25, { at: 0.36, v: 0.07 }),
+  forme_defense: [
+    ...[0, 0.06].map((at) => tone('square', 900, 0.04, { at, v: 0.05 })),
+    tone('triangle', 180, 0.5, { to: 120, at: 0.1, v: 0.16 }),
+    tone('sine', 1100, 0.6, { at: 0.1, v: 0.07, vib: [7, 12] }),
+    noise('bandpass', 2500, 0.12, { at: 0.1, q: 5, v: 0.14 }),
   ],
-  final_evolution: [
-    tone('sawtooth', 55, 1.1, { to: 220, a: 0.5, v: 0.14, vib: [8, 6] }),
-    tone('sawtooth', 82, 1.1, { to: 330, a: 0.5, v: 0.1 }),
-    noise('lowpass', 300, 1.0, { to: 6000, a: 0.8, v: 0.12 }),
-    tone('square', 1760, 0.5, { at: 0.9, to: 2637, v: 0.06 }),
-    noise('lowpass', 800, 0.3, { at: 1.0, v: 0.16 }),
+  forme_temporal: [
+    ...[0, 0.06].map((at) => tone('square', 900, 0.04, { at, v: 0.05 })),
+    tone('sine', 1200, 0.6, { to: 80, at: 0.1, v: 0.1, vib: [24, 200] }),
+    tone('sine', 660, 0.9, { at: 0.2, v: 0.05, vib: [3, 20] }),
+    ...[0.35, 0.6, 0.85].map((at) => noise('bandpass', 2400, 0.03, { at, q: 6, v: 0.1 })),
   ],
-  razor_limbs: [
-    noise('highpass', 5000, 0.12, { to: 9000, v: 0.16 }),
-    tone('sawtooth', 2400, 0.12, { to: 900, at: 0.02, v: 0.05 }),
-    noise('highpass', 6000, 0.1, { at: 0.12, v: 0.12 }),
+  forme_reboot: [
+    tone('sawtooth', 440, 0.7, { to: 55, v: 0.09 }),
+    noise('lowpass', 1500, 0.5, { to: 150, at: 0.1, v: 0.1 }),
+    tone('square', 220, 0.06, { at: 0.75, v: 0.04 }),
   ],
-  chain_assault: [
+  attack_bonus: [
     noise('bandpass', 2000, 0.08, { q: 2, v: 0.16 }),
     noise('bandpass', 2400, 0.08, { at: 0.1, q: 2, v: 0.16 }),
-    tone('square', 160, 0.2, { to: 50, at: 0.18, v: 0.14 }),
-    noise('lowpass', 700, 0.15, { at: 0.18, v: 0.16 }),
+    tone('square', 440, 0.2, { to: 880, at: 0.18, v: 0.07 }),
   ],
-  teleport_relay: [
-    tone('sine', 300, 0.3, { to: 2400, v: 0.1, vib: [40, 80] }),
-    noise('bandpass', 3000, 0.3, { q: 6, v: 0.07 }),
-    tone('sine', 2400, 0.25, { to: 400, at: 0.3, v: 0.08 }),
-  ],
-  magnetic_leap: [
-    tone('sawtooth', 60, 0.5, { to: 180, a: 0.3, v: 0.1, vib: [50, 20] }),
-    tone('sine', 400, 0.3, { to: 1200, at: 0.3, v: 0.08 }),
-    noise('lowpass', 500, 0.08, { at: 0.55, v: 0.14 }),
-  ],
-  quantum_drive: [
-    tone('sine', 1200, 0.5, { to: 80, v: 0.1, vib: [24, 200] }),
-    noise('highpass', 2000, 0.4, { to: 10000, v: 0.08 }),
-    tone('sine', 80, 0.4, { to: 1600, at: 0.45, v: 0.1 }),
-  ],
-  emp_burst: [
-    tone('sawtooth', 3000, 0.08, { v: 0.08 }),
-    noise('lowpass', 8000, 0.9, { to: 200, v: 0.2 }),
-    tone('sine', 900, 0.9, { to: 40, v: 0.12 }),
-    ...[0.3, 0.5, 0.65].map((at) => noise('highpass', 4000, 0.03, { at, v: 0.1 })),
-  ],
-  drone_launcher: [
+  defense_drone: [
     noise('lowpass', 1200, 0.12, { v: 0.16 }),
     tone('sawtooth', 200, 0.6, { to: 600, at: 0.08, v: 0.06, vib: [60, 30] }),
     tone('square', 1200, 0.06, { at: 0.5, v: 0.05 }),
     tone('square', 1600, 0.1, { at: 0.58, v: 0.05 }),
-  ],
-  reinforced_hull: [
-    tone('triangle', 180, 0.5, { to: 120, v: 0.16 }),
-    tone('sine', 1100, 0.6, { v: 0.07, vib: [7, 12] }),
-    noise('bandpass', 2500, 0.12, { q: 5, v: 0.16 }),
-  ],
-  reactive_plating: [
-    noise('bandpass', 900, 0.15, { to: 2400, q: 2, v: 0.12 }),
-    tone('square', 500, 0.12, { to: 900, at: 0.08, v: 0.06 }),
-  ],
-  energy_shield: [
-    tone('sine', 700, 0.5, { to: 1400, v: 0.1, vib: [12, 30] }),
-    tone('sine', 1050, 0.45, { to: 2100, at: 0.04, v: 0.06 }),
-    noise('highpass', 6000, 0.3, { at: 0.1, v: 0.06 }),
-  ],
-  self_repair: [
-    ...[0, 0.08, 0.16, 0.24, 0.32].map((at, i) => tone('square', 600 + i * 150, 0.05, { at, v: 0.05 })),
-    tone('sine', 1320, 0.4, { at: 0.4, v: 0.07 }),
-  ],
-  backup_core: [
-    tone('sine', 220, 0.3, { to: 55, v: 0.12 }),
-    tone('square', 440, 0.08, { at: 0.4, v: 0.06 }),
-    tone('square', 660, 0.08, { at: 0.52, v: 0.06 }),
-    tone('square', 880, 0.2, { at: 0.64, v: 0.06 }),
-  ],
-  adaptive_reactor: [
-    tone('sawtooth', 70, 0.7, { to: 140, a: 0.3, v: 0.12, vib: [6, 10] }),
-    noise('bandpass', 400, 0.7, { to: 1600, q: 2, a: 0.4, v: 0.1 }),
-    tone('sine', 880, 0.2, { at: 0.6, v: 0.07 }),
   ],
 };
 

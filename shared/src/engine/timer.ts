@@ -1,7 +1,15 @@
 import type { Color, Coord, GameState } from '../types.js';
 import type { MoveOption } from '../pieces/helpers.js';
 import { cloneState, log, mulberry32, opposite } from '../utils.js';
-import { applyMove, cancelPrompt, endTurn, listMoves, refreshCheckState, resolvePrompt } from './game.js';
+import {
+  applyMove,
+  cancelPrompt,
+  endTurn,
+  listMoves,
+  openQueuedLawPrompt,
+  refreshCheckState,
+  resolvePrompt,
+} from './game.js';
 
 export function turnTimerKey(state: GameState): string {
   return `${state.turnCount}:${state.turn}`;
@@ -28,7 +36,8 @@ export function syncTurnTimer(state: GameState, now: number): void {
   const paused: 'check' | 'waiting' | null =
     state.check === state.turn
       ? 'check'
-      : state.pendingPrompt && state.pendingPrompt.color !== state.turn
+      : state.pendingPrompt &&
+          (state.pendingPrompt.color !== state.turn || state.pendingPrompt.type === 'law_choice')
         ? 'waiting'
         : null;
   if (paused && timer.deadline != null) {
@@ -92,6 +101,9 @@ function autoResolvePrompt(state: GameState, color: Color, rng: () => number): G
     case 'gnome_hole_travel':
       attempts.push(() => resolvePrompt(state, color, 'skip'));
       break;
+    case 'law_choice':
+      for (const opt of shuffled(prompt.options, rng)) attempts.push(() => resolvePrompt(state, color, opt));
+      break;
     case 'spring_bounce': {
       const dests: Coord[] = [];
       for (const dr of [-2, 0, 2]) {
@@ -143,6 +155,7 @@ export function forceTimeoutMove(state: GameState): GameState {
 
   s = settleOwnPrompts(s, color, rng);
   if (s.phase !== 'playing' || turnTimerKey(s) !== key || s.pendingPrompt) {
+    openQueuedLawPrompt(s);
     refreshCheckState(s);
     return s;
   }
@@ -173,6 +186,7 @@ export function forceTimeoutMove(state: GameState): GameState {
   );
   s = moved ?? endTurn(cloneState(before), color, false);
   s = settleOwnPrompts(s, color, rng);
+  openQueuedLawPrompt(s);
   refreshCheckState(s);
   return s;
 }

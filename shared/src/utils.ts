@@ -256,14 +256,16 @@ export function nextDayNightFlipCycle(cycleCount: number): number {
   return cycleCount + (step === 0 ? 5 : step);
 }
 
-/** True when Magic Be-gone has silenced this player's spells and magical abilities. */
+/** True when Magic Be-gone or the Magic Prohibition law has silenced this player's spells and magical abilities. */
 export function isMagicDisabled(
   state: {
     cycleCount: number;
     players: Record<string, { magicDisabledUntilCycle?: number }>;
+    laws?: Array<{ id: string }>;
   },
   color: string,
 ): boolean {
+  if (state.laws?.some((l) => l.id === 'magic_ban')) return true;
   const until = state.players[color]?.magicDisabledUntilCycle;
   return until != null && state.cycleCount < until;
 }

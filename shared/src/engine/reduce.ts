@@ -8,6 +8,7 @@ import {
   draftPick,
   openingKeep,
   openingRedraw,
+  openQueuedLawPrompt,
   playCard,
   refreshCheckState,
   resolvePrompt,
@@ -69,6 +70,7 @@ export function applyClientAction(state: GameState, color: Color, action: Client
     default:
       throw new Error(`Unknown action: ${(action as { type?: string })?.type ?? 'undefined'}`);
   }
+  openQueuedLawPrompt(next);
   refreshCheckState(next);
   return next;
 }

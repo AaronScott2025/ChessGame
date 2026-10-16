@@ -49,7 +49,7 @@ function applyVariantSwap(state: GameState, piece: PieceState, newDefId: string)
     p.defId = def.id;
     p.class = def.class;
     p.linkedPieceId = undefined;
-    if (def.id === 'snail') p.charges = 8;
+    if (def.id === 'snail') p.charges = 5;
     else if (def.id === 'reaper') p.charges = p.charges ?? 0;
     else if (def.id === 'vampire') p.charges = 0;
     else p.charges = undefined;

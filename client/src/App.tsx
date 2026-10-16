@@ -21,18 +21,20 @@ import {
   syncTurnTimer,
   turnTimerExpired,
   CARD_REGISTRY,
+  LAWS,
   PIECES,
   TURN_TIMER_OPTIONS,
 } from '@shared/index.ts';
 import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
+import { FORME_RADIUS, inTemporalField } from '@shared/pieces/prototype.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
 import {
-  EvolutionPicker,
-  MutationToast,
+  formeAbilityStyle,
+  FormeToast,
+  formeOf,
   PrototypeBoardBadges,
   PrototypeInspector,
-  type FormId,
-  type MutationToastData,
+  type FormeToastData,
   type ProtoView,
 } from './PrototypeHud';
 import { spellsUnlocked, isMagicDisabled, reaperCapturesUntilRest, vampireNightRadius, opposite } from '@shared/utils.ts';
@@ -82,7 +84,7 @@ import {
   useUiButtonSfx,
   resetStuckAudio,
 } from './AudioControl';
-import { PieceIcon, prototypeTier } from './PieceIcon';
+import { PieceIcon } from './PieceIcon';
 import { getPieceInfo } from './pieceInfo';
 import { getObstacleInfo } from './obstacleInfo';
 import { RulesModal } from './RulesModal';
@@ -96,15 +98,6 @@ import './App.css';
 
 type Color = 'white' | 'black';
 type Coord = { row: number; col: number };
-
-const PROTO_PROMPT_LABELS: Record<string, string> = {
-  teleport_relay: 'Teleport here',
-  magnetic_leap: 'Magnetic Leap here',
-  quantum_drive: 'Quantum Drive here',
-  drone_launcher: 'Deploy Drone here',
-  razor_limbs: 'Razor Limbs step',
-  chain_assault: 'Chain Assault',
-};
 
 interface Piece {
   id: string;
@@ -129,7 +122,6 @@ interface Piece {
   copiedMoveDefId?: string;
   magicBegoneUsed?: number;
   timekeeperCycleUsed?: boolean;
-  timekeeperRecallUsed?: boolean;
   proto?: ProtoView;
 }
 
@@ -165,6 +157,7 @@ interface GameState {
       connected: boolean;
       magicDisabledUntilCycle?: number;
       lastPlayedCardDefId?: string;
+      formeSwapCooldown?: number;
     }
   >;
   turn: Color;
@@ -204,7 +197,8 @@ interface GameState {
     skippable?: boolean;
     actorColor?: Color;
   };
-  reactorAction?: { color: Color; pieceId: string };
+  bonusMove?: { color: Color; pieceId: string };
+  laws?: Array<{ id: string; by: Color }>;
   rules?: { banPhase: boolean; anonymous?: boolean; turnTimerSeconds?: number };
   turnTimer?: TurnTimerView;
   draft: null | {
@@ -379,6 +373,8 @@ function turnStripContent(
   };
 }
 
+const FILE_LETTERS = 'abcdefghij';
+
 function cardMeta(catalog: Catalog | null, defId: string) {
   return catalog?.cards.find((c) => c.id === defId);
 }
@@ -532,6 +528,9 @@ export default function App() {
   const movesReqRef = useRef<string | null>(null);
   const [gadgetKind, setGadgetKind] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<string | null>(null);
+  const [readCardId, setReadCardId] = useState<string | null>(null);
+  const [lawPickerHidden, setLawPickerHidden] = useState(false);
+  const [cardDetailsCollapsed, setCardDetailsCollapsed] = useState(false);
   const [pendingTargets, setPendingTargets] = useState<unknown[]>([]);
   const [confirmKey, setConfirmKey] = useState<string | null>(null);
   const [spellConfirm, setSpellConfirm] = useState<{
@@ -565,9 +564,8 @@ export default function App() {
   const [checkAlert, setCheckAlert] = useState<null | 'received' | 'dealt'>(null);
   const [cardCast, setCardCast] = useState<CardCastView | null>(null);
   const cardCastSeqRef = useRef(0);
-  const protoHistorySeenRef = useRef<Map<string, { count: number; form?: string }> | null>(null);
-  const [mutationToasts, setMutationToasts] = useState<MutationToastData[]>([]);
-  const [evolvePickerFor, setEvolvePickerFor] = useState<string | null>(null);
+  const protoFormeSeenRef = useRef<Map<string, string> | null>(null);
+  const [formeToasts, setFormeToasts] = useState<FormeToastData[]>([]);
   const [resultShow, setResultShow] = useState<null | {
     kind: 'victory' | 'loss';
     winnerName: string;
@@ -969,40 +967,26 @@ export default function App() {
 
   useEffect(() => {
     if (!state || !you) {
-      protoHistorySeenRef.current = null;
+      protoFormeSeenRef.current = null;
       return;
     }
-    const prev = protoHistorySeenRef.current;
-    const seen = new Map<string, { count: number; form?: string }>();
-    const fresh: MutationToastData[] = [];
+    const prev = protoFormeSeenRef.current;
+    const seen = new Map<string, string>();
+    const fresh: FormeToastData[] = [];
     for (const p of state.pieces) {
-      if (p.defId !== 'prototype' || !p.proto) continue;
-      const history = p.proto.history ?? [];
-      seen.set(p.id, { count: history.length, form: p.proto.form });
+      if (p.defId !== 'prototype') continue;
+      const forme = formeOf(p.proto);
+      seen.set(p.id, forme);
       const before = prev?.get(p.id);
-      if (!before) continue;
-      history.slice(before.count).forEach((mutationId, i) => {
-        fresh.push({
-          key: `${p.id}:${before.count + i}:${Date.now()}`,
-          mutationId,
-          mine: p.color === you,
-          gained: before.count + i + 1,
-        });
-      });
-      if (p.proto.form && !before.form) {
-        fresh.push({
-          key: `${p.id}:form:${Date.now()}`,
-          formId: p.proto.form as FormId,
-          mine: p.color === you,
-          gained: p.proto.gained,
-        });
+      if (before && before !== forme) {
+        fresh.push({ key: `${p.id}:${forme}:${Date.now()}`, forme, mine: p.color === you });
       }
     }
-    protoHistorySeenRef.current = seen;
+    protoFormeSeenRef.current = seen;
     if (!fresh.length) return;
-    setMutationToasts((cur) => [...cur, ...fresh].slice(-3));
+    setFormeToasts((cur) => [...cur, ...fresh].slice(-3));
     for (const t of fresh) {
-      window.setTimeout(() => setMutationToasts((cur) => cur.filter((x) => x.key !== t.key)), 5000);
+      window.setTimeout(() => setFormeToasts((cur) => cur.filter((x) => x.key !== t.key)), 4000);
     }
   }, [state, you]);
 
@@ -1039,6 +1023,10 @@ export default function App() {
   useEffect(() => {
     setMessagesHidden(false);
   }, [state?.pendingPrompt?.type, state?.pendingPrompt?.message, spellConfirm?.summary]);
+
+  useEffect(() => {
+    setLawPickerHidden(false);
+  }, [state?.pendingPrompt?.type, state?.pendingPrompt?.color]);
 
   useEffect(() => {
     if (error) setMessagesHidden(false);
@@ -1234,6 +1222,19 @@ export default function App() {
     }
   };
 
+  // Free actions (e.g. Forme Swap) keep the turn, so the selected piece's options must be re-derived.
+  useEffect(() => {
+    if (!state || !selectedPiece || state.phase !== 'playing') return;
+    const piece = state.pieces.find((p) => p.id === selectedPiece);
+    if (!piece) return;
+    try {
+      setMoves(sanitizeMoves(piece, engineListMoves(state as never, selectedPiece) as MoveOption[]));
+      setAbilities(engineAbilities(state as never, selectedPiece) as AbilityInfo[]);
+    } catch {
+      // keep the previous options
+    }
+  }, [state]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const requestMoves = (pieceId: string) => {
     if (!state) return;
     setFocusSpecial(null);
@@ -1366,11 +1367,42 @@ export default function App() {
     return ids;
   }, [state]);
 
+  /** Prototypes whose Defense / Temporal Forme projects a field over nearby squares. */
+  const protoFields = useMemo(() => {
+    const fields: Array<{ id: string; forme: 'defense' | 'temporal'; row: number; col: number }> = [];
+    if (!state) return fields;
+    for (const p of state.pieces) {
+      if (p.defId !== 'prototype' || p.proto?.rebooting) continue;
+      const forme = formeOf(p.proto);
+      if (forme === 'defense' || forme === 'temporal') fields.push({ id: p.id, forme, row: p.pos.row, col: p.pos.col });
+    }
+    return fields;
+  }, [state]);
+
   const activeCardDef = useMemo(() => {
     if (!state || !you || !selectedCard) return null;
     const card = state.players[you].hand.find((c) => c.instanceId === selectedCard);
     return card ? cardMeta(catalog, card.defId) ?? null : null;
   }, [state, you, selectedCard, catalog]);
+
+  const readCardDef = useMemo(() => {
+    if (!state || !you || !readCardId) return null;
+    const card = state.players[you].hand.find((c) => c.instanceId === readCardId);
+    return card ? cardMeta(catalog, card.defId) ?? null : null;
+  }, [state, you, readCardId, catalog]);
+  const shownCardDef = readCardDef ?? activeCardDef;
+
+  useEffect(() => {
+    setReadCardId(null);
+  }, [state?.turn, state?.turnPhase, you]);
+
+  useEffect(() => {
+    setCardDetailsCollapsed(false);
+  }, [selectedCard]);
+
+  useEffect(() => {
+    if (pendingTargets.length > 0 || spellConfirm) setCardDetailsCollapsed(true);
+  }, [pendingTargets.length, spellConfirm]);
 
   const barrierShiftHighlights = useMemo(() => {
     const barriers = new Set<string>();
@@ -1515,7 +1547,7 @@ export default function App() {
     for (const t of targets) {
       if (t && typeof t === 'object' && 'row' in (t as object) && 'col' in (t as object)) {
         const c = t as Coord;
-        parts.push(`file ${c.col + 1}, rank ${10 - c.row}`);
+        parts.push(`${FILE_LETTERS[c.col]}${10 - c.row}`);
       } else if (typeof t === 'string' && state) {
         const piece = state.pieces.find((p) => p.id === t);
         if (piece) parts.push(pieceMeta(catalog, piece.defId)?.name ?? piece.defId);
@@ -1636,12 +1668,7 @@ export default function App() {
             setStatus(prompt.message ?? 'Click a highlighted square');
             return;
           }
-          const piece = board[row][col];
-          const label = PROTO_PROMPT_LABELS[prompt.abilityId ?? ''] ?? 'Choose';
-          const summary =
-            piece && prompt.abilityId === 'chain_assault'
-              ? `Chain Assault: capture ${pieceMeta(catalog, piece.defId)?.name ?? piece.defId}?`
-              : `${label}: file ${col + 1}, rank ${10 - row}?`;
+          const summary = `Choose: ${FILE_LETTERS[col]}${10 - row}?`;
           setSpellConfirm({ summary, mode: 'resolve_prompt', payload: { row, col } });
           setStatus(summary);
           clearBoardConfirm();
@@ -1658,27 +1685,6 @@ export default function App() {
           }
           return;
         }
-        if (prompt.abilityId === 'chrono_recall') {
-          const piece = board[row][col];
-          if (!piece) return;
-          const tk = state.pieces.find((p) => p.id === prompt.pieceId);
-          if (!tk) return;
-          const dr = Math.sign(row - tk.pos.row);
-          const dc = Math.sign(col - tk.pos.col);
-          const aligned =
-            (dr === 0 || dc === 0 || Math.abs(row - tk.pos.row) === Math.abs(col - tk.pos.col)) &&
-            !(dr === 0 && dc === 0);
-          if (!aligned) {
-            setStatus('Target must be in a straight line from the TimeKeeper');
-            return;
-          }
-          const name = pieceMeta(catalog, piece.defId)?.name ?? piece.defId;
-          const summary = `Chrono Recall ${name}?`;
-          setSpellConfirm({ summary, mode: 'resolve_prompt', payload: piece.id });
-          setStatus(summary);
-          clearBoardConfirm();
-          return;
-        }
         if (prompt.abilityId === 'ultimate_suck') {
           const piece = board[row][col];
           if (ultimateSuckHighlights.landings.has(squareKey)) {
@@ -1687,7 +1693,7 @@ export default function App() {
             const victim = piece ? pieceMeta(catalog, piece.defId)?.name ?? piece.defId : null;
             const summary = victim
               ? `Launch ${name} into ${victim} (capture)?`
-              : `Launch ${name} to file ${col + 1}, rank ${10 - row}?`;
+              : `Launch ${name} to ${FILE_LETTERS[col]}${10 - row}?`;
             setSpellConfirm({ summary, mode: 'resolve_prompt', payload: { row, col } });
             setStatus(summary);
             clearBoardConfirm();
@@ -1720,8 +1726,8 @@ export default function App() {
             return;
           }
           const summary = from
-            ? `Move barrier to file ${col + 1}, rank ${10 - row}?`
-            : `Select barrier at file ${col + 1}, rank ${10 - row}?`;
+            ? `Move barrier to ${FILE_LETTERS[col]}${10 - row}?`
+            : `Select barrier at ${FILE_LETTERS[col]}${10 - row}?`;
           setSpellConfirm({
             summary,
             mode: 'resolve_prompt',
@@ -2247,6 +2253,11 @@ export default function App() {
       )
     : [];
 
+  const activeLaws = (state.laws ?? []).flatMap((l) => {
+    const law = LAWS[l.id];
+    return law ? [{ law, by: l.by }] : [];
+  });
+
   const promptDocked = wideLayout && showBoardKnowledge;
   const promptFloat =
     !messagesHidden &&
@@ -2301,6 +2312,7 @@ export default function App() {
           setStatus={setStatus}
           send={send}
           cancelAbility={cancelAbility}
+          onOpenLawPicker={() => setLawPickerHidden(false)}
         />
         {spellConfirm && (
           <div className="spell-confirm" role="dialog" aria-label="Confirm spell">
@@ -2427,26 +2439,23 @@ export default function App() {
           </span>
         </div>
       )}
-      {evolvePickerFor &&
-        evolvePickerFor === selectedPiece &&
-        state.turn === you &&
-        abilities.some((a) => a.id.startsWith('form_')) && (
-          <EvolutionPicker
-            onClose={() => setEvolvePickerFor(null)}
-            onChoose={(form) => {
-              send({ type: 'use_ability', pieceId: evolvePickerFor, abilityId: `form_${form}` });
-              setEvolvePickerFor(null);
-              setFocusSpecial(null);
-            }}
-          />
-        )}
-      {mutationToasts.length > 0 && (
-        <div className="mutation-toasts" role="status" aria-live="polite">
-          {mutationToasts.map((t) => (
-            <MutationToast
+      {state.pendingPrompt?.type === 'law_choice' && state.pendingPrompt.color === you && !lawPickerHidden && (
+        <LawPicker
+          key={`${state.pendingPrompt.color}:${(state.pendingPrompt.options as string[]).join(',')}`}
+          options={state.pendingPrompt.options as string[]}
+          color={you}
+          onEnact={(lawId) => send({ type: 'resolve_prompt', payload: lawId })}
+          onSkip={() => send({ type: 'resolve_prompt', payload: 'skip' })}
+          onHide={() => setLawPickerHidden(true)}
+        />
+      )}
+      {formeToasts.length > 0 && (
+        <div className="forme-toasts" role="status" aria-live="polite">
+          {formeToasts.map((t) => (
+            <FormeToast
               key={t.key}
               toast={t}
-              onClose={() => setMutationToasts((cur) => cur.filter((x) => x.key !== t.key))}
+              onClose={() => setFormeToasts((cur) => cur.filter((x) => x.key !== t.key))}
             />
           ))}
         </div>
@@ -2534,6 +2543,7 @@ export default function App() {
           cancelAbility={cancelAbility}
           onDismissStatus={() => setStatus('')}
           onDismissError={() => setError(null)}
+          onOpenLawPicker={() => setLawPickerHidden(false)}
         />
       )}
 
@@ -2804,6 +2814,17 @@ export default function App() {
                 </section>
               );
             })}
+            {wideLayout && activeLaws.length > 0 && (
+              <section className="law-board" aria-label="Laws in force">
+                <h2 className="law-board-title">Laws in force · until dawn</h2>
+                {activeLaws.map(({ law, by }) => (
+                  <div key={law.id} className={`law-board-item is-${by}`}>
+                    <strong>{law.name}</strong>
+                    <span>{law.text}</span>
+                  </div>
+                ))}
+              </section>
+            )}
             <h2 className="side-log-title">Battle log</h2>
             <ul className="log">
               {state.history.slice(0, 40).map((h, i) => {
@@ -2821,6 +2842,22 @@ export default function App() {
           </aside>
 
           <main className="board-wrap">
+            {!wideLayout && activeLaws.length > 0 && (
+              <div className="law-strip" aria-label="Laws in force until dawn">
+                <span className="law-strip-label">Laws</span>
+                {activeLaws.map(({ law, by }) => (
+                  <button
+                    key={law.id}
+                    type="button"
+                    className={`law-chip is-${by}`}
+                    title={law.text}
+                    onClick={() => setStatus(`${law.name} (until dawn): ${law.text}`)}
+                  >
+                    {law.name}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="board-stage">
             <div
               className={[
@@ -2889,6 +2926,16 @@ export default function App() {
                       : null;
                   const vampRadius =
                     piece?.defId === 'vampire' ? vampireNightRadius(piece.charges ?? 0) : 0;
+                  const inField = (f: { forme: string; row: number; col: number }, r: number, c: number) =>
+                    f.forme === 'temporal'
+                      ? inTemporalField(f, { row: r, col: c })
+                      : Math.abs(f.row - r) <= FORME_RADIUS && Math.abs(f.col - c) <= FORME_RADIUS;
+                  const fieldsHere = protoFields.filter((f) => inField(f, row, col));
+                  // Neighbours in screen space: the board is rotated 180° for Black.
+                  const step = flip ? 1 : -1;
+                  const timeFrozen =
+                    Boolean(piece && piece.class !== 'king') &&
+                    fieldsHere.some((f) => f.forme === 'temporal' && f.id !== piece?.id);
                   const showingInfo =
                     (piece && piece.id === inspectedId) ||
                     (piece && !infoLocked && piece.id === hoveredId) ||
@@ -2930,6 +2977,7 @@ export default function App() {
                           ? 'sq-reaper-fx'
                           : '',
                         vampRadius > 0 ? 'sq-vampire-fx' : '',
+                        timeFrozen ? 'sq-time-frozen' : '',
                         piece?.defId === 'gambler' ? `sq-gambler sq-gambler-${state.dayNight}` : '',
                       ].join(' ')}
                       onClick={() => onSquareClick(row, col)}
@@ -2958,6 +3006,30 @@ export default function App() {
                                   : undefined
                       }
                     >
+                      {visualCol === 0 && (
+                        <span className="sq-coord sq-coord-rank" aria-hidden>
+                          {10 - row}
+                        </span>
+                      )}
+                      {visualRow === 9 && (
+                        <span className="sq-coord sq-coord-file" aria-hidden>
+                          {FILE_LETTERS[col]}
+                        </span>
+                      )}
+                      {fieldsHere.map((f) => (
+                        <span
+                          key={`field-${f.id}`}
+                          aria-hidden
+                          className={[
+                            'proto-field',
+                            `is-${f.forme}`,
+                            inField(f, row + step, col) ? '' : 'edge-t',
+                            inField(f, row - step, col) ? '' : 'edge-b',
+                            inField(f, row, col + step) ? '' : 'edge-l',
+                            inField(f, row, col - step) ? '' : 'edge-r',
+                          ].join(' ')}
+                        />
+                      ))}
                       {toks.map((t) => (
                         <span key={t.id} className={`token ${t.kind}`} title={getObstacleInfo(t.kind).name} />
                       ))}
@@ -3039,7 +3111,7 @@ export default function App() {
                             defId={piece.defId}
                             color={piece.color}
                             title={meta?.name ?? piece.defId}
-                            tier={piece.defId === 'prototype' ? prototypeTier(piece.proto?.gained) : 0}
+                            forme={piece.proto?.form}
                           />
                           {piece.defId === 'prototype' && <PrototypeBoardBadges proto={piece.proto} />}
                           {piece.defId === 'gambler' && (
@@ -3140,27 +3212,18 @@ export default function App() {
             </div>
 
             <div className="ability-bar" aria-live="polite">
-              {selectedPiece && state.turn === you && abilities.some((a) => a.id.startsWith('form_')) && (
-                <button
-                  type="button"
-                  className="primary evolve-btn"
-                  title="Compare the three Final Evolution forms"
-                  onClick={() => setEvolvePickerFor(selectedPiece)}
-                >
-                  <strong>🧬 Final Evolution</strong>
-                </button>
-              )}
               {selectedPiece && abilities.length > 0 && state.turn === you
-                ? abilities.filter((a) => !a.id.startsWith('form_')).map((a) => (
+                ? abilities.map((a) => (
                     <button
                       key={a.id}
                       type="button"
-                      className={`${a.passive ? '' : 'primary'} ${focusSpecial === a.id ? 'active' : ''}`}
+                      className={`${a.passive ? '' : 'primary'} ${focusSpecial === a.id ? 'active' : ''} ${a.id.startsWith('forme_') ? 'forme-btn' : ''}`}
+                      style={formeAbilityStyle(a.id, state.pieces.find((p) => p.id === selectedPiece)?.proto)}
                       disabled={!a.ready && !a.passive}
                       title={a.hint}
                       onClick={() => {
                         if (a.passive) {
-                          if (a.id === 'bloodlust' || a.id === 'identity_theft' || a.id === 'mut_status') {
+                          if (a.id === 'bloodlust' || a.id === 'identity_theft' || a.id === 'forme_status') {
                             setFocusSpecial(null);
                             setStatus(a.hint ?? a.name);
                             return;
@@ -3217,8 +3280,11 @@ export default function App() {
                         <button
                           key={c.instanceId}
                           type="button"
-                          className={`card ${selectedCard === c.instanceId ? 'active' : ''} ${spellLocked ? 'card-dimmed' : ''}`}
-                          disabled={spellLocked}
+                          className={`card ${selectedCard === c.instanceId ? 'active' : ''} ${spellLocked ? 'card-dimmed' : ''} ${
+                            spellLocked && readCardId === c.instanceId ? 'card-reading' : ''
+                          }`}
+                          aria-disabled={spellLocked}
+                          aria-pressed={spellLocked ? readCardId === c.instanceId : undefined}
                           style={
                             {
                               '--fan-i': i,
@@ -3228,17 +3294,27 @@ export default function App() {
                           }
                           title={
                             nightLocked
-                              ? 'Spell cards unlock at the first night'
+                              ? 'Spell cards unlock at the first night · click to read'
                               : silenced
-                                ? 'Magic is silenced (Magic Be-gone)'
+                                ? state.laws?.some((l) => l.id === 'magic_ban')
+                                  ? 'Magic is banned by law until dawn · click to read'
+                                  : 'Magic is silenced (Magic Be-gone) · click to read'
                                 : spellLocked
                                 ? state.turn !== you
-                                  ? 'Cannot cast this on the opponent’s turn'
-                                  : 'Spell phase skipped — cards available next turn'
+                                  ? 'Cannot cast this on the opponent’s turn · click to read'
+                                  : 'Spell phase skipped — cards available next turn · click to read'
                                 : meta?.name ?? c.defId
                           }
                           onClick={() => {
-                            if (spellLocked) return;
+                            if (spellLocked) {
+                              setReadCardId((id) => (id === c.instanceId ? null : c.instanceId));
+                              return;
+                            }
+                            setReadCardId(null);
+                            if (selectedCard === c.instanceId) {
+                              setCardDetailsCollapsed((v) => !v);
+                              return;
+                            }
                             setSelectedCard(c.instanceId);
                             setPendingTargets([]);
                             setSpellConfirm(null);
@@ -3289,7 +3365,9 @@ export default function App() {
 
               {magicSilenced && (
                 <p className="hint">
-                  Magic Be-gone: your spells and magical abilities are silenced until the day/night cycle changes.
+                  {state.laws?.some((l) => l.id === 'magic_ban')
+                    ? 'Magic Prohibition: spells and magical abilities are banned for both players until dawn.'
+                    : 'Magic Be-gone: your spells and magical abilities are silenced until the day/night cycle changes.'}
                 </p>
               )}
 
@@ -3375,11 +3453,22 @@ export default function App() {
                   </div>
                 )}
 
-              {activeCardDef && !wideLayout && (
-                <div className="card-details">
-                  <h3>{activeCardDef.name}</h3>
+              {shownCardDef && !wideLayout && (readCardDef || !cardDetailsCollapsed) && (
+                <div className={`card-details is-sheet${readCardDef ? ' is-reading' : ''}`}>
+                  <button
+                    type="button"
+                    className="card-details-close"
+                    aria-label="Close card"
+                    onClick={() => (readCardDef ? setReadCardId(null) : setCardDetailsCollapsed(true))}
+                  >
+                    ×
+                  </button>
+                  <p className="dock-card-kicker">
+                    {readCardDef ? 'Reading · can’t cast right now' : 'Selected card · tap the card again to hide'}
+                  </p>
+                  <h3>{shownCardDef.name}</h3>
                   <ul>
-                    {activeCardDef.description.map((d) => (
+                    {shownCardDef.description.map((d) => (
                       <li key={d}>{d}</li>
                     ))}
                   </ul>
@@ -3395,17 +3484,27 @@ export default function App() {
           <aside className="play-dock" aria-live="polite">
             <div className="play-dock-box">
               <p className="play-dock-label">Info</p>
-              {activeCardDef && wideLayout && (
-                <div className="card-details dock-card-details">
+              {shownCardDef && wideLayout && (
+                <div className={`card-details dock-card-details${readCardDef ? ' is-reading' : ''}`}>
+                  {readCardDef && (
+                    <button
+                      type="button"
+                      className="card-details-close"
+                      aria-label="Close card"
+                      onClick={() => setReadCardId(null)}
+                    >
+                      ×
+                    </button>
+                  )}
                   <img
-                    src={cardMeta(catalog, activeCardDef.id)?.image ?? '/cards/Back_Of_Card.png'}
+                    src={cardMeta(catalog, shownCardDef.id)?.image ?? '/cards/Back_Of_Card.png'}
                     alt=""
                   />
                   <div>
-                    <p className="dock-card-kicker">Selected card</p>
-                    <h3>{activeCardDef.name}</h3>
+                    <p className="dock-card-kicker">{readCardDef ? 'Reading · can’t cast right now' : 'Selected card'}</p>
+                    <h3>{shownCardDef.name}</h3>
                     <ul>
-                      {activeCardDef.description.map((d) => (
+                      {shownCardDef.description.map((d) => (
                         <li key={d}>{d}</li>
                       ))}
                     </ul>
@@ -3447,13 +3546,13 @@ export default function App() {
                     abilityCooldown: inspectedPiece.abilityCooldown,
                     magicBegoneUsed: inspectedPiece.magicBegoneUsed,
                     timekeeperCycleUsed: inspectedPiece.timekeeperCycleUsed,
-                    timekeeperRecallUsed: inspectedPiece.timekeeperRecallUsed,
                     bloodlustTurnsRemaining: inspectedPiece.bloodlustTurnsRemaining,
                     identityLootDefId: inspectedPiece.identityLootDefId,
                     copiedMoveDefId: inspectedPiece.copiedMoveDefId,
                     coOccupantId: inspectedPiece.coOccupantId,
                     hasPigBuddy: pigHostIds.has(inspectedPiece.id),
                     proto: inspectedPiece.proto,
+                    formeSwapCooldown: state.players[inspectedPiece.color].formeSwapCooldown,
                     effects: inspectedPiece.effects,
                   }}
                   onClose={() => {
@@ -3959,13 +4058,13 @@ function PieceInfoBody({
     abilityCooldown?: number;
     magicBegoneUsed?: number;
     timekeeperCycleUsed?: boolean;
-    timekeeperRecallUsed?: boolean;
     bloodlustTurnsRemaining?: number;
     identityLootDefId?: string;
     copiedMoveDefId?: string;
     coOccupantId?: string;
     hasPigBuddy?: boolean;
     proto?: Piece['proto'];
+    formeSwapCooldown?: number;
     effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
 }) {
@@ -3984,7 +4083,7 @@ function PieceInfoBody({
             defId={defId}
             color={previewColor}
             title={info.name}
-            tier={defId === 'prototype' ? prototypeTier(live?.proto?.gained) : 0}
+            forme={live?.proto?.form}
           />
         </div>
         <div>
@@ -4084,7 +4183,6 @@ function PieceInfoBody({
             <span>Bloodlust ({live.bloodlustTurnsRemaining})</span>
           )}
           {live.timekeeperCycleUsed && <span>Temporal Shift used</span>}
-          {live.timekeeperRecallUsed && <span>Chrono Recall used</span>}
           {live.copiedMoveDefId && <span>Moves as {live.copiedMoveDefId}</span>}
           {!live.copiedMoveDefId && live.identityLootDefId && (
             <span>Stored identity: {live.identityLootDefId}</span>
@@ -4098,7 +4196,7 @@ function PieceInfoBody({
           ))}
         </div>
       )}
-      {live && defId === 'prototype' && <PrototypeInspector proto={live.proto} />}
+      {live && defId === 'prototype' && <PrototypeInspector proto={live.proto} swapCooldown={live.formeSwapCooldown} />}
     </>
   );
 }
@@ -4124,13 +4222,13 @@ function PieceInfoTile({
     abilityCooldown?: number;
     magicBegoneUsed?: number;
     timekeeperCycleUsed?: boolean;
-    timekeeperRecallUsed?: boolean;
     bloodlustTurnsRemaining?: number;
     identityLootDefId?: string;
     copiedMoveDefId?: string;
     coOccupantId?: string;
     hasPigBuddy?: boolean;
     proto?: Piece['proto'];
+    formeSwapCooldown?: number;
     effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
   locked?: boolean;
@@ -4438,6 +4536,7 @@ function PlayPromptBanners({
   cancelAbility,
   onDismissStatus,
   onDismissError,
+  onOpenLawPicker,
 }: {
   status: string;
   error: string | null;
@@ -4451,6 +4550,7 @@ function PlayPromptBanners({
   cancelAbility: () => void;
   onDismissStatus?: () => void;
   onDismissError?: () => void;
+  onOpenLawPicker?: () => void;
 }) {
   return (
     <>
@@ -4588,6 +4688,23 @@ function PlayPromptBanners({
           </div>
         )}
 
+      {state.pendingPrompt?.type === 'law_choice' && state.pendingPrompt.color === you && (
+        <div className="banner">
+          Your President is convening: enact a law or skip this cycle before play continues.
+          {onOpenLawPicker ? (
+            <span className="prompt-actions">
+              <button type="button" className="primary" onClick={onOpenLawPicker}>
+                Choose a law
+              </button>
+            </span>
+          ) : null}
+        </div>
+      )}
+
+      {state.pendingPrompt?.type === 'law_choice' && you && state.pendingPrompt.color !== you && (
+        <div className="banner">The opposing President is choosing a law…</div>
+      )}
+
       {state.pendingPrompt?.type === 'gambler_choice' && you && (
         <GamblerPrompt
           prompt={state.pendingPrompt}
@@ -4598,6 +4715,81 @@ function PlayPromptBanners({
         />
       )}
     </>
+  );
+}
+
+const LAW_KIND_LABEL: Record<string, string> = {
+  restrict: 'Restriction',
+  mandate: 'Mandate',
+  magic: 'Prohibition',
+  instant: 'Instant',
+  buff: 'Benefit',
+};
+
+function LawPicker({
+  options,
+  color,
+  onEnact,
+  onSkip,
+  onHide,
+}: {
+  options: string[];
+  color: Color;
+  onEnact: (lawId: string) => void;
+  onSkip: () => void;
+  onHide: () => void;
+}) {
+  const [pick, setPick] = useState<string | null>(null);
+  const picked = pick ? LAWS[pick] : null;
+  return (
+    <div className="evolve-picker-backdrop law-picker-backdrop">
+      <div className="evolve-picker law-picker" role="dialog" aria-modal="true" aria-label="Executive Order">
+        <div className="law-picker-head">
+          <PieceIcon defId="president" color={color} className="law-picker-icon" />
+          <div>
+            <h3>Executive Order</h3>
+            <p className="evolve-picker-sub">
+              A new day dawns. Enact one law — it binds both players until the next dawn — or skip until the next
+              dawn.
+            </p>
+          </div>
+        </div>
+        <div className="law-picker-options">
+          {options.map((id) => {
+            const law = LAWS[id];
+            return (
+              <button
+                key={id}
+                type="button"
+                className={`law-card${pick === id ? ' is-picked' : ''}`}
+                aria-pressed={pick === id}
+                onClick={() => setPick(id)}
+              >
+                <span className="law-card-kind">{LAW_KIND_LABEL[law?.kind ?? ''] ?? 'Law'}</span>
+                <strong>{law?.name ?? id}</strong>
+                <span className="law-card-text">{law?.text}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="law-picker-actions">
+          <button type="button" onClick={onHide}>
+            View board
+          </button>
+          <button type="button" onClick={onSkip}>
+            Skip this cycle
+          </button>
+          <button
+            type="button"
+            className="primary"
+            disabled={!pick}
+            onClick={() => pick && onEnact(pick)}
+          >
+            {picked ? `Enact ${picked.name}` : 'Select a law'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
