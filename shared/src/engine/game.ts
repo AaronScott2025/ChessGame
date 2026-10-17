@@ -329,10 +329,14 @@ export function draftPick(state: GameState, color: Color, defId: string): GameSt
   return next;
 }
 
+const ANGEL_MAX_REVIVES = 4;
+/** Allied effects tick at the end of the owner's turn, so 2 covers the opponent's next turn. */
+const ANGEL_BLESS_TURNS = 2;
+
 function initialCharges(defId: string): number | undefined {
   if (defId === 'reaper') return 0;
   if (defId === 'snail') return 5;
-  if (defId === 'vampire') return 0;
+  if (defId === 'vampire') return 1;
   return undefined;
 }
 
@@ -983,7 +987,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
         ready: false,
         passive: true,
         hint: stolenName
-          ? `This Fleece permanently moves like a ${stolenName} (movement only).`
+          ? `This Fleece permanently also moves like a ${stolenName}, on top of its own movement (movement only).`
           : 'Identity Theft has already been used.',
       });
     } else {
@@ -992,8 +996,8 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
         name: lootName ? `Identity Theft (${lootName})` : 'Identity Theft',
         ready: Boolean(loot) && (piece.disabledTurns ?? 0) <= 0,
         hint: lootName
-          ? `Once: permanently move like a ${lootName}. Uses your turn.`
-          : 'Capture a piece first. Then activate once, on a later turn, to steal that movement forever.',
+          ? `Once: permanently add ${lootName} movement to this Fleece (keeps its own). Uses your turn.`
+          : 'Capture a piece first. Then activate once, whenever you want, to add that movement forever.',
       });
     }
   }
@@ -1030,7 +1034,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
   }
   if (piece.defId === 'angel') {
     const canRevive =
-      (piece.reviveCount ?? 0) < 3 &&
+      (piece.reviveCount ?? 0) < ANGEL_MAX_REVIVES &&
       (piece.ritualTurns == null || piece.ritualTurns <= 0) &&
       state.lastMove?.pieceId !== piece.id &&
       (piece.disabledTurns ?? 0) <= 0 &&
@@ -1039,7 +1043,16 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
       id: 'revive',
       name: 'Revive Ritual',
       ready: canRevive,
-      hint: 'Start a ritual to revive a piece from your graveyard (consumes turn)',
+      hint: `Start a ritual to revive a piece from your graveyard (consumes turn). ${ANGEL_MAX_REVIVES - (piece.reviveCount ?? 0)} of ${ANGEL_MAX_REVIVES} revives left.`,
+    });
+    const hasBlessTarget = blessTargets(state, piece).length > 0;
+    out.push({
+      id: 'bless',
+      name: 'Bless',
+      ready: hasBlessTarget && (piece.disabledTurns ?? 0) <= 0 && !isMagicDisabled(state, piece.color),
+      hint: hasBlessTarget
+        ? 'Spend your turn to make an adjacent ally (not a King) uncapturable during the opponent’s next turn'
+        : 'Needs an adjacent ally (not a King) to Bless',
     });
   }
   if (piece.defId === 'enchanted_pawn') {
@@ -1201,6 +1214,7 @@ export function useAbility(
       'magic_begone',
       'gadget_deploy',
       'revive',
+      'bless',
       'barrier_shift',
       'temporal_shift',
     ];
@@ -1282,6 +1296,23 @@ export function useAbility(
       return next;
     }
     return finishAngelReviveStart(next, color, pieceId, defId);
+  }
+
+  if (abilityId === 'bless') {
+    const pos = targets as Coord | undefined;
+    if (!pos) {
+      next.pendingPrompt = {
+        type: 'ability_target',
+        color,
+        pieceId,
+        abilityId: 'bless',
+        message: 'Bless: click an adjacent ally to protect it',
+        options: blessTargets(next, piece).map((p) => ({ ...p.pos })),
+        resumeTurnPhase,
+      };
+      return next;
+    }
+    return finishAngelBless(next, color, pieceId, pos);
   }
 
   if (abilityId === 'barrier_shift') {
@@ -1412,7 +1443,7 @@ function finishIdentityTheft(state: GameState, color: Color, pieceId: string): G
     data: { defId: loot },
   });
   state.pendingPrompt = null;
-  log(state, `Fleece Identity Theft — now moves like ${stolenDef.name}`);
+  log(state, `Fleece Identity Theft — now also moves like ${stolenDef.name}`);
   abilityFx(state, 'identity_theft');
   return concludeAbilityTurn(state, color);
 }
@@ -1481,7 +1512,7 @@ function finishAngelReviveStart(state: GameState, color: Color, pieceId: string,
   if (defId === 'angel') throw new Error('Angel cannot revive angels');
 
   const emptyAdj = emptyAdjacentCount(state, angel.pos);
-  const duration = Math.max(1, 10 - emptyAdj);
+  const duration = Math.max(1, 8 - emptyAdj);
   angel.ritualTurns = duration;
   angel.ritualTargetDefId = defId;
   state.pendingPrompt = null;
@@ -1525,10 +1556,38 @@ function completeAngelRevive(state: GameState, angel: PieceState): void {
   angel.reviveCount = (angel.reviveCount ?? 0) + 1;
   log(state, `Angel revived ${entry.defId}`);
   abilityFx(state, 'revive_complete');
-  if ((angel.reviveCount ?? 0) >= 3) {
+  if ((angel.reviveCount ?? 0) >= ANGEL_MAX_REVIVES) {
     removePiece(state, angel, opposite(angel.color));
-    log(state, 'Angel perished after 3 revives');
+    log(state, `Angel perished after ${ANGEL_MAX_REVIVES} revives`);
   }
+}
+
+/** Allies an Angel can Bless: adjacent, not Kings. */
+function blessTargets(state: GameState, angel: PieceState): PieceState[] {
+  return state.pieces.filter(
+    (p) => p.color === angel.color && p.id !== angel.id && p.class !== 'king' && chebyshev(p.pos, angel.pos) === 1,
+  );
+}
+
+function finishAngelBless(state: GameState, color: Color, pieceId: string, pos: Coord): GameState {
+  const angel = state.pieces.find((p) => p.id === pieceId);
+  if (!angel || angel.defId !== 'angel') throw new Error('Only an Angel can Bless');
+  const target = blessTargets(state, angel).find((p) => sameCoord(p.pos, pos));
+  if (!target) throw new Error('Bless an adjacent ally (not a King)');
+  const existing = target.effects.find((e) => e.kind === 'invincible');
+  if (existing) {
+    existing.turnsRemaining = Math.max(existing.turnsRemaining ?? 0, ANGEL_BLESS_TURNS);
+  } else {
+    addEffect(target, {
+      id: `bless_${target.id}_${state.turnCount}`,
+      kind: 'invincible',
+      turnsRemaining: ANGEL_BLESS_TURNS,
+    });
+  }
+  state.pendingPrompt = null;
+  log(state, `Angel blessed ${getPieceDef(target.defId).name} — it cannot be captured next turn`);
+  abilityFx(state, 'bless');
+  return concludeAbilityTurn(state, color);
 }
 
 function finishBarrierShift(
@@ -2848,6 +2907,10 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (prompt.abilityId === 'revive') {
       next.pendingPrompt = null;
       return finishAngelReviveStart(next, color, prompt.pieceId, payload as string);
+    }
+    if (prompt.abilityId === 'bless') {
+      next.pendingPrompt = null;
+      return finishAngelBless(next, color, prompt.pieceId, payload as Coord);
     }
     if (prompt.abilityId === 'barrier_shift') {
       const selected = [...(prompt.selected ?? []), payload];

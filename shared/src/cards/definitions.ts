@@ -51,7 +51,7 @@ function applyVariantSwap(state: GameState, piece: PieceState, newDefId: string)
     p.linkedPieceId = undefined;
     if (def.id === 'snail') p.charges = 5;
     else if (def.id === 'reaper') p.charges = p.charges ?? 0;
-    else if (def.id === 'vampire') p.charges = 0;
+    else if (def.id === 'vampire') p.charges = 1;
     else p.charges = undefined;
     if (def.id !== 'snake') p.bloodlustTurnsRemaining = undefined;
     p.pos = { row: -99, col: -99 };

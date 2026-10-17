@@ -478,15 +478,19 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'bishop',
     symbol: '♝',
     getMoves: (p, s) => {
+      const own = rayMoves(p, s, DIAG, 3);
       const stolen = p.copiedMoveDefId;
-      if (stolen && stolen !== 'scamman') {
-        const def = PIECES[stolen];
-        if (def) {
-          const copied = def.getMoves(p, s).filter((m) => !m.special);
-          return filterLegal(p, s, copied);
-        }
-      }
-      return filterLegal(p, s, rayMoves(p, s, DIAG, 3));
+      const def = stolen && stolen !== 'scamman' ? PIECES[stolen] : undefined;
+      if (!def) return filterLegal(p, s, own);
+      const seen = new Set(own.map((m) => `${m.to.row},${m.to.col}`));
+      const extra = def.getMoves(p, s).filter((m) => {
+        if (m.special) return false;
+        const key = `${m.to.row},${m.to.col}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      return filterLegal(p, s, [...own, ...extra]);
     },
   },
   wizard: {
@@ -523,13 +527,11 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'queen',
     symbol: '♛',
     getMoves: (p, s) => {
-      // cannot move consecutively
-      if (s.lastMove?.pieceId === p.id) return [];
       // cannot capture
       return filterLegal(
         p,
         s,
-        rayMoves(p, s, ORTH, 1).filter((m) => !m.capture),
+        areaMoves(p, s, 1).filter((m) => !m.capture),
       );
     },
   },
@@ -596,7 +598,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♛',
     getMoves: (p, s) => {
       if (s.dayNight !== 'night') {
-        return filterLegal(p, s, rayMoves(p, s, ORTH, 1));
+        return filterLegal(p, s, areaMoves(p, s, 1));
       }
       return filterLegal(p, s, areaMoves(p, s, vampireNightRadius(p.charges ?? 0)));
     },

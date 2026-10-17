@@ -1478,6 +1478,8 @@ export default function App() {
     }
     return keys;
   }, [state, you]);
+  const blessPrompt =
+    state?.pendingPrompt?.type === 'ability_target' && state.pendingPrompt.abilityId === 'bless';
 
   const gamblerChoiceHighlights = useMemo(() => {
     const targets = new Set<string>();
@@ -1668,7 +1670,11 @@ export default function App() {
             setStatus(prompt.message ?? 'Click a highlighted square');
             return;
           }
-          const summary = `Choose: ${FILE_LETTERS[col]}${10 - row}?`;
+          const target = board[row][col];
+          const summary =
+            prompt.abilityId === 'bless' && target
+              ? `Bless ${pieceMeta(catalog, target.defId)?.name ?? target.defId}?`
+              : `Choose: ${FILE_LETTERS[col]}${10 - row}?`;
           setSpellConfirm({ summary, mode: 'resolve_prompt', payload: { row, col } });
           setStatus(summary);
           clearBoardConfirm();
@@ -2970,7 +2976,13 @@ export default function App() {
                         suckFrom ? 'suck-from' : suckTarget ? 'suck-target' : '',
                         suckLanding ? (piece ? 'suck-landing suck-capture' : 'suck-landing') : '',
                         gamblerTarget ? 'gambler-target' : '',
-                        promptSquareOptions.has(key) ? (piece ? 'proto-option proto-option-capture' : 'proto-option') : '',
+                        promptSquareOptions.has(key)
+                          ? blessPrompt
+                            ? 'bless-option'
+                            : piece
+                              ? 'proto-option proto-option-capture'
+                              : 'proto-option'
+                          : '',
                         sliding ? 'sq-sliding' : '',
                         piece?.defId === 'reaper' &&
                           ((piece.charges ?? 0) > 0 || (piece.disabledTurns ?? 0) > 0)
@@ -4183,9 +4195,11 @@ function PieceInfoBody({
             <span>Bloodlust ({live.bloodlustTurnsRemaining})</span>
           )}
           {live.timekeeperCycleUsed && <span>Temporal Shift used</span>}
-          {live.copiedMoveDefId && <span>Moves as {live.copiedMoveDefId}</span>}
+          {live.copiedMoveDefId && (
+            <span>Also moves as {getPieceInfo(live.copiedMoveDefId)?.name ?? live.copiedMoveDefId}</span>
+          )}
           {!live.copiedMoveDefId && live.identityLootDefId && (
-            <span>Stored identity: {live.identityLootDefId}</span>
+            <span>Stored identity: {getPieceInfo(live.identityLootDefId)?.name ?? live.identityLootDefId}</span>
           )}
           {live.coOccupantId && <span className="live-effect tone-buff">Pig Best Buddy</span>}
           {live.hasPigBuddy && <span className="live-effect tone-buff">Pig riding</span>}

@@ -189,7 +189,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves up to 3 squares diagonally.'],
     abilities: [
       'Fraudulent Fate: any non-pawn that captures this piece becomes a basic Pawn.',
-      'Identity Theft (once): after capturing a piece, activate whenever you want to permanently move like that piece (movement only, not specials). Later captures replace the stored identity until you activate.',
+      'Identity Theft (once): after capturing a piece, activate whenever you want to permanently add that piece’s movement to the Fleece, keeping its own diagonal moves (movement only, not specials). Later captures replace the stored identity until you activate.',
     ],
   },
   wizard: {
@@ -237,14 +237,11 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'angel',
     name: 'Angel',
     classLabel: 'Queen',
-    movement: [
-      'Moves 1 square orthogonally.',
-      'Cannot move on consecutive turns.',
-      'Cannot capture.',
-    ],
+    movement: ['Moves 1 square in any direction.', 'Cannot capture.'],
     abilities: [
-      'Revive: start a ritual lasting (10 − empty adjacent tiles) turns to revive a piece from your graveyard beside the Angel.',
-      'Max 3 revives — then the Angel dies.',
+      'Revive: start a ritual lasting (8 − empty adjacent tiles) turns, minimum 1, to revive a piece from your graveyard beside the Angel.',
+      'Max 4 revives — then the Angel dies.',
+      'Bless: spend your turn to make an adjacent ally (not a King) uncapturable during the opponent’s next turn.',
     ],
     notes: ['Cannot revive itself or other Angels.', 'You can revive then move later, but not move then revive the same turn.'],
   },
@@ -286,11 +283,14 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     name: 'Vampire',
     classLabel: 'Queen',
     movement: [
-      'Day: moves 1 tile orthogonally.',
-      'Night: a 1×1 Chebyshev area at 0 Blood Tokens.',
-      'Every 3 Blood Tokens adds 1 tile of night radius (3 → 2×2), up to a 5×5 area.',
+      'Day: moves 1 tile in any direction.',
+      'Night: a 1×1 Chebyshev area at 0–1 Blood Tokens.',
+      'Every 2 Blood Tokens adds 1 tile of night radius (2 → 2×2), up to a 4×4 area.',
     ],
-    abilities: ['Blood Token: gains 1 Blood Token each time it captures a piece (day or night).'],
+    abilities: [
+      'Starts with 1 Blood Token.',
+      'Blood Token: gains 1 Blood Token each time it captures a piece (day or night).',
+    ],
   },
   president: {
     id: 'president',

@@ -1592,6 +1592,11 @@ const ABILITY_SFX: Record<string, FxLayer[]> = {
     tone('sine', 2093, 0.8, { v: 0.04 }),
     tone('triangle', 523, 0.9, { at: 0.05, v: 0.06 }),
   ],
+  bless: [
+    tone('sine', 784, 0.6, { a: 0.08, v: 0.08 }),
+    tone('sine', 1175, 0.6, { a: 0.1, at: 0.08, v: 0.06 }),
+    tone('sine', 1568, 0.7, { a: 0.12, at: 0.16, v: 0.04, vib: [6, 4] }),
+  ],
   // Crystalite — glassy pings
   barrier_shift: [
     tone('sine', 2637, 0.25, { v: 0.07 }),
