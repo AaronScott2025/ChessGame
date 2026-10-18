@@ -16,13 +16,16 @@ export interface PieceInfo {
   notes?: string[];
 }
 
+const FAR_EDGE_PROMOTION =
+  'Also promotes if it lands on the far edge any other way (spell, revive, push) — that promotion does not use your turn.';
+
 export const PIECE_INFO: Record<string, PieceInfo> = {
   pawn: {
     id: 'pawn',
     name: 'Pawn',
     classLabel: 'Pawn',
     movement: ['Moves 1 square forward.', 'First move may go up to 2 squares forward.'],
-    abilities: ['Promote into a Queen or Queen variant at the far edge.'],
+    abilities: ['Promote into a Queen or Queen variant at the far edge.', FAR_EDGE_PROMOTION],
     notes: ['Captures diagonally forward only.'],
   },
   nwap: {
@@ -30,7 +33,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     name: 'nwaP',
     classLabel: 'Pawn',
     movement: ['Moves 1 square diagonally forward.', 'First move may go up to 2 squares diagonally forward.'],
-    abilities: ['Promote into Horse, Bishop, Wildcard, or Rook variants at the far edge.'],
+    abilities: ['Promote into Horse, Bishop, Wildcard, or Rook variants at the far edge.', FAR_EDGE_PROMOTION],
     notes: ['Captures straight forward only (not diagonally).'],
   },
   rogue: {
@@ -41,7 +44,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Moves 1 square forward, or 1 square diagonally backward.',
       'First move may go up to 2 squares forward.',
     ],
-    abilities: ['Promote into Bishop or Rook variants at the far edge.'],
+    abilities: ['Promote into Bishop or Rook variants at the far edge.', FAR_EDGE_PROMOTION],
     notes: ['Captures diagonally forward, diagonally backward, or straight backward.'],
   },
   leapfrog: {
@@ -52,6 +55,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     abilities: [
       'Leap: jump over one adjacent allied piece in any direction, landing on the square beyond if it is a legal destination.',
       'Promote into a Queen or Queen variant at the far edge.',
+      FAR_EDGE_PROMOTION,
     ],
     notes: [
       'Captures one square horizontally.',
@@ -162,6 +166,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     ],
     abilities: [
       'Best Buddy (day): may share a tile with an allied non-king piece that sits on a normal L (2–1) landing (same path rules as movement — not a teleport).',
+      'While sharing, click the tile once to select the host and again to select the Pig. Moving either one ends Best Buddy.',
       'If that shared tile is captured, the Pig dies in the host’s place, the host is shoved to the nearest adjacent empty tile, and the Pig’s owner gains 2 bonus turns. If no adjacent tile is free, both fall.',
     ],
   },
@@ -186,7 +191,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'scamman',
     name: 'Fleece',
     classLabel: 'Bishop',
-    movement: ['Moves up to 3 squares diagonally.'],
+    movement: ['Moves up to 4 squares diagonally.'],
     abilities: [
       'Fraudulent Fate: any non-pawn that captures this piece becomes a basic Pawn.',
       'Identity Theft (once): after capturing a piece, activate whenever you want to permanently add that piece’s movement to the Fleece, keeping its own diagonal moves (movement only, not specials). Later captures replace the stored identity until you activate.',
@@ -198,7 +203,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Bishop',
     movement: ['Moves up to 3 squares diagonally.'],
     abilities: [
-      'Enchant: give an adjacent piece +1 movement for 2 turns (4-turn cooldown).',
+      'Enchant (free action — does not use your turn): give an adjacent piece +1 movement for 1 turn (4-turn cooldown).',
       'Magic Be-gone (2× per game): if both of your Wizards are alive, silence the opponent’s spells and magical abilities until the next day/night change (up to 5 turns). Uses your turn. Ends early if either of your Wizards dies.',
     ],
   },
@@ -209,6 +214,21 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves exactly 2 squares orthogonally. The in-between square must be empty.'],
     abilities: [
       'Burrow: after the 2-step, if an allied piece is ahead and adjacent to that landing, may go to any square up to 1 tile orthogonally or 2 tiles diagonally from that ally (any direction, clear path). Further allies ahead of a square you can reach chain at 1-tile range each.',
+    ],
+  },
+  skirmisher: {
+    id: 'skirmisher',
+    name: 'Skirmisher',
+    classLabel: 'Bishop',
+    movement: [
+      'Moves up to 4 squares diagonally.',
+      'Ricochet: if its diagonal reaches a board edge within those 4 squares, it may bounce off that edge at a 90° angle and carry on for up to 3 more squares.',
+    ],
+    abilities: [],
+    notes: [
+      'Only one ricochet per move, and never off a corner.',
+      'It can capture at the end of either leg, but pieces block the path before and after the bounce.',
+      'Lava and webs are checked along the whole ricochet route.',
     ],
   },
   queen: {
@@ -262,9 +282,9 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Gains 1 charge each night while alive (not while disabled).',
       '1+: Swap of Fates — swap with any allied piece.',
       '2+: Shadow Step — move in a 2×2 area, including over pieces.',
-      '3+: Soul Lock — night captures may revive the victim as an ally on the Reaper’s start square.',
+      '3+: Soul Lock — captures revive the victim as an ally on the Reaper’s start square (day or night).',
       '4+: Death Stare — capture in a 2×2 area without moving.',
-      '5+: World Shatterer — night captures also remove all enemy pieces of that class.',
+      '5+: World Shatterer — captures also remove all enemy pieces of that class (day or night).',
       'After capturing the inverse of your charge count (1 charge → 5 captures, 5 charges → 1 capture): all charges are spent, return home, and disable for floor(charges × 2.5) turns.',
     ],
   },
@@ -284,8 +304,8 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Queen',
     movement: [
       'Day: moves 1 tile in any direction.',
-      'Night: a 1×1 Chebyshev area at 0–1 Blood Tokens.',
-      'Every 2 Blood Tokens adds 1 tile of night radius (2 → 2×2), up to a 4×4 area.',
+      'Night: the move area grows at Blood Token milestones.',
+      '1 Blood Token → 1×1 area · 2 → 2×2 · 5 → 3×3 · 10 → 4×4 (max).',
     ],
     abilities: [
       'Starts with 1 Blood Token.',
@@ -306,6 +326,22 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Movement laws are lifted for a player whose King is in check, and never leave a side with no piece able to move.',
       'If both players field a President, each enacts a law and both apply.',
       'A law stays in force until dawn even if the President falls, but no new law is enacted without a President.',
+    ],
+  },
+  merchant: {
+    id: 'merchant',
+    name: 'Merchant',
+    classLabel: 'Queen',
+    movement: ['Moves 1 square diagonally.'],
+    abilities: [
+      'Trade Route: earns 1 coin at the end of each of your turns that it ends in enemy territory (the opponent’s half of the board). Coins go into your purse, shown under your name.',
+      'Shop (free actions on your turn, as often as you can pay): 3 coins — draw a spell card. 5 coins — give an allied non-king piece +1 range permanently. 8 coins — promote one of your pawns on the spot, wherever it stands.',
+    ],
+    notes: [
+      'Buying does not use your turn; you can still cast and move afterwards.',
+      '+1 range works like Speed+ (longer slides and jumps) and can be bought once per piece.',
+      'A bought promotion that gives check ends your turn, like any free promotion.',
+      'The purse belongs to you, but you can only shop while a Merchant is on the board.',
     ],
   },
   prince_princess: {
@@ -329,9 +365,12 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'demon',
     name: 'Demon',
     classLabel: 'Wildcard',
-    movement: ['Moves up to 2 tiles vertically, or 1 tile horizontally or diagonally.'],
-    abilities: ['Soul Syphon: capturing an enemy converts it to your side.'],
-    notes: ['Cannot move during the day.'],
+    movement: [
+      'Night: moves up to 2 tiles vertically, or 1 tile horizontally or diagonally.',
+      'Day: moves only 1 tile diagonally.',
+    ],
+    abilities: ['Soul Syphon (night only): capturing an enemy converts it to your side.'],
+    notes: ['During the day, captures are normal — the victim is taken, not converted.'],
   },
   mimic: {
     id: 'mimic',
@@ -389,6 +428,29 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       `Defense drones and entering Temporal Forme each have a ${FORME_FIELD_COOLDOWN}-turn cooldown.`,
       'Temporal Forme cannot freeze Kings, and frozen pieces still give check.',
       'Attack Forme’s bonus move is skipped if the capture gives check.',
+    ],
+  },
+  musician: {
+    id: 'musician',
+    name: 'Musician',
+    classLabel: 'Wildcard',
+    movement: [
+      'Follows a 4-beat rhythm. The beat moves on at the end of each of your turns (the 4 dots above her show it).',
+      'Beat 1 · Forte: up to 3 squares orthogonally. The only beat she can capture on.',
+      'Beat 2 · Staccato: 1 square diagonally (no capture).',
+      'Beat 3 · Leap: Knight jump (no capture).',
+      'Beat 4 · Rest: cannot move, but plays one song as a free action.',
+    ],
+    abilities: [
+      'Day songs — March: every allied pawn within 2 squares steps 1 square forward. Encore: an allied non-king piece within 2 squares makes one move now (no capture), then your turn continues.',
+      'Night songs — Lullaby: enemy non-king pieces within 2 squares fall asleep and cannot move on their next turn. Discord: enemy non-king pieces within 2 squares are knocked 2 squares straight away from her.',
+      'Crescendo: play the same song on two Rest beats in a row (moving no more than 1 square in between) to empower it. March and Lullaby reach 3 squares, Encore’s move may capture (not the King), and Discord knocks back 3 squares.',
+      'Final Note: if the Musician is captured, every piece her Lullaby put to sleep wakes up.',
+    ],
+    notes: [
+      'A sleeping piece wakes early if a piece next to it is captured.',
+      'Discord pushes stop at pieces, barriers and the board edge. Pieces knocked into lava burn, into a web get stuck, and onto Ice Floor slide 1 more square.',
+      'Songs are magic: Magic Be-gone silences them. Songs cannot be played while you are in check, and a song or Encore move that gives check ends your turn.',
     ],
   },
   drone: {

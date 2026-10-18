@@ -21,6 +21,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   scamman: { folder: 'Bishops', file: 'Scamman' },
   wizard: { folder: 'Bishops', file: 'Wizard' },
   worm: { folder: 'Bishops', file: 'Worm' },
+  skirmisher: { folder: 'Bishops', file: 'Skirmisher' },
   queen: { folder: 'Queens', file: 'Queen' },
   spider_queen: { folder: 'Queens', file: 'SpiderQueen' },
   angel: { folder: 'Queens', file: 'Angel' },
@@ -29,6 +30,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   snail: { folder: 'Queens', file: 'Snail' },
   vampire: { folder: 'Queens', file: 'Vampire' },
   president: { folder: 'Queens', file: 'President' },
+  merchant: { folder: 'Queens', file: 'Merchant' },
   prince_princess: { folder: 'Wildcards', file: 'PrincePrincess' },
   demon: { folder: 'Wildcards', file: 'Demon' },
   mimic: { folder: 'Wildcards', file: 'Mimic' },
@@ -36,6 +38,7 @@ const PIECE_ART: Record<string, { folder: string; file: string }> = {
   timekeeper: { folder: 'Wildcards', file: 'TimeKeeper' },
   prototype: { folder: 'Wildcards', file: 'Prototype' },
   drone: { folder: 'Wildcards', file: 'Drone' },
+  musician: { folder: 'Wildcards', file: 'Musician' },
   king: { folder: 'Kings', file: 'King' },
 };
 

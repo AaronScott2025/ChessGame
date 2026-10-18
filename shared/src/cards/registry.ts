@@ -32,6 +32,8 @@ export interface CardDefinition {
   tags?: Array<'rally' | 'instant' | 'persistent'>;
   playOnOpponentTurn?: boolean;
   copiesInDeck?: number;
+  /** Left out of the deck for pass-and-play games (it hides information from the opponent). */
+  onlineOnly?: boolean;
   targeting: TargetingMode;
   targetCount?: number;
   canPlay?: (ctx: CardContext) => string | null;
@@ -51,11 +53,12 @@ export function getCardDef(id: string): CardDefinition {
   return def;
 }
 
-export function buildDeck(seed: number): CardInstance[] {
+export function buildDeck(seed: number, opts?: { local?: boolean }): CardInstance[] {
   const rng = mulberry32(seed);
   const deck: CardInstance[] = [];
   let n = 0;
   for (const def of Object.values(CARD_REGISTRY)) {
+    if (opts?.local && def.onlineOnly) continue;
     const copies = def.copiesInDeck ?? 2;
     for (let i = 0; i < copies; i++) {
       deck.push({ instanceId: `card_${def.id}_${n++}`, defId: def.id });

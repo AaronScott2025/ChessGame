@@ -6,8 +6,10 @@ import {
   endBestBuddy,
   inBounds,
   isAlliedTerritory,
+  isPieceBanned,
   log,
   manhattan,
+  MIDDLE_ROWS,
   nearestEmptyAround,
   opposite,
   pieceAt,
@@ -15,11 +17,28 @@ import {
   sameCoord,
   mulberry32,
 } from '../utils.js';
-import { getPieceDef, rollGamblerStyles } from '../pieces/index.js';
-import { registerCard, requirePiece } from './registry.js';
+import { getPieceDef, rollGamblerStyles, VARIANTS_BY_CLASS } from '../pieces/index.js';
+import { getCardDef, registerCard, requirePiece } from './registry.js';
+import { revertCast } from './castRecord.js';
 
 function uid(prefix: string) {
   return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+const KING_BOOSTS = new Set([
+  'kingsstead',
+  'kingsstead_pending',
+  'speed_plus',
+  'speed_plus_pending',
+  'mathematical',
+  'movement_plus_pending',
+]);
+
+/** King movement boosts never stack and can't be refreshed while one is pending or active. */
+function assertNoKingBoost(king: PieceState): void {
+  if (king.effects.some((e) => KING_BOOSTS.has(e.kind))) {
+    throw new Error('Your king already has a movement boost (pending or active)');
+  }
 }
 
 function swapSubjects(state: GameState, piece: PieceState, newDefId: string): PieceState[] {
@@ -42,6 +61,7 @@ function applyVariantSwap(state: GameState, piece: PieceState, newDefId: string)
   const def = getPieceDef(newDefId);
   if (def.class !== piece.class) throw new Error('Must be same class');
   if (def.id === piece.defId) throw new Error('Must be different variant');
+  if (isPieceBanned(state, def.id)) throw new Error(`${def.name} was banned this game`);
   const fromName = getPieceDef(piece.defId).name;
   const subjects = swapSubjects(state, piece, def.id);
   for (const p of subjects) {
@@ -126,23 +146,29 @@ registerCard({
   name: 'Enchant',
   description: [
     'Enchant any non-king piece.',
+    'Choose any Queen variant.',
     'Survive 10 turns without moving and without any allied piece being taken.',
-    'If successful, becomes a Queen.',
+    'If successful, becomes the chosen Queen variant.',
   ],
   image: '/cards/Enchant.png',
   tags: ['persistent'],
   targeting: 'any_piece_non_king',
   play: (ctx, targets) => {
     if (!targets.length) return { state: ctx.state, done: false, message: 'Pick a non-king piece' };
+    if (targets.length < 2) return { state: ctx.state, done: false, message: 'Pick a Queen variant' };
     const piece = requirePiece(ctx.state, targets[0] as string);
     if (piece.class === 'king') throw new Error('Cannot enchant king');
+    const queenDefId = targets[1] as string;
+    if (!VARIANTS_BY_CLASS.queen.includes(queenDefId)) throw new Error('Pick a Queen variant');
+    if (isPieceBanned(ctx.state, queenDefId)) throw new Error(`${getPieceDef(queenDefId).name} is banned`);
     addEffect(piece, {
       id: uid('enchant'),
       kind: 'enchant_ritual',
       turnsRemaining: 10,
       sourceCardId: 'enchant',
-      data: { owner: ctx.player },
+      data: { owner: ctx.player, queenDefId },
     });
+    log(ctx.state, `Enchant ritual begins on ${getPieceDef(piece.defId).name} → ${getPieceDef(queenDefId).name}`);
     return { state: ctx.state, done: true };
   },
 });
@@ -150,13 +176,24 @@ registerCard({
 registerCard({
   id: 'kingstead',
   name: 'KingsStead',
-  description: ['For 3 turns, your king may move like a knight instead of its normal moves.'],
+  description: [
+    'For 3 turns, your king may move like a knight instead of its normal moves.',
+    'Takes 4 turns to take effect (king movement rule).',
+  ],
   image: '/cards/Kingstead.png',
   targeting: 'none',
   play: (ctx) => {
     const king = ctx.state.pieces.find((p) => p.color === ctx.player && p.class === 'king');
     if (!king) throw new Error('No king');
-    addEffect(king, { id: uid('ks'), kind: 'kingsstead', turnsRemaining: 3, sourceCardId: 'kingstead' });
+    assertNoKingBoost(king);
+    addEffect(king, {
+      id: uid('ks_pending'),
+      kind: 'kingsstead_pending',
+      turnsRemaining: 4,
+      data: { duration: 3 },
+      sourceCardId: 'kingstead',
+    });
+    log(ctx.state, 'KingsStead will activate on the king in 4 turns');
     return { state: ctx.state, done: true };
   },
 });
@@ -170,6 +207,7 @@ registerCard({
   play: (ctx) => {
     const king = ctx.state.pieces.find((p) => p.color === ctx.player && p.class === 'king');
     if (!king) throw new Error('No king');
+    assertNoKingBoost(king);
     // Movement on king takes 4 turns to take effect per rules
     addEffect(king, {
       id: uid('sp_pending'),
@@ -198,6 +236,7 @@ registerCard({
     if (!targets.length) return { state: ctx.state, done: false, message: 'Pick a piece' };
     const piece = requirePiece(ctx.state, targets[0] as string);
     if (piece.class === 'king') {
+      assertNoKingBoost(piece);
       addEffect(piece, {
         id: uid('math_pending'),
         kind: 'movement_plus_pending',
@@ -379,7 +418,7 @@ registerCard({
   id: 'rally',
   name: 'Rally',
   description: [
-    'Cancel the opponent\'s last played card (and its lasting effects).',
+    'Cancel the opponent\'s last played card: everything it did is undone, including lasting and delayed effects.',
     'Can be cast on either player\'s turn, even outside the spell phase.',
   ],
   image: '/cards/Rally.png',
@@ -388,60 +427,13 @@ registerCard({
   targeting: 'none',
   play: (ctx) => {
     const enemy = opposite(ctx.player);
-    const lastId = ctx.state.players[enemy].lastPlayedCardDefId;
-    let canceled = false;
-
-    if (lastId) {
-      const spells = ctx.state.players[enemy].activeSpells;
-      for (let i = spells.length - 1; i >= 0; i--) {
-        if (spells[i].defId === lastId) {
-          spells.splice(i, 1);
-          canceled = true;
-        }
-      }
-      for (const p of ctx.state.pieces) {
-        const before = p.effects.length;
-        p.effects = p.effects.filter((e) => e.sourceCardId !== lastId);
-        if (p.effects.length < before) canceled = true;
-      }
-      if (lastId === 'blink') {
-        const before = ctx.state.tokens.length;
-        ctx.state.tokens = ctx.state.tokens.filter((t) => !(t.kind === 'blink' && t.owner === enemy));
-        if (ctx.state.tokens.length < before) canceled = true;
-      }
-      if (lastId === 'portal') {
-        const before = ctx.state.tokens.length;
-        ctx.state.tokens = ctx.state.tokens.filter((t) => !(t.kind === 'portal' && t.owner === enemy));
-        if (ctx.state.tokens.length < before) canceled = true;
-      }
+    const reverted = revertCast(ctx.state, enemy);
+    if (reverted) {
       ctx.state.players[enemy].lastPlayedCardDefId = undefined;
-      if (canceled) {
-        log(ctx.state, `Rally canceled ${lastId}`);
-        return { state: ctx.state, done: true };
-      }
-      // Instant with no lasting footprint — still "cancels" the last card record
-      log(ctx.state, `Rally canceled ${lastId} (no lasting effects left)`);
+      log(ctx.state, `Rally canceled ${getCardDef(reverted).name} — all of its effects are undone`);
       return { state: ctx.state, done: true };
     }
-
-    // Fallback: cancel newest active spell, else one sourced timed effect
-    const spells = ctx.state.players[enemy].activeSpells;
-    if (spells.length) {
-      const removed = spells.pop()!;
-      log(ctx.state, `Rally canceled ${removed.defId}`);
-      return { state: ctx.state, done: true };
-    }
-    for (const p of ctx.state.pieces) {
-      for (let i = 0; i < p.effects.length; i++) {
-        const e = p.effects[i];
-        if (e.sourceCardId && e.sourceCardId !== 'rally') {
-          p.effects.splice(i, 1);
-          log(ctx.state, `Rally canceled effect ${e.kind}`);
-          return { state: ctx.state, done: true };
-        }
-      }
-    }
-    throw new Error('Nothing to cancel with Rally');
+    throw new Error('Nothing to cancel — your opponent has no card left to Rally against');
   },
 });
 
@@ -649,6 +641,7 @@ registerCard({
       const pos = targets[n * 2 + 1] as Coord;
       const def = getPieceDef(defId);
       if (def.class !== 'pawn') throw new Error('Must be a pawn variant');
+      if (isPieceBanned(ctx.state, def.id)) throw new Error(`${def.name} was banned this game`);
       if (!isAlliedTerritory(ctx.player, pos) || pieceAt(ctx.state, pos)) throw new Error('Invalid square');
       const idx = gy.findIndex((g) => g.class === 'pawn');
       if (idx < 0) throw new Error('Need fallen pawns');
@@ -806,6 +799,153 @@ function gamblerMessage(roll: number): string {
   if (roll === 10) return `Rolled ${roll}: Opponent revives one piece.`;
   if (roll === 11) return `Rolled ${roll}: Revive one of your pieces.`;
   return `Rolled ${roll}: Gain a Queen (not Royal/special-locked).`;
+}
+
+registerCard({
+  id: 'cloak',
+  name: 'Cloak',
+  description: [
+    'Online only.',
+    'Pick one of your non-king pieces: it becomes invisible to your opponent for its next 5 moves.',
+    'Its moves show up in the opponent’s battle log as <REDACTED>.',
+  ],
+  image: '/cards/Cloak.png',
+  targeting: 'allied_piece',
+  onlineOnly: true,
+  play: (ctx, targets) => {
+    if (!targets.length) return { state: ctx.state, done: false, message: 'Pick an allied piece to cloak' };
+    const piece = requirePiece(ctx.state, targets[0] as string);
+    if (piece.color !== ctx.player) throw new Error('Cloak only works on your own pieces');
+    if (piece.class === 'king') throw new Error('The king cannot be cloaked');
+    removeEffects(piece, 'cloaked');
+    addEffect(piece, { id: uid('cloak'), kind: 'cloaked', sourceCardId: 'cloak', data: { movesLeft: 5 } });
+    return { state: ctx.state, done: true };
+  },
+});
+
+registerCard({
+  id: 'in_spirit',
+  name: 'In-Spirit',
+  description: [
+    'Pick one of your pieces.',
+    'For 2 turns it captures anything within its normal moves without leaving its square.',
+  ],
+  image: '/cards/In_Spirit.png',
+  targeting: 'allied_piece',
+  play: (ctx, targets) => {
+    if (!targets.length) return { state: ctx.state, done: false, message: 'Pick an allied piece' };
+    const piece = requirePiece(ctx.state, targets[0] as string);
+    if (piece.color !== ctx.player) throw new Error('In-Spirit only works on your own pieces');
+    removeEffects(piece, 'in_spirit');
+    addEffect(piece, { id: uid('spirit'), kind: 'in_spirit', turnsRemaining: 2, sourceCardId: 'in_spirit' });
+    return { state: ctx.state, done: true };
+  },
+});
+
+registerCard({
+  id: 'coordinated_shuffle',
+  name: 'Coordinated Shuffle',
+  description: ['Pick any 2 non-king pieces, allied or enemy.', 'They swap positions.'],
+  image: '/cards/Coordinated_Shuffle.png',
+  targeting: 'any_piece_non_king',
+  targetCount: 2,
+  play: (ctx, targets) => {
+    if (targets.length < 2) {
+      return { state: ctx.state, done: false, message: `Pick ${2 - targets.length} more piece(s) to swap` };
+    }
+    const a = requirePiece(ctx.state, targets[0] as string);
+    const b = requirePiece(ctx.state, targets[1] as string);
+    if (a.id === b.id) throw new Error('Pick two different pieces');
+    if (a.class === 'king' || b.class === 'king') throw new Error('Kings cannot be shuffled');
+    if (sameCoord(a.pos, b.pos)) throw new Error('Those pieces share a square');
+    const aFrom = { ...a.pos };
+    const bFrom = { ...b.pos };
+    if (endBestBuddy(ctx.state, a, aFrom)) log(ctx.state, 'Best Buddy ended');
+    if (endBestBuddy(ctx.state, b, bFrom)) log(ctx.state, 'Best Buddy ended');
+    a.pos = bFrom;
+    b.pos = aFrom;
+    log(
+      ctx.state,
+      `Coordinated Shuffle: ${a.color} ${getPieceDef(a.defId).name} ↔ ${b.color} ${getPieceDef(b.defId).name}`,
+    );
+    return { state: ctx.state, done: true };
+  },
+});
+
+registerCard({
+  id: 'gamblers_high',
+  name: 'Gamblers High',
+  description: [
+    'Roll 2 dice (2–12):',
+    '2–4: Swap hands with your opponent.',
+    '5–6: Draw until you hold 5 cards.',
+    '7: Swap all your cards for new ones.',
+    '8: Summon a Gambler on any empty tile in allied territory.',
+    '9: Your knight variants become a new knight variant.',
+    '10: Both players lose a queen.',
+    '11: Rows 5–6 become neutral territory for 5 turns (no spells, no captures there).',
+    '12: Both kings return to their starting squares, unless that would put one in check.',
+  ],
+  image: '/cards/Gamblers_High.png',
+  targeting: 'none',
+  play: (ctx) => {
+    const roll = 1 + Math.floor(ctx.rng() * 6) + 1 + Math.floor(ctx.rng() * 6);
+    ctx.state.players[ctx.player].lastPlayedCardDefId = 'gamblers_high';
+    log(ctx.state, `${ctx.player} played Gamblers High`);
+    log(ctx.state, `Gamblers High rolled ${roll}`);
+    ctx.state.pendingPrompt = {
+      type: 'gambler_choice',
+      color: ctx.player,
+      cardDefId: 'gamblers_high',
+      roll,
+      message: highMessage(roll),
+    };
+    (ctx.state.pendingPrompt as { _instanceId?: string })._instanceId = ctx.card.instanceId;
+    return { state: ctx.state, done: false, message: highMessage(roll) };
+  },
+});
+
+registerCard({
+  id: 'lava_tsunami',
+  name: 'Lava Tsunami',
+  description: [
+    'Rows 5–6 heat up from orange to red over 3 turn cycles.',
+    'Then they turn to lava for 1 turn cycle: every non-king piece on them is destroyed,',
+    'and any piece that moves into or through the lava burns. Kings cannot enter it.',
+  ],
+  image: '/cards/Lava_Tsunami.png',
+  targeting: 'none',
+  play: (ctx) => {
+    const zones = ctx.state.zones ?? [];
+    if (zones.some((z) => z.kind === 'lava_warning' || z.kind === 'lava')) {
+      throw new Error('A Lava Tsunami is already underway');
+    }
+    ctx.state.zones = [
+      ...zones,
+      {
+        id: uid('lava'),
+        kind: 'lava_warning',
+        rows: [...MIDDLE_ROWS],
+        owner: ctx.player,
+        turnsRemaining: 3,
+        total: 3,
+        createdTurn: ctx.state.turnCount,
+      },
+    ];
+    log(ctx.state, 'Lava Tsunami: rows 5–6 begin to heat up…');
+    return { state: ctx.state, done: true };
+  },
+});
+
+function highMessage(roll: number): string {
+  if (roll <= 4) return `Rolled ${roll}: You swap hands with your opponent.`;
+  if (roll <= 6) return `Rolled ${roll}: Draw until you hold 5 cards.`;
+  if (roll === 7) return `Rolled ${roll}: Swap all of your cards for new ones.`;
+  if (roll === 8) return `Rolled ${roll}: Click an empty tile in allied territory to summon a Gambler.`;
+  if (roll === 9) return `Rolled ${roll}: Your knights become a new knight variant.`;
+  if (roll === 10) return `Rolled ${roll}: Both players lose a queen.`;
+  if (roll === 11) return `Rolled ${roll}: Rows 5–6 become neutral territory for 5 turns.`;
+  return `Rolled ${roll}: Both kings return to their starting squares (unless that puts one in check).`;
 }
 
 function delightMessage(roll: number): string {

@@ -4,6 +4,8 @@ const FX_STORAGE_KEY = 'chesspansion-fx-enabled';
 const KNOWLEDGE_STORAGE_KEY = 'chesspansion-knowledge-enabled';
 const BAN_PHASE_STORAGE_KEY = 'chesspansion-rule-ban-phase';
 const ANONYMOUS_STORAGE_KEY = 'chesspansion-rule-anonymous';
+const CARDS_STORAGE_KEY = 'chesspansion-rule-cards';
+const NO_DUPES_STORAGE_KEY = 'chesspansion-rule-no-dupes';
 const TURN_TIMER_STORAGE_KEY = 'chesspansion-rule-turn-timer';
 
 function usePersistedToggle(storageKey: string, defaultValue = true) {
@@ -47,9 +49,42 @@ export function useBanPhaseRule() {
   return { banPhaseRule, setBanPhaseRule };
 }
 
+export function useCardsRule() {
+  const [cardsRule, setCardsRule] = usePersistedToggle(CARDS_STORAGE_KEY);
+  return { cardsRule, setCardsRule };
+}
+
+export function useNoDupesRule() {
+  const [noDupesRule, setNoDupesRule] = usePersistedToggle(NO_DUPES_STORAGE_KEY, false);
+  return { noDupesRule, setNoDupesRule };
+}
+
 export function useAnonymousRule() {
   const [anonymousRule, setAnonymousRule] = usePersistedToggle(ANONYMOUS_STORAGE_KEY, false);
   return { anonymousRule, setAnonymousRule };
+}
+
+/** One of a fixed set of string options, remembered in localStorage under `chesspansion-<key>`. */
+export function useStoredChoice<T extends string>(key: string, options: readonly T[], fallback: T) {
+  const storageKey = `chesspansion-${key}`;
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      return options.includes(raw as T) ? (raw as T) : fallback;
+    } catch {
+      return fallback;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(storageKey, value);
+    } catch {
+      /* ignore */
+    }
+  }, [storageKey, value]);
+
+  return [value, setValue] as const;
 }
 
 /** Chess but Fast seconds per turn; 0 means the rule is off. */

@@ -1,6 +1,25 @@
 import type { Color, Coord, GameState, PieceState, StatusEffect } from './types.js';
 import { ALLIED_ROWS, BOARD_SIZE } from './types.js';
 
+/** Pieces banned in the ban phase (kept for the whole game once the draft ends). */
+export function bannedPieceIds(state: Pick<GameState, 'bannedPieces' | 'draft'>): string[] {
+  if (state.bannedPieces) return state.bannedPieces;
+  const bans = state.draft?.bans;
+  return bans ? [...bans.white, ...bans.black] : [];
+}
+
+export function isPieceBanned(state: Pick<GameState, 'bannedPieces' | 'draft'>, defId: string): boolean {
+  return bannedPieceIds(state).includes(defId);
+}
+
+/** First candidate that isn't banned (undefined entries are skipped). */
+export function firstUnbanned(
+  state: Pick<GameState, 'bannedPieces' | 'draft'>,
+  candidates: Array<string | undefined>,
+): string | undefined {
+  return candidates.find((id): id is string => Boolean(id) && !isPieceBanned(state, id!));
+}
+
 export function hasBloodlust(piece: PieceState): boolean {
   return (piece.bloodlustTurnsRemaining ?? 0) > 0;
 }
@@ -229,6 +248,7 @@ export function movementBonus(piece: PieceState): number {
     if (e.kind === 'movement_plus') bonus += Number(e.data?.amount ?? 1);
     if (e.kind === 'mathematical') bonus += 1;
     if (e.kind === 'wizard_enchant') bonus += 1;
+    if (e.kind === 'merchant_range') bonus += 1;
   }
   return bonus;
 }
@@ -238,7 +258,8 @@ export function isFrozen(piece: PieceState): boolean {
     hasEffect(piece, 'frozen') ||
       hasEffect(piece, 'immobilized') ||
       hasEffect(piece, 'webbed') ||
-      hasEffect(piece, 'stunned'),
+      hasEffect(piece, 'stunned') ||
+      hasEffect(piece, 'asleep'),
   );
 }
 
@@ -247,7 +268,12 @@ export function isInvincible(piece: PieceState): boolean {
 }
 
 /** Spell cards unlock at the first night (after 5 mutual turn cycles) and stay available thereafter. */
-export function spellsUnlocked(state: { cycleCount: number; dayNight: string }): boolean {
+export function spellsUnlocked(state: {
+  cycleCount: number;
+  dayNight: string;
+  rules?: { cardsDisabled?: boolean };
+}): boolean {
+  if (state.rules?.cardsDisabled) return false;
   return state.cycleCount >= 5 || state.dayNight === 'night';
 }
 
@@ -275,9 +301,12 @@ export function reaperCapturesUntilRest(charges: number): number {
   return 6 - c;
 }
 
-/** Night Chebyshev radius. 0–1 tokens → 1; every 2 tokens +1; cap 4. */
+/** Blood Token counts at which the Vampire's night radius grows to 2, 3 and 4. */
+export const VAMPIRE_RADIUS_MILESTONES = [2, 5, 10] as const;
+
+/** Night Chebyshev radius. 0–1 tokens → 1; 2 → 2; 5 → 3; 10+ → 4. */
 export function vampireNightRadius(tokens: number): number {
-  return Math.min(4, 1 + Math.floor(Math.max(0, tokens) / 2));
+  return 1 + VAMPIRE_RADIUS_MILESTONES.filter((m) => tokens >= m).length;
 }
 
 export function ownWizards(
@@ -316,8 +345,58 @@ export function webTokenAt(state: GameState, pos: Coord) {
   return state.tokens.find((t) => t.kind === 'web' && sameCoord(t.pos, pos));
 }
 
-/** First empty-or-enemy web on a queen-style ray, else destination web for leaps. */
-export function firstWebOnPath(state: GameState, from: Coord, to: Coord, mover: PieceState): Coord | null {
+/** Rows 5 and 6 (ranks counted from White's side) — the two middle rows of the board. */
+export const MIDDLE_ROWS = [4, 5];
+
+export function zoneOnRow(
+  state: Pick<GameState, 'zones'>,
+  row: number,
+  kind: 'neutral' | 'lava_warning' | 'lava',
+): boolean {
+  return (state.zones ?? []).some((z) => z.kind === kind && z.rows.includes(row));
+}
+
+/** Gamblers High neutral territory: nothing there can be captured or targeted by spells. */
+export function inNeutralZone(state: Pick<GameState, 'zones'>, pos: Coord): boolean {
+  return zoneOnRow(state, pos.row, 'neutral');
+}
+
+export function isLava(state: Pick<GameState, 'zones'>, pos: Coord): boolean {
+  return zoneOnRow(state, pos.row, 'lava');
+}
+
+/** Squares a move explicitly crosses (e.g. a Skirmisher ricochet), when it records them. */
+export function movePath(move: { meta?: Record<string, unknown> }): Coord[] | undefined {
+  const path = move.meta?.path;
+  return Array.isArray(path) ? (path as Coord[]) : undefined;
+}
+
+/**
+ * First lava square a move crosses: every square of a straight ray, or just the landing square of a leap.
+ * An explicit `path` is followed instead, up to `to`.
+ */
+export function lavaOnPath(state: Pick<GameState, 'zones'>, from: Coord, to: Coord, path?: Coord[]): Coord | null {
+  if (!state.zones?.some((z) => z.kind === 'lava')) return null;
+  if (path) {
+    const end = path.findIndex((p) => sameCoord(p, to));
+    return (end >= 0 ? path.slice(0, end + 1) : path).find((p) => isLava(state, p)) ?? null;
+  }
+  const dr = Math.sign(to.row - from.row);
+  const dc = Math.sign(to.col - from.col);
+  const absR = Math.abs(to.row - from.row);
+  const absC = Math.abs(to.col - from.col);
+  if ((dr === 0 || dc === 0 || absR === absC) && (absR > 0 || absC > 0)) {
+    for (let i = 1; i <= Math.max(absR, absC); i++) {
+      const pos = { row: from.row + dr * i, col: from.col + dc * i };
+      if (isLava(state, pos)) return pos;
+    }
+    return null;
+  }
+  return isLava(state, to) ? to : null;
+}
+
+/** First empty-or-enemy web on a queen-style ray (or an explicit `path`), else destination web for leaps. */
+export function firstWebOnPath(state: GameState, from: Coord, to: Coord, mover: PieceState, path?: Coord[]): Coord | null {
   if (immuneToWeb(mover)) return null;
   const dr = Math.sign(to.row - from.row);
   const dc = Math.sign(to.col - from.col);
@@ -330,6 +409,7 @@ export function firstWebOnPath(state: GameState, from: Coord, to: Coord, mover: 
     if (!occ) return true;
     return occ.color !== mover.color;
   };
+  if (path) return path.find(consider) ?? null;
   if (isRay) {
     const steps = Math.max(absR, absC);
     for (let i = 1; i <= steps; i++) {

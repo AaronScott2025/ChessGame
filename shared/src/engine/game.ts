@@ -1,4 +1,5 @@
 import type {
+  BoardZone,
   Color,
   Coord,
   GameRules,
@@ -8,9 +9,18 @@ import type {
   PieceState,
   PlayerState,
   PrototypeForm,
+  SongId,
+  TurnPhase,
 } from '../types.js';
 import { BOARD_SIZE, DEFAULT_RULES, MAX_HAND, TURN_TIMER_OPTIONS } from '../types.js';
-import { DRAFT_ORDER, getPieceDef, PIECES, VARIANTS_BY_CLASS, rollGamblerStyles } from '../pieces/index.js';
+import {
+  DRAFT_ORDER,
+  getPieceDef,
+  musicianBeat,
+  PIECES,
+  VARIANTS_BY_CLASS,
+  rollGamblerStyles,
+} from '../pieces/index.js';
 import {
   activeForm,
   ensureProto,
@@ -27,7 +37,16 @@ import {
 } from '../pieces/prototype.js';
 import type { MoveOption } from '../pieces/helpers.js';
 import { chebyshevPathBlocked, isKnightLanding, isPigLShape } from '../pieces/helpers.js';
-import { buildDeck, discardCard, drawCard, getCardDef } from '../cards/index.js';
+import {
+  buildDeck,
+  castFrame,
+  closeCast,
+  discardCard,
+  drawCard,
+  getCardDef,
+  openCast,
+  recordCast,
+} from '../cards/index.js';
 import { LAWS, lawActive, rollLawOptions } from '../laws.js';
 import {
   abilityFx,
@@ -60,17 +79,35 @@ import {
   bothOwnWizardsAlive,
   magicBegoneUses,
   reaperCapturesUntilRest,
+  vampireNightRadius,
   immuneToWeb,
   firstWebOnPath,
   webTokenAt,
+  bannedPieceIds,
+  firstUnbanned,
+  isPieceBanned,
+  inNeutralZone,
+  isLava,
+  lavaOnPath,
+  movePath,
+  MIDDLE_ROWS,
+  pawnDirection,
 } from '../utils.js';
 
+/** Who answers a Gambler prompt: some Gambit/Delight rolls hand the choice to the opponent. */
+function gamblerChooser(prompt: { color: Color; cardDefId: string; roll: number }): Color {
+  if (prompt.cardDefId === 'gamblers_high') return prompt.color;
+  const opponentPicks = prompt.roll <= 4 || (prompt.cardDefId === 'gamblers_gambit' && prompt.roll === 10);
+  return opponentPicks ? opposite(prompt.color) : prompt.color;
+}
+
+/** The player who must answer `prompt` (a Gambler roll can hand the choice to the opponent). */
+export function promptActor(prompt: PendingPrompt): Color {
+  return prompt.type === 'gambler_choice' ? gamblerChooser(prompt) : prompt.color;
+}
+
 function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
-  const chooser =
-    prompt.type === 'gambler_choice' &&
-    (prompt.roll <= 4 || (prompt.cardDefId === 'gamblers_gambit' && prompt.roll === 10))
-      ? opposite(prompt.color)
-      : prompt.color;
+  const chooser = prompt.type === 'gambler_choice' ? gamblerChooser(prompt) : prompt.color;
   const yours = chooser === color;
 
   switch (prompt.type) {
@@ -91,6 +128,14 @@ function pendingPromptBusyMessage(prompt: PendingPrompt, color: Color): string {
         ? 'Keep or redraw your opening hand first'
         : 'Waiting for opponent to finish their opening hand';
     case 'gambler_choice': {
+      if (prompt.cardDefId === 'gamblers_high') {
+        if (prompt.roll === 8) {
+          return yours
+            ? 'Click an empty allied tile to summon the Gambler first (Gamblers High)'
+            : 'Waiting for opponent to summon a Gambler (Gamblers High)';
+        }
+        return yours ? 'Confirm the Gamblers High result first' : 'Waiting for opponent to confirm Gamblers High';
+      }
       const cardName = prompt.cardDefId === 'gamblers_delight' ? "Gambler's Delight" : "Gambler's Gambit";
       if (prompt.roll <= 4) {
         return yours
@@ -223,6 +268,8 @@ export function normalizeRules(input: Partial<Record<keyof GameRules, unknown>> 
   const rules: GameRules = { ...DEFAULT_RULES };
   if (typeof input.banPhase === 'boolean') rules.banPhase = input.banPhase;
   if (input.anonymous === true) rules.anonymous = true;
+  if (input.cardsDisabled === true) rules.cardsDisabled = true;
+  if (input.noDupes === true) rules.noDupes = true;
   const secs = TURN_TIMER_OPTIONS.find((s) => s === input.turnTimerSeconds);
   if (secs) rules.turnTimerSeconds = secs;
   return rules;
@@ -239,6 +286,7 @@ export function startDraft(state: GameState): GameState {
   const next = cloneState(state);
   next.phase = 'draft';
   const banPhase = next.rules?.banPhase ?? DEFAULT_RULES.banPhase;
+  delete next.bannedPieces;
   next.draft = {
     pickingColor: 'white',
     blackChoseFirstPicker: null,
@@ -263,8 +311,7 @@ export function chooseFirstPicker(state: GameState, whitePicksFirst: boolean): G
 export const BANS_PER_COLOR = 2;
 
 export function draftBannedIds(state: GameState): string[] {
-  const bans = state.draft?.bans;
-  return bans ? [...bans.white, ...bans.black] : [];
+  return bannedPieceIds(state);
 }
 
 /** Why `color` can't ban `defId` right now, or null if the ban is allowed. */
@@ -303,6 +350,12 @@ export function draftBan(state: GameState, color: Color, defId: string): GameSta
   return next;
 }
 
+/** Pieces `color` may not draft because the opponent already took them (No Dupes rule). */
+export function draftTakenIds(state: GameState, color: Color): string[] {
+  if (!state.rules?.noDupes) return [];
+  return Object.values(state.players[opposite(color)].army).filter((id): id is string => Boolean(id));
+}
+
 export function draftPick(state: GameState, color: Color, defId: string): GameState {
   if (state.phase !== 'draft' || !state.draft) throw new Error('Not drafting');
   if (state.draft.blackChoseFirstPicker == null) throw new Error('Black must choose who picks first');
@@ -314,6 +367,7 @@ export function draftPick(state: GameState, color: Color, defId: string): GameSt
   if (cls === 'king' || !DRAFT_ORDER.includes(cls)) throw new Error('Invalid draft class');
   if (!VARIANTS_BY_CLASS[cls]?.includes(defId)) throw new Error('Invalid variant for this class');
   if (draftBannedIds(state).includes(defId)) throw new Error(`${def.name} is banned`);
+  if (draftTakenIds(state, color).includes(defId)) throw new Error(`${def.name} was already drafted by your opponent`);
   if (state.players[color].army[cls]) throw new Error(`Already drafted ${cls}`);
 
   const next = cloneState(state);
@@ -329,9 +383,16 @@ export function draftPick(state: GameState, color: Color, defId: string): GameSt
   return next;
 }
 
-const ANGEL_MAX_REVIVES = 4;
+export const ANGEL_MAX_REVIVES = 4;
 /** Allied effects tick at the end of the owner's turn, so 2 covers the opponent's next turn. */
 const ANGEL_BLESS_TURNS = 2;
+
+/** `preferred` unless it was banned; otherwise the owner's drafted variant of that class (never banned). */
+function allowedVariant(state: GameState, color: Color, cls: PieceClass, preferred: string): string {
+  return (
+    firstUnbanned(state, [preferred, state.players[color].army[cls], ...(VARIANTS_BY_CLASS[cls] ?? [])]) ?? preferred
+  );
+}
 
 function initialCharges(defId: string): number | undefined {
   if (defId === 'reaper') return 0;
@@ -347,11 +408,18 @@ function armyDraftComplete(army: Partial<Record<PieceClass, string>>): boolean {
 function finishDraftAndSetup(state: GameState): GameState {
   const next = state;
   next.phase = 'opening_draw';
+  next.bannedPieces = draftBannedIds(next);
   next.draft = null;
   next.pieces = spawnArmies(next);
   const spawnRng = mulberry32(next.rngSeed + 7919);
   for (const line of rollGamblerStyles(next, spawnRng)) log(next, line);
-  next.deck = buildDeck(next.rngSeed);
+  if (next.rules?.cardsDisabled) {
+    next.deck = [];
+    log(next, 'Armies placed. Cards are disabled this game.');
+    beginPlay(next);
+    return next;
+  }
+  next.deck = buildDeck(next.rngSeed, { local: next.roomCode === 'LOCAL' });
   for (const color of ['white', 'black'] as Color[]) {
     for (let i = 0; i < 3; i++) {
       drawCard(next, color, { avoidDupes: true });
@@ -360,6 +428,21 @@ function finishDraftAndSetup(state: GameState): GameState {
   next.pendingPrompt = { type: 'opening_mulligan', color: 'white' };
   log(next, 'Armies placed. Opening hand draw — White mulligan first.');
   return next;
+}
+
+function beginPlay(next: GameState): void {
+  next.pendingPrompt = null;
+  next.phase = 'playing';
+  next.turn = 'white';
+  next.turnPhase = spellsUnlocked(next) ? 'spell' : 'move';
+  pushSnapshot(next);
+  log(
+    next,
+    next.rules?.cardsDisabled
+      ? 'Game start — White to play.'
+      : 'Game start — White to play. Spell cards unlock at the first night.',
+  );
+  queueLawOffers(next);
 }
 
 function spawnArmies(state: GameState): PieceState[] {
@@ -444,13 +527,7 @@ export function openingKeep(state: GameState, color: Color): GameState {
   if (color === 'white') {
     next.pendingPrompt = { type: 'opening_mulligan', color: 'black' };
   } else {
-    next.pendingPrompt = null;
-    next.phase = 'playing';
-    next.turn = 'white';
-    next.turnPhase = spellsUnlocked(next) ? 'spell' : 'move';
-    pushSnapshot(next);
-    log(next, 'Game start — White to play. Spell cards unlock at the first night.');
-    queueLawOffers(next);
+    beginPlay(next);
   }
   return next;
 }
@@ -475,6 +552,7 @@ export function openingRedraw(state: GameState, color: Color, instanceId: string
 function pushSnapshot(state: GameState): void {
   const copy = cloneState(state);
   copy.snapshots = [];
+  delete copy.castRecords;
   state.snapshots.unshift(JSON.stringify(copy));
   if (state.snapshots.length > 12) state.snapshots.length = 12;
 }
@@ -499,6 +577,25 @@ export function isInCheck(state: GameState, color: Color): boolean {
   return isSquareAttacked(state, king.pos, opposite(color));
 }
 
+/** Black's turn ending on a 5-cycle boundary flips day/night before White can reply. */
+function turnEndFlipsCycle(state: GameState, color: Color): boolean {
+  return color === 'black' && (state.cycleCount + 1) % 5 === 0;
+}
+
+/**
+ * Whether `color`'s king is attacked when the opponent next acts. If ending this turn flips
+ * day/night, attacks are judged in the new phase — pieces like the Demon change pattern at dusk.
+ */
+function kingExposedAtHandover(state: GameState, color: Color): boolean {
+  if (!turnEndFlipsCycle(state, color)) return isInCheck(state, color);
+  const trial = cloneState(state);
+  trial.cycleCount += 1;
+  trial.previousDayNight = trial.dayNight;
+  trial.dayNight = trial.dayNight === 'day' ? 'night' : 'day';
+  applyDayNightSideEffects(trial, trial.dayNight, false);
+  return isInCheck(trial, color);
+}
+
 /** Recompute which king (if any) is in check from the current board. */
 export function refreshCheckState(state: GameState): Color | null {
   if (state.phase !== 'playing') {
@@ -516,7 +613,7 @@ export function refreshCheckState(state: GameState): Color | null {
 }
 
 function assertOwnKingSafe(state: GameState, color: Color, action: string): void {
-  if (isInCheck(state, color)) {
+  if (kingExposedAtHandover(state, color)) {
     throw new Error(`${action} is illegal — you are in check and it does not save your king`);
   }
 }
@@ -596,7 +693,11 @@ function queueLawOffers(state: GameState): void {
     const president = state.pieces.find((p) => p.defId === 'president' && p.color === color);
     if (!president) continue;
     const rng = mulberry32(state.rngSeed + state.cycleCount * 7717 + (color === 'white' ? 131 : 262));
-    offers.push({ color, pieceId: president.id, options: rollLawOptions(rng) });
+    offers.push({ color, pieceId: president.id, options: rollLawOptions(rng, undefined, {
+        bannedPieces: bannedPieceIds(state),
+        cardsDisabled: state.rules?.cardsDisabled,
+      }),
+    });
   }
   state.lawOffers = offers.length ? offers : undefined;
 }
@@ -732,7 +833,51 @@ function lawMandateFor(state: GameState, piece: PieceState): string | null {
   return null;
 }
 
-const NON_RELOCATING_SPECIALS = new Set(['archer_shot', 'death_stare', 'giga_stomp']);
+/** Specials that capture the target square while the attacker stays put. */
+const CAPTURE_IN_PLACE = new Set(['archer_shot', 'death_stare', 'spirit_strike']);
+const NON_RELOCATING_SPECIALS = new Set([...CAPTURE_IN_PLACE, 'giga_stomp']);
+
+function capturesInPlace(special: string | undefined): boolean {
+  return Boolean(special && CAPTURE_IN_PLACE.has(special));
+}
+
+/** Specials that teleport, swap or stay put instead of travelling across the board. */
+const LAVA_SAFE_SPECIALS = new Set([
+  ...NON_RELOCATING_SPECIALS,
+  'castle_swap',
+  'ancient_shuffle',
+  'swap_of_fates',
+  'best_buddy',
+  'portal_travel',
+  'blink_return',
+]);
+
+/** A non-king piece that walks into or across lava is destroyed instead of arriving. */
+function burnsInLava(state: GameState, piece: PieceState, move: MoveOption): boolean {
+  if (piece.class === 'king') return false;
+  if (move.special && LAVA_SAFE_SPECIALS.has(move.special)) return false;
+  return Boolean(lavaOnPath(state, piece.pos, move.to, movePath(move)));
+}
+
+/** In-Spirit, neutral territory and lava, applied after a piece's own movement rules. */
+function applyZoneAndSpiritRules(state: GameState, piece: PieceState, moves: MoveOption[]): MoveOption[] {
+  let out = moves;
+  if (hasEffect(piece, 'in_spirit')) {
+    out = out.map((m) =>
+      m.capture && !m.special ? { to: m.to, capture: true, special: 'spirit_strike' } : m,
+    );
+  }
+  if (!state.zones?.length) return out;
+  return out.filter((m) => {
+    if (inNeutralZone(state, m.to)) {
+      const occ = pieceAt(state, m.to);
+      if (m.capture || (occ && occ.color !== piece.color)) return false;
+    }
+    const travels = !m.special || !LAVA_SAFE_SPECIALS.has(m.special);
+    if (piece.class === 'king' && travels && lavaOnPath(state, piece.pos, m.to)) return false;
+    return true;
+  });
+}
 
 function applyLawRestrictions(state: GameState, piece: PieceState, moves: MoveOption[]): MoveOption[] {
   const active = new Set((state.laws ?? []).filter((l) => LAWS[l.id]?.kind === 'restrict').map((l) => l.id));
@@ -744,7 +889,7 @@ function applyLawRestrictions(state: GameState, piece: PieceState, moves: MoveOp
   }
   return moves.filter((m) => {
     const relocates = !m.special || !NON_RELOCATING_SPECIALS.has(m.special);
-    if (active.has('speed_limit') && !m.special && chebyshev(piece.pos, m.to) > 3) return false;
+    if (active.has('speed_limit') && !m.special && (movePath(m)?.length ?? chebyshev(piece.pos, m.to)) > 3) return false;
     if (active.has('no_retreat') && relocates && piece.class !== 'king') {
       const backward = piece.color === 'white' ? m.to.row > piece.pos.row : m.to.row < piece.pos.row;
       if (backward) return false;
@@ -882,16 +1027,32 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
   const bonus = state.bonusMove;
   if (bonus && bonus.color === piece.color) {
     if (bonus.pieceId !== piece.id) return [];
-    moves = prototypeBonusMoves(piece, state).filter((m) => pieceAt(state, m.to)?.class !== 'king');
+    if (bonus.kind === 'encore') {
+      moves = moves.filter((m) => {
+        const occ = pieceAt(state, m.to);
+        const hitsEnemy = Boolean(m.capture || (occ && occ.color !== piece.color));
+        if (m.special === 'giga_stomp') return false;
+        if (!hitsEnemy) return true;
+        return Boolean(bonus.canCapture) && occ?.class !== 'king';
+      });
+    } else {
+      moves = prototypeBonusMoves(piece, state).filter((m) => pieceAt(state, m.to)?.class !== 'king');
+    }
   }
 
   moves = applyLawRestrictions(state, piece, moves);
+  moves = applyZoneAndSpiritRules(state, piece, moves);
 
   // Filter moves that leave own king in check
   return moves.filter((m) => {
     try {
       const trial = cloneState(state);
       const tp = trial.pieces.find((p) => p.id === pieceId)!;
+      if (burnsInLava(trial, tp, m)) {
+        endBestBuddy(trial, tp, { ...tp.pos });
+        trial.pieces = trial.pieces.filter((p) => p.id !== tp.id);
+        return !kingExposedAtHandover(trial, piece.color);
+      }
       const occ = pieceAt(trial, m.to);
       if (occ && occ.color !== tp.color) {
         trial.pieces = trial.pieces.filter((p) => p.id !== occ.id);
@@ -914,7 +1075,7 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
       } else if (m.special === 'best_buddy') {
         tp.pos = { ...m.to };
         tp.coOccupantId = m.meta?.withId as string;
-      } else if (m.special === 'death_stare' || m.special === 'archer_shot') {
+      } else if (capturesInPlace(m.special)) {
         trial.pieces = trial.pieces.filter((p) => !(sameCoord(p.pos, m.to) && p.color !== tp.color));
       } else if (m.special === 'giga_stomp') {
         const dr = Math.sign(m.to.row - tp.pos.row);
@@ -955,7 +1116,7 @@ export function listMoves(state: GameState, pieceId: string, options?: { forAtta
           simulatePortalHop(trial, tp);
         }
       }
-      return !isInCheck(trial, piece.color);
+      return !kingExposedAtHandover(trial, piece.color);
     } catch {
       return false;
     }
@@ -1012,7 +1173,7 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
         !isInCheck(state, piece.color),
       hint: isInCheck(state, piece.color)
         ? 'Cannot Enchant while in check — you must save your king first'
-        : '+1 movement to an adjacent piece for 2 turns (4-turn cooldown)',
+        : 'Free action: +1 movement to an adjacent piece for 1 turn (4-turn cooldown)',
     });
     const bothWizards = bothOwnWizardsAlive(state, piece.color);
     const used = magicBegoneUses(state, piece.color);
@@ -1171,12 +1332,421 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
     });
   }
   if (piece.defId === 'prototype') out.push(...prototypeAbilityList(state, piece));
+  if (piece.defId === 'musician') out.push(...musicianSongList(state, piece));
+  if (piece.defId === 'merchant') out.push(...merchantShopList(state, piece));
 
-  if (state.bonusMove?.color === piece.color) {
-    const hint = 'Only the Prototype’s bonus Knight move is available right now';
-    return out.map((a) => (a.passive || a.id === 'bonus_end' ? a : { ...a, ready: false, hint }));
+  const bonus = state.bonusMove;
+  if (bonus?.color === piece.color) {
+    if (bonus.kind === 'encore' && bonus.pieceId === piece.id) {
+      out.push({ id: 'encore_skip', name: 'Skip Encore Move', ready: true, hint: 'Give up the Encore move and carry on with your turn.' });
+    }
+    const hint =
+      bonus.kind === 'encore'
+        ? 'Make or skip the Encore move first'
+        : 'Only the Prototype’s bonus Knight move is available right now';
+    return out.map((a) => (a.passive || a.id === 'bonus_end' || a.id === 'encore_skip' ? a : { ...a, ready: false, hint }));
   }
   return out;
+}
+
+const SONGS: Record<SongId, { name: string; text: string; crescendo: string }> = {
+  march: {
+    name: 'March',
+    text: 'Every allied pawn within 2 squares steps 1 square forward (if the square is empty).',
+    crescendo: 'reaches 3 squares.',
+  },
+  encore: {
+    name: 'Encore',
+    text: 'An allied non-king piece within 2 squares makes one move right now (no capture), then your turn continues.',
+    crescendo: 'the Encore move may capture (not the king).',
+  },
+  lullaby: {
+    name: 'Lullaby',
+    text: 'Enemy non-king pieces within 2 squares fall asleep and cannot move on their next turn. A sleeper wakes if a piece next to it is captured.',
+    crescendo: 'reaches 3 squares.',
+  },
+  discord: {
+    name: 'Discord',
+    text: 'Enemy non-king pieces within 2 squares are knocked 2 squares straight away from the Musician.',
+    crescendo: 'knocked back 3 squares.',
+  },
+};
+
+const DAY_SONGS: SongId[] = ['march', 'encore'];
+const NIGHT_SONGS: SongId[] = ['lullaby', 'discord'];
+const SONG_ABILITY_IDS = [...DAY_SONGS, ...NIGHT_SONGS].map((s) => `song_${s}`);
+
+/** Same song as last Rest beat, without wandering more than 1 square in between. */
+function crescendoReady(piece: PieceState, song: SongId): boolean {
+  const m = piece.music;
+  return Boolean(m?.lastSong === song && m.lastSongAt && chebyshev(m.lastSongAt, piece.pos) <= 1);
+}
+
+function songBlocker(state: GameState, piece: PieceState): string | null {
+  if (state.turn !== piece.color) return 'Only on your turn';
+  const beat = musicianBeat(piece);
+  if (beat !== 4) return `Songs play on the Rest beat (now beat ${beat} of 4)`;
+  if (piece.music?.sang) return 'Already played a song this Rest beat';
+  if (isFrozen(piece) || (piece.disabledTurns ?? 0) > 0) return 'The Musician cannot play right now';
+  if (isMagicDisabled(state, piece.color)) return 'Magic is silenced (Magic Be-gone)';
+  if (isInCheck(state, piece.color)) return 'Cannot play a song while in check';
+  return null;
+}
+
+function songRadius(song: SongId, crescendo: boolean): number {
+  return crescendo && (song === 'march' || song === 'lullaby') ? 3 : 2;
+}
+
+function songVictims(state: GameState, musician: PieceState, radius: number): PieceState[] {
+  return state.pieces.filter(
+    (p) =>
+      p.color !== musician.color &&
+      p.class !== 'king' &&
+      !p.coOccupantId &&
+      !hasEffect(p, 'pause') &&
+      chebyshev(p.pos, musician.pos) <= radius,
+  );
+}
+
+function marchStep(state: GameState, pawn: PieceState): Coord | null {
+  if (isFrozen(pawn) || (pawn.disabledTurns ?? 0) > 0 || hasEffect(pawn, 'cannot_move') || pawn.coOccupantId) return null;
+  const to = { row: pawn.pos.row + pawnDirection(pawn.color), col: pawn.pos.col };
+  if (squareBlockedForDisplacement(state, to)) return null;
+  // Spiders are taken on reaching the far edge.
+  if (pawn.defId === 'spider' && to.row === (pawn.color === 'white' ? 0 : BOARD_SIZE - 1)) return null;
+  return to;
+}
+
+function marchPawns(state: GameState, musician: PieceState, radius: number): PieceState[] {
+  return state.pieces.filter(
+    (p) => p.color === musician.color && p.class === 'pawn' && chebyshev(p.pos, musician.pos) <= radius,
+  );
+}
+
+function encoreTargets(state: GameState, musician: PieceState, canCapture: boolean): PieceState[] {
+  return state.pieces.filter((p) => {
+    if (p.color !== musician.color || p.id === musician.id || p.class === 'king' || p.coOccupantId) return false;
+    if (chebyshev(p.pos, musician.pos) > 2) return false;
+    const trial: GameState = {
+      ...state,
+      history: [],
+      snapshots: [],
+      bonusMove: { color: musician.color, pieceId: p.id, kind: 'encore', canCapture },
+    };
+    return listMoves(trial, p.id).length > 0;
+  });
+}
+
+function songTargetsBlocker(state: GameState, musician: PieceState, song: SongId, crescendo: boolean): string | null {
+  const radius = songRadius(song, crescendo);
+  if (song === 'march') {
+    return marchPawns(state, musician, radius).some((p) => marchStep(state, p)) ? null : 'No pawn in range can step forward';
+  }
+  if (song === 'encore') {
+    return encoreTargets(state, musician, crescendo).length ? null : 'No ally within 2 squares can move';
+  }
+  return songVictims(state, musician, radius).length ? null : 'No enemy piece in range';
+}
+
+function musicianSongList(
+  state: GameState,
+  piece: PieceState,
+): Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> {
+  const songs = state.dayNight === 'day' ? DAY_SONGS : NIGHT_SONGS;
+  const blocker = songBlocker(state, piece);
+  return songs.map((song) => {
+    const info = SONGS[song];
+    const crescendo = crescendoReady(piece, song);
+    const reason = blocker ?? songTargetsBlocker(state, piece, song, crescendo);
+    return {
+      id: `song_${song}`,
+      name: crescendo ? `${info.name} (Crescendo)` : info.name,
+      ready: !reason,
+      hint: `${reason ? `${reason}. ` : ''}${info.text}${crescendo ? ` Crescendo: ${info.crescendo}` : ''} Free action.`,
+    };
+  });
+}
+
+const MERCHANT_WARES = {
+  merchant_card: { name: 'Buy a Card', price: 3, text: 'Draw a spell card.' },
+  merchant_range: { name: 'Buy +1 Range', price: 5, text: 'Give an allied non-king piece +1 range permanently (once per piece).' },
+  merchant_promote: { name: 'Buy a Promotion', price: 8, text: 'Promote one of your pawns on the spot, wherever it stands.' },
+} as const;
+type MerchantWare = keyof typeof MERCHANT_WARES;
+const MERCHANT_ABILITY_IDS = Object.keys(MERCHANT_WARES) as MerchantWare[];
+
+function isMerchantWare(id: string): id is MerchantWare {
+  return id in MERCHANT_WARES;
+}
+
+function merchantRangeTargets(state: GameState, color: Color): PieceState[] {
+  return state.pieces.filter((p) => p.color === color && p.class !== 'king' && !hasEffect(p, 'merchant_range'));
+}
+
+function merchantPromoteTargets(state: GameState, color: Color): PieceState[] {
+  return state.pieces.filter(
+    (p) => p.color === color && p.class === 'pawn' && p.defId !== 'enchanted_pawn' && p.defId !== 'spider',
+  );
+}
+
+function merchantWareBlocker(state: GameState, color: Color, ware: MerchantWare): string | null {
+  if (ware === 'merchant_card') {
+    if (state.rules?.cardsDisabled) return 'Spell cards are off this game';
+    if (state.players[color].hand.length >= MAX_HAND) return 'Your hand is full';
+    if (!state.deck.length && !state.discardPile.length) return 'The deck is empty';
+    return null;
+  }
+  if (ware === 'merchant_range') return merchantRangeTargets(state, color).length ? null : 'Every piece already has the bonus';
+  return merchantPromoteTargets(state, color).length ? null : 'No pawn to promote';
+}
+
+function merchantShopList(
+  state: GameState,
+  piece: PieceState,
+): Array<{ id: string; name: string; ready: boolean; hint?: string; passive?: boolean }> {
+  const coins = state.players[piece.color].coins ?? 0;
+  const closed =
+    state.turn !== piece.color ? 'Only on your turn' : (piece.disabledTurns ?? 0) > 0 ? 'The Merchant is disabled' : null;
+  return MERCHANT_ABILITY_IDS.map((id) => {
+    const ware = MERCHANT_WARES[id];
+    const reason =
+      closed ?? (coins < ware.price ? `Needs ${ware.price} coins (you have ${coins})` : merchantWareBlocker(state, piece.color, id));
+    return {
+      id,
+      name: `${ware.name} (${ware.price})`,
+      ready: !reason,
+      hint: `${reason ? `${reason}. ` : ''}${ware.text} Costs ${ware.price} coins. Free action.`,
+    };
+  });
+}
+
+/** Spend coins on a ware. Targeted wares open a square-pick prompt first; coins are paid once a target is chosen. */
+function merchantBuy(
+  state: GameState,
+  color: Color,
+  merchant: PieceState,
+  ware: MerchantWare,
+  resumeTurnPhase: TurnPhase,
+  target?: unknown,
+): GameState {
+  const player = state.players[color];
+  const price = MERCHANT_WARES[ware].price;
+  if ((player.coins ?? 0) < price) throw new Error(`Needs ${price} coins`);
+  const pay = () => {
+    player.coins = (player.coins ?? 0) - price;
+    abilityFx(state, 'merchant_buy');
+  };
+
+  if (ware === 'merchant_card') {
+    const card = drawCard(state, color);
+    if (!card) throw new Error('No card to draw');
+    pay();
+    state.turnPhase = resumeTurnPhase;
+    log(state, `${color} Merchant bought a card (${player.coins} coins left)`);
+    return state;
+  }
+
+  const options = ware === 'merchant_range' ? merchantRangeTargets(state, color) : merchantPromoteTargets(state, color);
+  const pos = target && typeof target === 'object' && 'row' in (target as object) ? (target as Coord) : undefined;
+  if (!pos) {
+    state.pendingPrompt = {
+      type: 'ability_target',
+      color,
+      pieceId: merchant.id,
+      abilityId: ware,
+      message:
+        ware === 'merchant_range'
+          ? `Merchant: click an ally to give it +1 range for good (${price} coins)`
+          : `Merchant: click a pawn to promote it on the spot (${price} coins)`,
+      options: options.map((p) => ({ ...p.pos })),
+      resumeTurnPhase,
+    };
+    return state;
+  }
+  const chosen = options.find((p) => sameCoord(p.pos, pos));
+  if (!chosen) throw new Error(ware === 'merchant_range' ? 'Pick an ally without the bonus' : 'Pick one of your pawns');
+  state.pendingPrompt = null;
+  state.turnPhase = resumeTurnPhase;
+  pay();
+  const name = getPieceDef(chosen.defId).name;
+  if (ware === 'merchant_range') {
+    addEffect(chosen, { id: `merchant_range_${chosen.id}`, kind: 'merchant_range' });
+    log(state, `${color} Merchant sold the ${name} +1 range (${player.coins} coins left)`);
+    return state;
+  }
+  state.pendingPrompt = { type: 'promote', color, pieceId: chosen.id, options: promotionOptions(state, chosen), free: true };
+  log(state, `${color} Merchant bought the ${name} a promotion (${player.coins} coins left)`);
+  return state;
+}
+
+/** End of `color`'s turn: each of its Merchants standing in enemy territory earns 1 coin. */
+function payMerchants(state: GameState, color: Color): void {
+  if (state.phase !== 'playing') return;
+  const earners = state.pieces.filter(
+    (p) => p.color === color && p.defId === 'merchant' && isAlliedTerritory(opposite(color), p.pos),
+  ).length;
+  if (!earners) return;
+  const player = state.players[color];
+  player.coins = (player.coins ?? 0) + earners;
+  log(state, `${color} Merchant earns ${earners === 1 ? 'a coin' : `${earners} coins`} (${player.coins} in the purse)`);
+  abilityFx(state, 'merchant_coin');
+}
+
+/** End of `color`'s turn: every Musician moves to its next beat. A silent Rest breaks the Crescendo streak. */
+function advanceMusicianBeats(state: GameState, color: Color): void {
+  for (const p of state.pieces) {
+    if (p.defId !== 'musician' || p.color !== color) continue;
+    const m = (p.music ??= { beat: 1 });
+    if (musicianBeat(p) === 4 && !m.sang) {
+      m.lastSong = undefined;
+      m.lastSongAt = undefined;
+    }
+    m.beat = (musicianBeat(p) % 4) + 1;
+    m.sang = false;
+  }
+}
+
+/** Push `piece` up to `steps` squares along (dr, dc). Blocked squares stop it; webs snare; lava burns; ice slides 1 more. */
+function knockBack(state: GameState, piece: PieceState, dr: number, dc: number, steps: number): boolean {
+  const origin = { ...piece.pos };
+  let pos = { ...origin };
+  let moved = 0;
+  let webbed = false;
+  for (let i = 0; i < steps; i++) {
+    const step = { row: pos.row + dr, col: pos.col + dc };
+    if (squareBlockedForDisplacement(state, step)) break;
+    pos = step;
+    moved += 1;
+    if (isLava(state, pos) || (!immuneToWeb(piece) && webTokenAt(state, pos))) {
+      webbed = !isLava(state, pos);
+      break;
+    }
+  }
+  if (!moved) return false;
+  if (!webbed && !isLava(state, pos) && state.tokens.some((t) => t.kind === 'ice_floor' && sameCoord(t.pos, pos))) {
+    const slide = { row: pos.row + dr, col: pos.col + dc };
+    if (!squareBlockedForDisplacement(state, slide)) pos = slide;
+  }
+  endBestBuddy(state, piece, origin);
+  piece.pos = pos;
+  if (isLava(state, pos)) {
+    burnInLava(state, piece);
+    log(state, `${getPieceDef(piece.defId).name} was knocked into the lava`);
+    return true;
+  }
+  snareInWeb(state, piece);
+  return true;
+}
+
+function playSong(
+  state: GameState,
+  color: Color,
+  musician: PieceState,
+  song: SongId,
+  resumeTurnPhase: TurnPhase,
+  target?: Coord,
+): GameState {
+  const crescendo = crescendoReady(musician, song);
+  const radius = songRadius(song, crescendo);
+  const name = `${SONGS[song].name}${crescendo ? ' (Crescendo)' : ''}`;
+
+  if (song === 'encore') {
+    const options = encoreTargets(state, musician, crescendo);
+    if (!target) {
+      state.pendingPrompt = {
+        type: 'ability_target',
+        color,
+        pieceId: musician.id,
+        abilityId: 'song_encore',
+        message: `${name}: click an ally within 2 squares to move it now`,
+        options: options.map((p) => ({ ...p.pos })),
+        resumeTurnPhase,
+      };
+      return state;
+    }
+    const ally = options.find((p) => sameCoord(p.pos, target));
+    if (!ally) throw new Error('Pick an ally within 2 squares that can move');
+    recordSong(musician, song);
+    state.pendingPrompt = null;
+    state.bonusMove = { color, pieceId: ally.id, kind: 'encore', canCapture: crescendo, resumeTurnPhase };
+    state.turnPhase = 'move';
+    log(state, `${color} Musician played ${name} — the ${getPieceDef(ally.defId).name} moves now`);
+    abilityFx(state, crescendo ? 'crescendo' : 'song_encore');
+    return state;
+  }
+
+  if (song === 'march') {
+    const forward = pawnDirection(color);
+    // Front pawns step first so a whole column can advance together.
+    const pawns = marchPawns(state, musician, radius).sort((a, b) => (a.pos.row - b.pos.row) * -forward);
+    let stepped = 0;
+    for (const pawn of pawns) {
+      const to = marchStep(state, pawn);
+      if (!to) continue;
+      const origin = { ...pawn.pos };
+      endBestBuddy(state, pawn, origin);
+      pawn.pos = to;
+      pawn.hasMoved = true;
+      stepped += 1;
+      if (isLava(state, to)) {
+        burnInLava(state, pawn);
+        continue;
+      }
+      snareInWeb(state, pawn);
+    }
+    if (!stepped) throw new Error('No pawn in range can step forward');
+    log(state, `${color} Musician played ${name} — ${stepped} pawn${stepped === 1 ? '' : 's'} march forward`);
+  } else if (song === 'lullaby') {
+    const sleepers = songVictims(state, musician, radius);
+    if (!sleepers.length) throw new Error('No enemy piece in range');
+    for (const p of sleepers) {
+      removeEffects(p, 'asleep');
+      addEffect(p, {
+        id: `asleep_${p.id}_${state.turnCount}`,
+        kind: 'asleep',
+        turnsRemaining: 1,
+        data: { musicianId: musician.id },
+      });
+    }
+    log(state, `${color} Musician played ${name} — ${sleepers.length} enem${sleepers.length === 1 ? 'y falls' : 'ies fall'} asleep`);
+  } else {
+    const victims = songVictims(state, musician, radius).sort(
+      (a, b) => chebyshev(b.pos, musician.pos) - chebyshev(a.pos, musician.pos),
+    );
+    if (!victims.length) throw new Error('No enemy piece in range');
+    const steps = crescendo ? 3 : 2;
+    let pushed = 0;
+    for (const v of victims) {
+      if (!state.pieces.includes(v)) continue;
+      const dr = Math.sign(v.pos.row - musician.pos.row);
+      const dc = Math.sign(v.pos.col - musician.pos.col);
+      if (knockBack(state, v, dr, dc, steps)) pushed += 1;
+    }
+    freePiecesNoLongerInWeb(state);
+    retireSpidersAtFarEdge(state);
+    log(state, `${color} Musician played ${name} — ${pushed} enem${pushed === 1 ? 'y is' : 'ies are'} knocked back`);
+  }
+
+  recordSong(musician, song);
+  state.pendingPrompt = null;
+  abilityFx(state, crescendo ? 'crescendo' : `song_${song}`);
+  assertOwnKingSafe(state, color, 'That song');
+  state.turnPhase = resumeTurnPhase;
+  if (state.phase !== 'playing') return state;
+  refreshCheckState(state);
+  if (state.check === opposite(color)) {
+    log(state, `Check from ${SONGS[song].name} — turn passes`);
+    return endTurn(state, color, true);
+  }
+  offerFreePromotion(state, color);
+  return state;
+}
+
+function recordSong(musician: PieceState, song: SongId): void {
+  const m = (musician.music ??= { beat: 4 });
+  m.sang = true;
+  m.lastSong = song;
+  m.lastSongAt = { ...musician.pos };
 }
 
 export function useAbility(
@@ -1217,12 +1787,27 @@ export function useAbility(
       'bless',
       'barrier_shift',
       'temporal_shift',
+      ...SONG_ABILITY_IDS,
     ];
     if (magical.includes(abilityId)) throw new Error('Magic is silenced (Magic Be-gone)');
   }
 
   const avail = availableAbilities(next, pieceId).find((a) => a.id === abilityId);
   if (!avail?.ready) throw new Error('Ability not available');
+
+  if (abilityId === 'encore_skip') {
+    const bonus = next.bonusMove;
+    next.bonusMove = undefined;
+    next.turnPhase = bonus?.resumeTurnPhase ?? 'move';
+    log(next, 'Encore move skipped');
+    return next;
+  }
+  if (SONG_ABILITY_IDS.includes(abilityId)) {
+    const song = abilityId.slice('song_'.length) as SongId;
+    const target = targets && typeof targets === 'object' && 'row' in (targets as object) ? (targets as Coord) : undefined;
+    return playSong(next, color, piece, song, resumeTurnPhase, target);
+  }
+  if (isMerchantWare(abilityId)) return merchantBuy(next, color, piece, abilityId, resumeTurnPhase, targets);
 
   if (piece.defId === 'prototype') {
     if (abilityId === 'forme_status') throw new Error('Forme status is informational');
@@ -1275,7 +1860,7 @@ export function useAbility(
       };
       return next;
     }
-    return finishWizardEnchant(next, color, pieceId, targetId);
+    return finishWizardEnchant(next, color, pieceId, targetId, resumeTurnPhase);
   }
 
   if (abilityId === 'magic_begone') {
@@ -1448,7 +2033,14 @@ function finishIdentityTheft(state: GameState, color: Color, pieceId: string): G
   return concludeAbilityTurn(state, color);
 }
 
-function finishWizardEnchant(state: GameState, color: Color, pieceId: string, targetId: string): GameState {
+/** Free action: the Wizard keeps its turn. The buff lasts for the target owner's next turn. */
+function finishWizardEnchant(
+  state: GameState,
+  color: Color,
+  pieceId: string,
+  targetId: string,
+  resumeTurnPhase: GameState['turnPhase'] | undefined,
+): GameState {
   const wizard = state.pieces.find((p) => p.id === pieceId)!;
   const target = state.pieces.find((p) => p.id === targetId);
   if (!target) throw new Error('Invalid target');
@@ -1457,13 +2049,21 @@ function finishWizardEnchant(state: GameState, color: Color, pieceId: string, ta
   addEffect(target, {
     id: `wiz_ench_${target.id}_${Date.now()}`,
     kind: 'wizard_enchant',
-    turnsRemaining: 2,
+    // wizard_enchant ticks at every turn end, so an enemy target needs to survive this one
+    turnsRemaining: target.color === color ? 1 : 2,
   });
   wizard.abilityCooldown = 4;
   state.pendingPrompt = null;
-  log(state, `Wizard enchanted ${target.defId} (+1 move, 2 turns)`);
+  log(state, `Wizard enchanted ${target.defId} (+1 move, 1 turn)`);
   abilityFx(state, 'enchant');
-  return concludeAbilityTurn(state, color);
+  assertOwnKingSafe(state, color, 'That ability');
+  if (resumeTurnPhase === 'spell' || resumeTurnPhase === 'move') state.turnPhase = resumeTurnPhase;
+  refreshCheckState(state);
+  if (state.check === opposite(color)) {
+    log(state, 'Check from an Enchant — turn passes');
+    return endTurn(state, color, true);
+  }
+  return state;
 }
 
 function finishMagicBegone(state: GameState, color: Color, pieceId: string): GameState {
@@ -2038,6 +2638,7 @@ const SPECIAL_MOVE_FX = new Set([
   'best_buddy',
   'death_stare',
   'archer_shot',
+  'spirit_strike',
   'giga_stomp',
 ]);
 
@@ -2067,9 +2668,35 @@ function moveAbilityFxId(
   return null;
 }
 
+/** First square on a move path where the direction changes, if it lies before `to`. */
+function pathTurnBefore(from: Coord, path: Coord[] | undefined, to: Coord): Coord | undefined {
+  if (!path) return undefined;
+  const pts = [from, ...path];
+  for (let i = 1; i < pts.length - 1; i++) {
+    if (sameCoord(pts[i], to)) return undefined;
+    const d1 = { row: pts[i].row - pts[i - 1].row, col: pts[i].col - pts[i - 1].col };
+    const d2 = { row: pts[i + 1].row - pts[i].row, col: pts[i + 1].col - pts[i].col };
+    if (d1.row !== d2.row || d1.col !== d2.col) return { ...pts[i] };
+  }
+  return undefined;
+}
+
 /** Board square in Chesspansion notation: files a–j left to right, ranks 1–10 from White's side. */
 export function squareName(pos: Coord): string {
   return `${'abcdefghij'[pos.col] ?? '?'}${10 - pos.row}`;
+}
+
+const CLOAKED_SQUARE_RE = /⟪(white|black):([^⟫]*)⟫/g;
+
+/** Square name only `owner` may read; `publicState` turns it into <REDACTED> for everyone else. */
+function cloakedSquare(owner: Color, pos: Coord): string {
+  return `⟪${owner}:${squareName(pos)}⟫`;
+}
+
+function revealCloakedSquares(line: string, viewer: Color | null): string {
+  return line.replace(CLOAKED_SQUARE_RE, (_, owner: string, sq: string) =>
+    !viewer || owner === viewer ? sq : '<REDACTED>',
+  );
 }
 
 function describeMove(
@@ -2079,21 +2706,23 @@ function describeMove(
   target: Coord,
   special: string | undefined,
   captured: PieceState | undefined,
+  cloaked = false,
 ): string {
+  const sq = (pos: Coord) => (cloaked ? cloakedSquare(piece.color, pos) : squareName(pos));
   const name = getPieceDef(piece.defId).name;
   const victim = captured ? `${captured.color} ${getPieceDef(captured.defId).name}` : null;
-  if (special === 'death_stare' || special === 'archer_shot') {
-    const verb = special === 'archer_shot' ? 'shot' : 'stared down';
+  if (capturesInPlace(special)) {
+    const verb = special === 'archer_shot' ? 'shot' : special === 'spirit_strike' ? 'spirit-struck' : 'stared down';
     return victim
-      ? `${color} ${name} ${squareName(from)} ${verb} ${victim} on ${squareName(target)}`
-      : `${color} ${name} ${squareName(from)} ${verb} ${squareName(target)}`;
+      ? `${color} ${name} ${sq(from)} ${verb} ${victim} on ${squareName(target)}`
+      : `${color} ${name} ${sq(from)} ${verb} ${squareName(target)}`;
   }
   const label = special ? ` (${special.replace(/_/g, ' ')})` : '';
   const takes = victim ? `, takes ${victim}` : '';
   if (sameCoord(from, piece.pos)) {
-    return `${color} ${name} on ${squareName(from)} used ${special ? special.replace(/_/g, ' ') : 'its move'}${takes}`;
+    return `${color} ${name} on ${sq(from)} used ${special ? special.replace(/_/g, ' ') : 'its move'}${takes}`;
   }
-  return `${color} ${name} ${squareName(from)} → ${squareName(piece.pos)}${takes}${label}`;
+  return `${color} ${name} ${sq(from)} → ${sq(piece.pos)}${takes}${label}`;
 }
 
 export function applyMove(
@@ -2102,6 +2731,8 @@ export function applyMove(
   pieceId: string,
   requestedTo: Coord,
   meta?: Record<string, unknown>,
+  /** A move already taken from `listMoves(state, pieceId)` — skips recomputing legality (AI search). */
+  knownLegal?: MoveOption,
 ): GameState {
   if (state.phase !== 'playing') throw new Error('Not playing');
   if (state.turn !== color) throw new Error('Not your turn');
@@ -2118,12 +2749,14 @@ export function applyMove(
   const piece = next.pieces.find((p) => p.id === pieceId);
   if (!piece || piece.color !== color) throw new Error('Invalid piece');
   let to = { ...requestedTo };
-  const legal = listMoves(next, pieceId);
+  const legal = knownLegal ? [knownLegal] : listMoves(next, pieceId);
   let move = legal.find((m) => sameCoord(m.to, to) && (!meta?.special || m.special === meta.special));
   if (!move && meta?.special) {
     move = legal.find((m) => sameCoord(m.to, to) && m.special === meta.special);
   }
-  if (!move) throw new Error('Illegal move');
+  if (!move) {
+    throw new Error(hiddenFrom(next, color).size ? 'Illegal move — something unseen is in the way' : 'Illegal move');
+  }
   // Prefer authoritative legal meta, but allow client-provided withId as fallback
   if (move.special && !move.meta?.withId && typeof meta?.withId === 'string') {
     move = { ...move, meta: { ...(move.meta ?? {}), withId: meta.withId } };
@@ -2134,12 +2767,11 @@ export function applyMove(
     move.special === 'castle_swap' ||
     move.special === 'ancient_shuffle' ||
     move.special === 'swap_of_fates' ||
-    move.special === 'death_stare' ||
-    move.special === 'archer_shot' ||
+    capturesInPlace(move.special) ||
     move.special === 'giga_stomp' ||
     move.special === 'best_buddy';
   if (!skipWebPath) {
-    const hit = firstWebOnPath(next, from, to, piece);
+    const hit = firstWebOnPath(next, from, to, piece, movePath(move));
     if (hit && !sameCoord(hit, to)) {
       to = { ...hit };
       const occ = pieceAt(next, to);
@@ -2152,6 +2784,26 @@ export function applyMove(
     }
   }
 
+  const cloaked = Boolean(hasEffect(piece, 'cloaked'));
+  if (burnsInLava(next, piece, move)) {
+    const burnedAt = lavaOnPath(next, from, to, movePath(move))!;
+    const sq = (pos: Coord) => (cloaked ? cloakedSquare(color, pos) : squareName(pos));
+    log(next, `${color} ${getPieceDef(piece.defId).name} ${sq(from)} → ${squareName(burnedAt)} burned up in the lava`);
+    burnInLava(next, piece);
+    const burnVia = pathTurnBefore(from, movePath(move), burnedAt);
+    next.lastMove = {
+      pieceId,
+      from,
+      to: burnedAt,
+      defId: piece.defId,
+      color,
+      ...(cloaked ? { cloaked } : {}),
+      ...(burnVia ? { via: burnVia } : {}),
+    };
+    if (kingExposedAtHandover(next, color)) throw new Error('Illegal move — your king would remain in check');
+    return finishEncoreMove(next, color) ?? endTurn(next, color, isInCheck(next, opposite(color)));
+  }
+
   // cancel recall if moves
   if (hasEffect(piece, 'recall')) removeEffects(piece, 'recall');
   // enchant fails if moves
@@ -2161,7 +2813,7 @@ export function applyMove(
   const blink = hasEffect(piece, 'blink');
   if (blink && move.special !== 'blink_return') {
     next.tokens = next.tokens.filter((t) => !(t.kind === 'blink' && t.owner === color));
-    next.tokens.push({ id: `blink_${color}`, kind: 'blink', pos: from, owner: color });
+    next.tokens.push({ id: `blink_${color}`, kind: 'blink', pos: from, owner: color, castId: blink.castId });
     blink.data = { tokenPos: from };
   }
   if (move.special === 'blink_return') {
@@ -2216,7 +2868,7 @@ export function applyMove(
     piece.pos = { ...ally.pos };
     piece.coOccupantId = ally.id;
     log(next, `Pig Best Buddy with ${ally.defId}`);
-  } else if (move.special === 'death_stare' || move.special === 'archer_shot') {
+  } else if (capturesInPlace(move.special)) {
     captured = pieceAt(next, to);
     if (captureBestBuddyPair(next, to, color)) {
       captured = undefined;
@@ -2235,6 +2887,7 @@ export function applyMove(
       const occ = pieceAt(next, pos);
       if (occ && occ.class !== 'king' && occ.id !== piece.id) {
         if (hasEffect(occ, 'invincible') || hasEffect(occ, 'pause')) continue;
+        if (inNeutralZone(next, occ.pos)) continue;
         victims.push(occ);
       }
     }
@@ -2256,15 +2909,10 @@ export function applyMove(
     if (endBestBuddy(next, piece, from)) log(next, 'Best Buddy ended');
     piece.pos = { ...to };
   }
-  const moveFx = moveAbilityFxId(next, piece, move.special, from, to);
+  const moveFx = move.meta?.ricochet ? 'ricochet' : moveAbilityFxId(next, piece, move.special, from, to);
   if (moveFx) abilityFx(next, moveFx);
 
-  if (
-    move.special !== 'death_stare' &&
-    move.special !== 'archer_shot' &&
-    move.special !== 'giga_stomp' &&
-    move.special !== 'portal_travel'
-  ) {
+  if (!capturesInPlace(move.special) && move.special !== 'giga_stomp' && move.special !== 'portal_travel') {
     const linkedFromOrigin = portalExitAt(next, from);
     if (!linkedFromOrigin || !sameCoord(linkedFromOrigin, to)) {
       const portalVictim = travelPortalOnce(next, piece, color);
@@ -2272,7 +2920,20 @@ export function applyMove(
     }
   }
 
-  log(next, describeMove(color, piece, from, to, move.special, captured && captured.color !== color ? captured : undefined));
+  log(
+    next,
+    describeMove(color, piece, from, to, move.special, captured && captured.color !== color ? captured : undefined, cloaked),
+  );
+  const cloak = hasEffect(piece, 'cloaked');
+  if (cloak) {
+    const left = Number(cloak.data?.movesLeft ?? 5) - 1;
+    if (left <= 0) {
+      removeEffects(piece, 'cloaked');
+      log(next, `${color} ${getPieceDef(piece.defId).name} is no longer cloaked`);
+    } else {
+      cloak.data = { ...cloak.data, movesLeft: left };
+    }
+  }
 
   if (captured && captured.color !== color) {
     tookPiece = true;
@@ -2286,14 +2947,14 @@ export function applyMove(
 
     // ScamMan fraud
     if (captured.defId === 'scamman' && piece.class !== 'pawn') {
-      piece.defId = 'pawn';
+      piece.defId = allowedVariant(next, piece.color, 'pawn', 'pawn');
       piece.class = 'pawn';
       log(next, `${piece.id} was fleeced into a pawn!`);
       abilityFx(next, 'fraudulent_fate');
     }
 
-    // Demon convert
-    if (piece.defId === 'demon') {
+    // Demon convert (Soul Syphon works only at night; by day the Demon captures normally)
+    if (piece.defId === 'demon' && next.dayNight === 'night') {
       captured.color = color;
       next.pieces = next.pieces.filter((p) => p.id !== captured!.id);
       const converted = {
@@ -2319,7 +2980,7 @@ export function applyMove(
       // Reaper: soul lock / shatterer, then rest after inverse-charge captures
       if (piece.defId === 'reaper') {
         const charges = piece.charges ?? 0;
-        if (charges >= 3 && next.dayNight === 'night') {
+        if (charges >= 3) {
           const spot = nearestEmptyAround(next, piece.startPos);
           if (spot) {
             const def = getPieceDef(victimSnapshot.defId);
@@ -2341,7 +3002,7 @@ export function applyMove(
             abilityFx(next, 'soul_lock');
           }
         }
-        if (charges >= 5 && next.dayNight === 'night') {
+        if (charges >= 5) {
           const cls = victimSnapshot.class;
           const victims = next.pieces.filter((p) => p.color !== color && p.class === cls);
           for (const v of [...victims]) removePiece(next, v, color);
@@ -2393,8 +3054,11 @@ export function applyMove(
     }
 
     if (piece.defId === 'vampire' && captured) {
+      const before = vampireNightRadius(piece.charges ?? 0);
       piece.charges = (piece.charges ?? 0) + 1;
       log(next, `Vampire gains a Blood Token (${piece.charges})`);
+      const after = vampireNightRadius(piece.charges);
+      if (after > before) log(next, `Vampire night hunt grows to ${after}×${after}`);
       abilityFx(next, 'blood_token');
     }
 
@@ -2425,7 +3089,7 @@ export function applyMove(
   }
 
   // Prince & Princess mirror
-  if (piece.defId === 'prince_princess' && piece.linkedPieceId) {
+  if (piece.defId === 'prince_princess' && piece.linkedPieceId && !capturesInPlace(move.special)) {
     const other = next.pieces.find((p) => p.id === piece.linkedPieceId);
     if (other) {
       const dr = to.row - from.row;
@@ -2442,19 +3106,10 @@ export function applyMove(
     }
   }
 
-  if (
-    move.special !== 'death_stare' &&
-    move.special !== 'archer_shot' &&
-    move.special !== 'giga_stomp'
-  ) {
+  if (!capturesInPlace(move.special) && move.special !== 'giga_stomp') {
     snareInWeb(next, piece);
   }
-  if (
-    piece.defId === 'spider_queen' &&
-    move.special !== 'death_stare' &&
-    move.special !== 'archer_shot' &&
-    move.special !== 'giga_stomp'
-  ) {
+  if (piece.defId === 'spider_queen' && !capturesInPlace(move.special) && move.special !== 'giga_stomp') {
     placeTrailOfWebs(next, piece, from, piece.pos);
   }
 
@@ -2468,6 +3123,8 @@ export function applyMove(
         ? (next.lastMove as { copiedDefId?: string }).copiedDefId
         : next.lastMove.defId;
   }
+  const endPath = movePath(move);
+  const via = endPath?.some((c) => sameCoord(c, piece.pos)) ? pathTurnBefore(from, endPath, piece.pos) : undefined;
   next.lastMove = {
     pieceId,
     from,
@@ -2476,6 +3133,8 @@ export function applyMove(
     defId: piece.defId,
     color,
     ...(copiedDefId ? { copiedDefId } : {}),
+    ...(cloaked ? { cloaked } : {}),
+    ...(via ? { via } : {}),
   } as GameState['lastMove'];
 
   if (
@@ -2492,7 +3151,7 @@ export function applyMove(
 
   // Echo
   const echo = hasEffect(piece, 'echo_armed');
-  if (echo) {
+  if (echo && !capturesInPlace(move.special)) {
     addEchoOption(next, piece, from, to);
     snareInWeb(next, piece);
   }
@@ -2502,8 +3161,7 @@ export function applyMove(
     move.special !== 'castle_swap' &&
     move.special !== 'ancient_shuffle' &&
     move.special !== 'swap_of_fates' &&
-    move.special !== 'death_stare' &&
-    move.special !== 'archer_shot' &&
+    !capturesInPlace(move.special) &&
     move.special !== 'giga_stomp'
   ) {
     const waiting = resolveGadgetLanding(next, piece, from, piece.pos, color);
@@ -2523,22 +3181,27 @@ export function applyMove(
   retireSpidersAtFarEdge(next);
 
   // Promotion
-  const promoteRow = color === 'white' ? 0 : BOARD_SIZE - 1;
-  if (
-    piece.class === 'pawn' &&
-    piece.defId !== 'enchanted_pawn' &&
-    piece.defId !== 'spider' &&
-    piece.pos.row === promoteRow
-  ) {
-    const opts = getPieceDef(piece.defId).promoteOptions ?? ['queen'];
-    next.pendingPrompt = { type: 'promote', color, pieceId: piece.id, options: opts };
+  const promoting = promotablePawn(next, color, piece.id);
+  if (promoting) {
+    const encore = next.bonusMove?.kind === 'encore' && next.bonusMove.color === color;
+    if (encore) {
+      next.turnPhase = next.bonusMove!.resumeTurnPhase ?? 'move';
+      next.bonusMove = undefined;
+    }
+    next.pendingPrompt = {
+      type: 'promote',
+      color,
+      pieceId: promoting.id,
+      options: promotionOptions(next, promoting),
+      ...(encore ? { free: true } : {}),
+    };
     log(next, `${color} pawn awaiting promotion`);
     return next;
   }
 
   // Check ends turn immediately
   const enemy = opposite(color);
-  if (next.phase === 'playing' && isInCheck(next, color)) {
+  if (next.phase === 'playing' && kingExposedAtHandover(next, color)) {
     throw new Error('Illegal move — your king would remain in check');
   }
   if (isInCheck(next, enemy)) {
@@ -2546,6 +3209,8 @@ export function applyMove(
     return endTurn(next, color, true);
   }
 
+  const encoreDone = finishEncoreMove(next, color);
+  if (encoreDone) return encoreDone;
   if (offerAttackBonus(next, piece, color, tookPiece)) return next;
 
   return endTurn(next, color, false);
@@ -2565,6 +3230,50 @@ function addEchoOption(state: GameState, piece: PieceState, from: Coord, to: Coo
       snareInWeb(state, piece);
       removeEffects(piece, 'echo_armed');
   log(state, `Echo repeated move for ${piece.defId}`);
+}
+
+/** After an Encore move the player's own turn carries on; a check still ends it. Null when no Encore was running. */
+function finishEncoreMove(state: GameState, color: Color): GameState | null {
+  const bonus = state.bonusMove;
+  if (bonus?.kind !== 'encore' || bonus.color !== color || state.phase !== 'playing') return null;
+  state.bonusMove = undefined;
+  state.turnPhase = bonus.resumeTurnPhase ?? 'move';
+  if (isInCheck(state, opposite(color))) {
+    log(state, `${opposite(color)} is in check — turn ends immediately`);
+    return endTurn(state, color, true);
+  }
+  refreshCheckState(state);
+  return state;
+}
+
+/** A pawn of `color` standing on its promotion row, however it got there. Prefers `preferId`. */
+function promotablePawn(state: GameState, color: Color, preferId?: string): PieceState | undefined {
+  const row = color === 'white' ? 0 : BOARD_SIZE - 1;
+  const eligible = (p: PieceState) =>
+    p.color === color &&
+    p.class === 'pawn' &&
+    p.defId !== 'enchanted_pawn' &&
+    p.defId !== 'spider' &&
+    p.pos.row === row;
+  const preferred = preferId ? state.pieces.find((p) => p.id === preferId) : undefined;
+  if (preferred && eligible(preferred)) return preferred;
+  return state.pieces.find(eligible);
+}
+
+function promotionOptions(state: GameState, pawn: PieceState): string[] {
+  const all = getPieceDef(pawn.defId).promoteOptions ?? ['queen'];
+  const allowed = all.filter((id) => !isPieceBanned(state, id));
+  return allowed.length ? allowed : all;
+}
+
+/** Offer a turn-free promotion to the side to move if one of its pawns sits on the far edge. */
+function offerFreePromotion(state: GameState, color: Color): boolean {
+  if (state.phase !== 'playing' || state.winner || state.pendingPrompt || state.turn !== color) return false;
+  const pawn = promotablePawn(state, color);
+  if (!pawn) return false;
+  state.pendingPrompt = { type: 'promote', color, pieceId: pawn.id, options: promotionOptions(state, pawn), free: true };
+  log(state, `${color} pawn on the far edge may promote`);
+  return true;
 }
 
 function retireSpidersAtFarEdge(state: GameState): void {
@@ -2591,6 +3300,18 @@ function removePiece(state: GameState, piece: PieceState, byColor: Color): void 
   }
   state.pieces = state.pieces.filter((p) => p.id !== piece.id);
   state.players[piece.color].graveyard.push({ defId: piece.defId, class: piece.class });
+
+  // Lullaby: a capture next to a sleeper wakes it; Final Note wakes everything its Musician lulled.
+  let woke = 0;
+  for (const p of state.pieces) {
+    const sleep = hasEffect(p, 'asleep');
+    if (!sleep) continue;
+    if (chebyshev(p.pos, piece.pos) === 1 || sleep.data?.musicianId === piece.id) {
+      removeEffects(p, 'asleep');
+      woke += 1;
+    }
+  }
+  if (woke) log(state, piece.defId === 'musician' ? 'Final Note — the Lullaby ends' : `${woke} sleeping piece${woke === 1 ? ' wakes' : 's wake'} up`);
 
   if (piece.defId === 'wizard' && !bothOwnWizardsAlive(state, piece.color)) {
     const enemy = opposite(piece.color);
@@ -2702,6 +3423,7 @@ export function skipSpell(state: GameState, color: Color): GameState {
 }
 
 export function playCard(state: GameState, color: Color, instanceId: string, targets: unknown[] = []): GameState {
+  if (state.rules?.cardsDisabled) throw new Error('Cards are disabled this game');
   const next = cloneState(state);
   const player = next.players[color];
   const card = player.hand.find((c) => c.instanceId === instanceId);
@@ -2736,13 +3458,26 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
 
   if (next.bonusMove) throw new Error('Spells cannot be cast during a bonus move');
 
+  for (const t of targets) {
+    const pos =
+      typeof t === 'string'
+        ? next.pieces.find((p) => p.id === t)?.pos
+        : t && typeof t === 'object' && 'row' in t && 'col' in t
+          ? (t as Coord)
+          : undefined;
+    if (pos && inNeutralZone(next, pos)) throw new Error('No spells can be cast into neutral territory');
+  }
+
   const rng = mulberry32(next.rngSeed + next.turnCount * 31);
+  const before = castFrame(next);
   const result = def.play({ state: next, player: color, card, rng }, targets);
   // Cards may replace the whole board (e.g. Rewind) — always honor returned state
   const out = result.state;
 
   if (!result.done) {
-    if (!out.pendingPrompt) {
+    if (out.pendingPrompt?.type === 'gambler_choice') {
+      openCast(out, color, def.id, instanceId, before);
+    } else if (!out.pendingPrompt) {
       out.pendingPrompt = {
         type: 'card_target',
         color,
@@ -2771,6 +3506,7 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
   }
   outPlayer.lastPlayedCardDefId = def.id;
   log(out, `${color} played ${def.name}`);
+  recordCast(out, color, def.id, instanceId, before);
 
   if (!isOppTurn) {
     assertOwnKingSafe(out, color, 'That spell');
@@ -2786,6 +3522,7 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
     log(out, 'Check from spell — turn passes');
     return endTurn(out, out.turn, true);
   }
+  offerFreePromotion(out, out.turn);
   return out;
 }
 
@@ -2823,6 +3560,16 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     piece.class = def.class;
     piece.charges = initialCharges(def.id);
     next.pendingPrompt = null;
+    log(next, `${color} pawn promoted to ${def.name}`);
+    if (prompt.free) {
+      refreshCheckState(next);
+      if (next.check === opposite(color)) {
+        log(next, 'Check from a promotion — turn passes');
+        return endTurn(next, color, true);
+      }
+      offerFreePromotion(next, color);
+      return next;
+    }
     if (isInCheck(next, opposite(color))) return endTurn(next, color, true);
     return endTurn(next, color, false);
   }
@@ -2837,14 +3584,11 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
   if (prompt.type === 'gambler_choice') {
     const cardPlayer = prompt.color;
     const roll = prompt.roll ?? 0;
-    if (roll <= 4 || (prompt.cardDefId === 'gamblers_gambit' && roll === 10)) {
-      if (color === cardPlayer) throw new Error('Waiting for opponent');
-      if (color !== opposite(cardPlayer)) throw new Error('Not your prompt');
-    } else if (color !== cardPlayer) {
-      throw new Error('Not your prompt');
+    if (gamblerChooser(prompt) !== color) {
+      throw new Error(color === cardPlayer ? 'Waiting for opponent' : 'Not your prompt');
     }
     next.pendingPrompt = null;
-    applyGambler(next, prompt.cardDefId, roll, cardPlayer, payload);
+    // Consume the card first: some results reshuffle hands.
     const inst = (prompt as { _instanceId?: string })._instanceId;
     if (inst) {
       const idx = next.players[prompt.color].hand.findIndex((c) => c.instanceId === inst);
@@ -2855,6 +3599,15 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
         next.players[prompt.color].spellsThisTurn >= next.players[prompt.color].maxSpellsThisTurn
       ) {
         next.turnPhase = 'move';
+      }
+    }
+    applyGambler(next, prompt.cardDefId, roll, cardPlayer, payload);
+    closeCast(next, cardPlayer);
+    if (prompt.cardDefId === 'gamblers_high' && next.phase === 'playing' && next.turn === cardPlayer) {
+      refreshCheckState(next);
+      if (next.check === opposite(cardPlayer)) {
+        log(next, 'Check from spell — turn passes');
+        return endTurn(next, next.turn, true);
       }
     }
     return next;
@@ -2902,7 +3655,7 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (prompt.color !== color) throw new Error('Not your prompt');
     if (prompt.abilityId === 'enchant') {
       next.pendingPrompt = null;
-      return finishWizardEnchant(next, color, prompt.pieceId, payload as string);
+      return finishWizardEnchant(next, color, prompt.pieceId, payload as string, prompt.resumeTurnPhase);
     }
     if (prompt.abilityId === 'revive') {
       next.pendingPrompt = null;
@@ -2911,6 +3664,18 @@ export function resolvePrompt(state: GameState, color: Color, payload: unknown):
     if (prompt.abilityId === 'bless') {
       next.pendingPrompt = null;
       return finishAngelBless(next, color, prompt.pieceId, payload as Coord);
+    }
+    if (prompt.abilityId === 'song_encore') {
+      const musician = next.pieces.find((p) => p.id === prompt.pieceId);
+      if (!musician) throw new Error('The Musician is gone');
+      next.pendingPrompt = null;
+      return playSong(next, color, musician, 'encore', prompt.resumeTurnPhase ?? 'move', payload as Coord);
+    }
+    if (isMerchantWare(prompt.abilityId)) {
+      const merchant = next.pieces.find((p) => p.id === prompt.pieceId);
+      if (!merchant) throw new Error('The Merchant is gone');
+      next.pendingPrompt = null;
+      return merchantBuy(next, color, merchant, prompt.abilityId, prompt.resumeTurnPhase ?? 'move', payload);
     }
     if (prompt.abilityId === 'barrier_shift') {
       const selected = [...(prompt.selected ?? []), payload];
@@ -3085,6 +3850,10 @@ function applyGambler(
   cardPlayer: Color,
   payload: unknown,
 ): void {
+  if (cardDefId === 'gamblers_high') {
+    applyGamblersHigh(state, roll, cardPlayer, payload);
+    return;
+  }
   if (cardDefId === 'gamblers_gambit') {
     if (roll <= 4) {
       const pieceId = payload as string;
@@ -3112,15 +3881,18 @@ function applyGambler(
         col: 4,
       });
       if (spot) {
+        const defId = allowedVariant(state, cardPlayer, 'queen', 'queen');
         state.pieces.push({
           id: `bonus_queen_${cardPlayer}`,
-          defId: 'queen',
+          defId,
           class: 'queen',
           color: cardPlayer,
           pos: spot,
           hasMoved: false,
           startPos: spot,
           effects: [],
+          charges: initialCharges(defId),
+          reviveCount: defId === 'angel' ? 0 : undefined,
         });
       }
     }
@@ -3152,18 +3924,126 @@ function applyGambler(
     } else if (roll === 12) {
       const spot = nearestEmptyAround(state, { row: frontRow(cardPlayer), col: 5 });
       if (spot) {
+        const defId = allowedVariant(state, cardPlayer, 'queen', 'angel');
         state.pieces.push({
           id: `bonus_queen2_${cardPlayer}`,
-          defId: 'angel',
+          defId,
           class: 'queen',
           color: cardPlayer,
           pos: spot,
           hasMoved: false,
           startPos: spot,
           effects: [],
-          reviveCount: 0,
+          charges: initialCharges(defId),
+          reviveCount: defId === 'angel' ? 0 : undefined,
         });
       }
+    }
+  }
+}
+
+function applyGamblersHigh(state: GameState, roll: number, color: Color, payload: unknown): void {
+  const enemy = opposite(color);
+  const rng = mulberry32((state.rngSeed ^ Math.imul(state.turnCount + 1, 0x2545f491)) >>> 0);
+  if (roll <= 4) {
+    const mine = state.players[color].hand;
+    state.players[color].hand = state.players[enemy].hand;
+    state.players[enemy].hand = mine;
+    log(state, `Gamblers High: ${color} and ${enemy} swapped hands`);
+  } else if (roll <= 6) {
+    const need = MAX_HAND - state.players[color].hand.length;
+    tryDrawWithHandLimit(state, color, need);
+    log(state, need > 0 ? `Gamblers High: ${color} draws up to ${MAX_HAND} cards` : `Gamblers High: ${color}'s hand is already full`);
+  } else if (roll === 7) {
+    const hand = [...state.players[color].hand];
+    for (const c of hand) discardCard(state, color, c.instanceId);
+    tryDrawWithHandLimit(state, color, hand.length);
+    log(state, `Gamblers High: ${color} swapped ${hand.length} card(s) for new ones`);
+  } else if (roll === 8) {
+    if (isPieceBanned(state, 'gambler')) {
+      log(state, 'Gamblers High: the Gambler was banned this game — nothing happens');
+      return;
+    }
+    const pos = payload as Coord | null;
+    const valid =
+      pos &&
+      typeof pos === 'object' &&
+      typeof pos.row === 'number' &&
+      typeof pos.col === 'number' &&
+      inBounds(pos) &&
+      isAlliedTerritory(color, pos) &&
+      !squareBlockedForDisplacement(state, pos);
+    if (!valid) throw new Error('Pick an empty tile in allied territory');
+    state.pieces.push({
+      id: `gh_gambler_${color}_${state.turnCount}`,
+      defId: 'gambler',
+      class: 'wildcard',
+      color,
+      pos: { row: pos.row, col: pos.col },
+      hasMoved: false,
+      startPos: { row: pos.row, col: pos.col },
+      effects: [],
+      charges: initialCharges('gambler'),
+    });
+    log(state, `Gamblers High: a Gambler joins ${color} on ${squareName(pos)}`);
+    for (const line of rollGamblerStyles(state, rng, true)) log(state, line);
+  } else if (roll === 9) {
+    const current = state.players[color].army.knight;
+    const pool = (VARIANTS_BY_CLASS.knight ?? []).filter((id) => id !== current && !isPieceBanned(state, id));
+    if (!pool.length) {
+      log(state, 'Gamblers High: no other knight variant is available — nothing happens');
+      return;
+    }
+    const pick = pool[Math.floor(rng() * pool.length)]!;
+    state.players[color].army.knight = pick;
+    for (const k of state.pieces.filter((p) => p.color === color && p.class === 'knight')) {
+      if (endBestBuddy(state, k, { ...k.pos })) log(state, 'Best Buddy ended');
+      k.defId = pick;
+      k.charges = initialCharges(pick);
+      k.bloodlustTurnsRemaining = undefined;
+    }
+    log(state, `Gamblers High: ${color}'s knights become ${getPieceDef(pick).name}s`);
+  } else if (roll === 10) {
+    for (const c of [color, enemy]) {
+      const queens = state.pieces.filter((p) => p.color === c && p.class === 'queen');
+      if (!queens.length) {
+        log(state, `Gamblers High: ${c} has no queen to lose`);
+        continue;
+      }
+      const q = queens[Math.floor(rng() * queens.length)]!;
+      removePiece(state, q, c);
+      log(state, `Gamblers High: ${c} loses their ${getPieceDef(q.defId).name}`);
+    }
+  } else if (roll === 11) {
+    state.zones = [
+      ...(state.zones ?? []).filter((z) => z.kind !== 'neutral'),
+      {
+        id: `neutral_${color}_${state.turnCount}`,
+        kind: 'neutral',
+        rows: [...MIDDLE_ROWS],
+        owner: color,
+        turnsRemaining: 5,
+        total: 5,
+        createdTurn: state.turnCount,
+      },
+    ];
+    log(state, 'Gamblers High: rows 5–6 are neutral territory for 5 turns');
+  } else {
+    const trial = cloneState(state);
+    let moved = false;
+    for (const c of [color, enemy]) {
+      const king = getKing(trial, c);
+      if (!king?.startPos || sameCoord(king.pos, king.startPos) || pieceAt(trial, king.startPos)) continue;
+      king.pos = { ...king.startPos };
+      moved = true;
+    }
+    if (!moved) {
+      log(state, 'Gamblers High: neither king can return home — nothing happens');
+    } else if (isInCheck(trial, color) || isInCheck(trial, enemy)) {
+      log(state, 'Gamblers High: a king would land in check — nothing happens');
+    } else {
+      state.pieces = trial.pieces;
+      log(state, 'Gamblers High: both kings return to their starting squares');
     }
   }
 }
@@ -3182,7 +4062,7 @@ function hasLegalBoardMoves(state: GameState, color: Color): boolean {
 function escapesCheck(trial: GameState, color: Color): boolean {
   if (trial.phase === 'ended' && trial.winner !== color) return false;
   if (!getKing(trial, color)) return false;
-  if (!isInCheck(trial, color)) return true;
+  if (!kingExposedAtHandover(trial, color)) return true;
   return hasLegalBoardMoves(trial, color);
 }
 
@@ -3420,7 +4300,7 @@ function ultimateSuckSaves(state: GameState, color: Color): boolean {
         if (occ && !captureBestBuddyPair(trial, to, color)) removePiece(trial, occ, color);
         endBestBuddy(trial, tp, tp.pos);
         tp.pos = { ...to };
-        if (getKing(trial, color) && !isInCheck(trial, color)) return true;
+        if (getKing(trial, color) && !kingExposedAtHandover(trial, color)) return true;
       }
     }
   }
@@ -3443,11 +4323,35 @@ function hasEscapeFromCheck(state: GameState, color: Color): boolean {
   return false;
 }
 
+/**
+ * Ends the game if the side to move is in check with no way out. Run after every action:
+ * the turn-start check can count a spell as an escape that later turns out not to save the king.
+ */
+export function declareCheckmateIfStuck(state: GameState): boolean {
+  if (state.phase !== 'playing' || state.winner || state.pendingPrompt) return false;
+  const checked = refreshCheckState(state);
+  const threatened = checked === state.turn || kingExposedAtHandover(state, state.turn);
+  if (!threatened || hasEscapeFromCheck(state, state.turn)) return false;
+  state.phase = 'ended';
+  state.winner = opposite(state.turn);
+  state.winReason = 'Checkmate';
+  log(
+    state,
+    checked === state.turn
+      ? `Checkmate — ${state.winner} wins`
+      : `Checkmate — the king cannot escape the coming ${state.dayNight === 'day' ? 'night' : 'day'}; ${state.winner} wins`,
+  );
+  return true;
+}
+
 export function endTurn(state: GameState, color: Color, fromCheck: boolean): GameState {
   retireSpidersAtFarEdge(state);
   const next = state;
   next.bonusMove = undefined;
   tickEffectsOnTurnEnd(next, color);
+  advanceMusicianBeats(next, color);
+  payMerchants(next, color);
+  tickZones(next, color);
 
   next.players[color].spellsThisTurn = 0;
   next.players[color].maxSpellsThisTurn = 1;
@@ -3459,7 +4363,7 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
     if (pending) {
       removeEffects(king, 'doublecast_pending');
       // grant to next own turn — mark ready
-      king.effects.push({ id: `dc_ready`, kind: 'doublecast_ready', turnsRemaining: 2 });
+      king.effects.push({ id: `dc_ready`, kind: 'doublecast_ready', turnsRemaining: 2, castId: pending.castId });
     }
     const ready = hasEffect(king, 'doublecast_ready');
     if (ready && next.turn === color) {
@@ -3513,11 +4417,49 @@ export function endTurn(state: GameState, color: Color, fromCheck: boolean): Gam
     }
   }
 
+  offerFreePromotion(next, nextColor);
   return next;
 }
 
+function tickZones(state: GameState, color: Color): void {
+  if (!state.zones?.length) return;
+  const kept: BoardZone[] = [];
+  let erupted: BoardZone | null = null;
+  for (const z of state.zones) {
+    if (z.owner !== color || z.createdTurn === state.turnCount) {
+      kept.push(z);
+      continue;
+    }
+    z.turnsRemaining -= 1;
+    if (z.turnsRemaining > 0) {
+      kept.push(z);
+    } else if (z.kind === 'lava_warning') {
+      erupted = { ...z, kind: 'lava', turnsRemaining: 1, total: 1, createdTurn: state.turnCount };
+      kept.push(erupted);
+    } else {
+      log(state, z.kind === 'lava' ? 'The lava cools and hardens' : 'Neutral territory fades');
+    }
+  }
+  state.zones = kept;
+  if (!erupted) return;
+  log(state, 'Lava Tsunami! Rows 5–6 turn to lava');
+  abilityFx(state, 'lava_tsunami');
+  const doomed = state.pieces.filter((p) => p.class !== 'king' && erupted!.rows.includes(p.pos.row));
+  for (const p of doomed) {
+    if (!state.pieces.some((x) => x.id === p.id)) continue;
+    burnInLava(state, p);
+    log(state, `${p.color} ${getPieceDef(p.defId).name} on ${squareName(p.pos)} is engulfed by lava`);
+  }
+}
+
+function burnInLava(state: GameState, piece: PieceState): void {
+  const lava = state.zones?.find((z) => z.kind === 'lava');
+  if (lava) lava.victims = [...(lava.victims ?? []), cloneState(piece)];
+  removePiece(state, piece, piece.color);
+}
+
 function tryDrawWithHandLimit(state: GameState, color: Color, times = 1): void {
-  if (times <= 0) return;
+  if (times <= 0 || state.rules?.cardsDisabled) return;
   if (state.pendingPrompt?.type === 'discard_to_draw') {
     const prompt = state.pendingPrompt;
     prompt.queuedDraws = [...(prompt.queuedDraws ?? []), { color, remaining: times }];
@@ -3576,6 +4518,17 @@ function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
               id: `sp_${piece.id}`,
               kind: 'speed_plus',
               turnsRemaining: Number(e.data?.duration ?? 8),
+              sourceCardId: 'speed_plus',
+              castId: e.castId,
+            });
+          } else if (e.kind === 'kingsstead_pending') {
+            removeEffects(piece, 'kingsstead_pending');
+            piece.effects.push({
+              id: `ks_${piece.id}`,
+              kind: 'kingsstead',
+              turnsRemaining: Number(e.data?.duration ?? 3),
+              sourceCardId: 'kingstead',
+              castId: e.castId,
             });
           } else if (e.kind === 'movement_plus_pending') {
             removeEffects(piece, 'movement_plus_pending');
@@ -3584,13 +4537,18 @@ function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
               kind: 'mathematical',
               turnsRemaining: Number(e.data?.duration ?? 2),
               sourceCardId: 'mathematical',
+              castId: e.castId,
             });
           } else if (e.kind === 'enchant_ritual') {
             // success
-            piece.defId = 'queen';
+            if (e.castId) {
+              piece.castUndo = { castId: e.castId, defId: piece.defId, class: piece.class, charges: piece.charges };
+            }
+            piece.defId = allowedVariant(state, piece.color, 'queen', String(e.data?.queenDefId ?? 'queen'));
             piece.class = 'queen';
+            piece.charges = initialCharges(piece.defId);
             removeEffects(piece, 'enchant_ritual');
-            log(state, `${piece.id} enchantment completed → Queen`);
+            log(state, `${piece.id} enchantment completed → ${getPieceDef(piece.defId).name}`);
           } else {
             removeEffects(piece, e.kind);
           }
@@ -3604,7 +4562,10 @@ function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
       recall.data = { idleTurns: idle };
       if (idle >= 2) {
         const dest = nearestEmptyAround(state, piece.startPos);
-        if (dest) piece.pos = dest;
+        if (dest) {
+          if (recall.castId) piece.castUndo = { castId: recall.castId, from: { ...piece.pos }, at: { ...dest } };
+          piece.pos = dest;
+        }
         removeEffects(piece, 'recall');
         log(state, `${piece.defId} recalled home`);
       }
@@ -3621,9 +4582,37 @@ function tickEffectsOnTurnEnd(state: GameState, color: Color): void {
   freePiecesNoLongerInWeb(state);
 }
 
+/** Enemy pieces under Cloak — present in the engine, invisible to `viewer`. */
+function hiddenFrom(state: GameState, viewer: Color): Set<string> {
+  return new Set(
+    state.pieces.filter((p) => p.color !== viewer && hasEffect(p, 'cloaked')).map((p) => p.id),
+  );
+}
+
+/** Legal moves as `viewer` may see them: capturing a cloaked piece looks like an ordinary move. */
+export function movesForViewer(state: GameState, viewer: Color, moves: MoveOption[]): MoveOption[] {
+  const hidden = hiddenFrom(state, viewer);
+  if (!hidden.size) return moves;
+  return moves.map((m) => {
+    const occ = pieceAt(state, m.to);
+    return occ && hidden.has(occ.id) ? { ...m, capture: false } : m;
+  });
+}
+
 export function publicState(state: GameState, viewer: Color | null): GameState {
   const view = cloneState(state);
+  view.history = view.history.map((line) => revealCloakedSquares(line, viewer));
   if (!viewer) return view;
+  delete view.castRecords;
+  const hidden = hiddenFrom(state, viewer);
+  if (hidden.size) {
+    view.pieces = view.pieces.filter((p) => !hidden.has(p.id));
+    view.snapshots = [];
+  }
+  const lm = view.lastMove;
+  if (lm && lm.color !== viewer && (hidden.has(lm.pieceId) || lm.cloaked)) {
+    delete view.lastMove;
+  }
   // hide opponent hand details? show count only — keep defIds hidden
   for (const c of ['white', 'black'] as Color[]) {
     if (c !== viewer) {
@@ -3645,10 +4634,10 @@ export function getDraftOptions(state: GameState, color?: Color): string[] {
     );
   }
   const army = state.players[picker].army;
-  const banned = draftBannedIds(state);
+  const blocked = [...draftBannedIds(state), ...draftTakenIds(state, picker)];
   const out: string[] = [];
   for (const cls of DRAFT_ORDER) {
-    if (!army[cls]) out.push(...(VARIANTS_BY_CLASS[cls] ?? []).filter((id) => !banned.includes(id)));
+    if (!army[cls]) out.push(...(VARIANTS_BY_CLASS[cls] ?? []).filter((id) => !blocked.includes(id)));
   }
   return out;
 }

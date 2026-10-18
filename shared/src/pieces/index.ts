@@ -5,6 +5,7 @@ import {
   hasEffect,
   inBounds,
   isAlliedTerritory,
+  isPieceBanned,
   movementBonus,
   pieceAt,
   sameCoord,
@@ -23,6 +24,7 @@ import {
   type MoveOption,
   type PieceDefinition,
   rayMoves,
+  ricochetMoves,
   standardPawnMoves,
 } from './helpers.js';
 import { droneMoves, prototypeMoves } from './prototype.js';
@@ -40,6 +42,20 @@ const DIAG: { row: number; col: number }[] = [
   { row: -1, col: -1 },
 ];
 const ALL8 = [...ORTH, ...DIAG];
+
+/** Musician rhythm, indexed by beat - 1. Only Forte can capture; Rest plays a song instead of moving. */
+export const MUSICIAN_BEATS = [
+  { name: 'Forte', move: 'Up to 3 squares orthogonally — the only beat that can capture' },
+  { name: 'Staccato', move: '1 square diagonally (no capture)' },
+  { name: 'Leap', move: 'Knight jump (no capture)' },
+  { name: 'Rest', move: 'Cannot move — plays a free song' },
+] as const;
+
+/** 1–4. Mimics and law mandates borrowing the movement use Forte. */
+export function musicianBeat(piece: Pick<PieceState, 'music'>): number {
+  const beat = piece.music?.beat ?? 1;
+  return beat >= 1 && beat <= 4 ? beat : 1;
+}
 
 function coordKey(c: Coord): string {
   return `${c.row},${c.col}`;
@@ -179,17 +195,13 @@ function wormMoves(piece: PieceState, state: GameState): MoveOption[] {
   return moves;
 }
 
-function nightOnly(_p: PieceState, state: GameState) {
-  return state.dayNight === 'night';
-}
-
 export const PIECES: Record<string, PieceDefinition> = {
   pawn: {
     id: 'pawn',
     name: 'Pawn',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president'],
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president', 'merchant'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, false)),
   },
   nwap: {
@@ -197,7 +209,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'nwaP',
     class: 'pawn',
     symbol: '♙',
-    promoteOptions: ['horse', 'snake', 'pig', 'archer', 'bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti', 'crocodile', 'demon', 'mimic'],
+    promoteOptions: ['horse', 'snake', 'pig', 'archer', 'bishop', 'scamman', 'wizard', 'worm', 'skirmisher', 'rook', 'stoneman', 'gnome', 'yeti', 'crocodile', 'demon', 'mimic'],
     getMoves: (p, s) => filterLegal(p, s, standardPawnMoves(p, s, true)),
   },
   rogue: {
@@ -205,7 +217,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Rogue',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['bishop', 'scamman', 'wizard', 'worm', 'rook', 'stoneman', 'gnome', 'yeti', 'crocodile'],
+    promoteOptions: ['bishop', 'scamman', 'wizard', 'worm', 'skirmisher', 'rook', 'stoneman', 'gnome', 'yeti', 'crocodile'],
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
@@ -242,7 +254,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Leapfrog',
     class: 'pawn',
     symbol: '♟',
-    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president'],
+    promoteOptions: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president', 'merchant'],
     getMoves: (p, s) => {
       const moves = [];
       const dir = p.color === 'white' ? -1 : 1;
@@ -478,7 +490,7 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'bishop',
     symbol: '♝',
     getMoves: (p, s) => {
-      const own = rayMoves(p, s, DIAG, 3);
+      const own = rayMoves(p, s, DIAG, 4);
       const stolen = p.copiedMoveDefId;
       const def = stolen && stolen !== 'scamman' ? PIECES[stolen] : undefined;
       if (!def) return filterLegal(p, s, own);
@@ -506,6 +518,13 @@ export const PIECES: Record<string, PieceDefinition> = {
     class: 'bishop',
     symbol: '♝',
     getMoves: (p, s) => filterLegal(p, s, wormMoves(p, s)),
+  },
+  skirmisher: {
+    id: 'skirmisher',
+    name: 'Skirmisher',
+    class: 'bishop',
+    symbol: '♝',
+    getMoves: (p, s) => filterLegal(p, s, ricochetMoves(p, s, 4, 3)),
   },
   queen: {
     id: 'queen',
@@ -610,6 +629,13 @@ export const PIECES: Record<string, PieceDefinition> = {
     symbol: '♛',
     getMoves: (p, s) => filterLegal(p, s, areaMoves(p, s, 1)),
   },
+  merchant: {
+    id: 'merchant',
+    name: 'Merchant',
+    class: 'queen',
+    symbol: '♛',
+    getMoves: (p, s) => filterLegal(p, s, rayMoves(p, s, DIAG, 1)),
+  },
   prince_princess: {
     id: 'prince_princess',
     name: 'Prince & Princess',
@@ -628,8 +654,9 @@ export const PIECES: Record<string, PieceDefinition> = {
     name: 'Demon',
     class: 'wildcard',
     symbol: '♟',
-    canAct: nightOnly,
     getMoves: (p, s) => {
+      // Daylight: only a single diagonal step (Mimic and law mandates keep the full night pattern).
+      if (p.defId === 'demon' && s.dayNight === 'day') return filterLegal(p, s, rayMoves(p, s, DIAG, 1));
       const moves = areaMoves(p, s, 1);
       for (const m of rayMoves(p, s, ORTH.filter((d) => d.col === 0), 2)) {
         if (!moves.some((x) => sameCoord(x.to, m.to))) moves.push(m);
@@ -714,6 +741,19 @@ export const PIECES: Record<string, PieceDefinition> = {
       return filterLegal(p, s, knightMoves(p, s, 2, 1, true));
     },
   },
+  musician: {
+    id: 'musician',
+    name: 'Musician',
+    class: 'wildcard',
+    symbol: '♟',
+    getMoves: (p, s) => {
+      const beat = musicianBeat(p);
+      if (beat === 1) return filterLegal(p, s, rayMoves(p, s, ORTH, 3));
+      if (beat === 2) return filterLegal(p, s, rayMoves(p, s, DIAG, 1).filter((m) => !m.capture));
+      if (beat === 3) return filterLegal(p, s, knightMoves(p, s, 2, 1, true).filter((m) => !m.capture));
+      return [];
+    },
+  },
   king: {
     id: 'king',
     name: 'King',
@@ -736,9 +776,9 @@ export const VARIANTS_BY_CLASS: Record<string, string[]> = {
   pawn: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'],
   rook: ['rook', 'stoneman', 'gnome', 'yeti', 'crocodile'],
   knight: ['horse', 'snake', 'pig', 'archer'],
-  bishop: ['bishop', 'scamman', 'wizard', 'worm'],
-  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype', 'snail'],
-  queen: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president'],
+  bishop: ['bishop', 'scamman', 'wizard', 'worm', 'skirmisher'],
+  wildcard: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype', 'snail', 'musician'],
+  queen: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president', 'merchant'],
   king: ['king'],
 };
 
@@ -769,11 +809,10 @@ export function rollGamblerStyles(state: GameState, rng: () => number, onlyUnrol
     if (onlyUnrolled && g.gamblerStyleDefId) continue;
     const exclude = new Set(taken);
     if (g.gamblerPrevStyleDefId) exclude.add(g.gamblerPrevStyleDefId);
-    let pool = Object.keys(PIECES).filter((id) => id !== 'gambler' && !exclude.has(id));
-    if (!pool.length) {
-      pool = Object.keys(PIECES).filter((id) => id !== 'gambler' && id !== g.gamblerPrevStyleDefId);
-    }
-    if (!pool.length) pool = Object.keys(PIECES).filter((id) => id !== 'gambler');
+    const styles = Object.keys(PIECES).filter((id) => id !== 'gambler' && !isPieceBanned(state, id));
+    let pool = styles.filter((id) => !exclude.has(id));
+    if (!pool.length) pool = styles.filter((id) => id !== g.gamblerPrevStyleDefId);
+    if (!pool.length) pool = styles;
     const pick = pool[Math.floor(rng() * pool.length)]!;
     g.gamblerPrevStyleDefId = g.gamblerStyleDefId;
     g.gamblerStyleDefId = pick;

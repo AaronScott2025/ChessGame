@@ -27,6 +27,8 @@ export interface StatusEffect {
   id: string;
   kind: string;
   sourceCardId?: string;
+  /** Card cast that created this effect (Rally removes everything tagged with the canceled cast). */
+  castId?: string;
   turnsRemaining?: number;
   data?: Record<string, unknown>;
 }
@@ -74,6 +76,29 @@ export interface PieceState {
   timekeeperCycleUsed?: boolean;
   /** Prototype: forme state. */
   proto?: PrototypeState;
+  /** Musician: rhythm and song streak. */
+  music?: MusicState;
+  /** Delayed card outcome (Enchant → Queen, Recall home) that Rally can still undo. */
+  castUndo?: {
+    castId: string;
+    defId?: string;
+    class?: PieceClass;
+    charges?: number;
+    from?: Coord;
+    at?: Coord;
+  };
+}
+
+export type SongId = 'march' | 'encore' | 'lullaby' | 'discord';
+
+export interface MusicState {
+  /** 1 Forte, 2 Staccato, 3 Leap, 4 Rest. Advances when the owner ends a turn. */
+  beat: number;
+  /** A song was already played on the current Rest beat. */
+  sang?: boolean;
+  /** The song played on the previous Rest beat and where, for Crescendo. */
+  lastSong?: SongId;
+  lastSongAt?: Coord;
 }
 
 export type PrototypeForm = 'speed' | 'attack' | 'defense' | 'temporal';
@@ -96,6 +121,7 @@ export interface TokenState {
   pos: Coord;
   owner: Color;
   turnsRemaining?: number;
+  castId?: string;
   data?: Record<string, unknown>;
 }
 
@@ -134,6 +160,8 @@ export interface PlayerState {
   formeSwapCooldown?: number;
   /** `turnCount` of the turn a Forme Swap was used; no Prototype may move that turn. */
   formeSwapTurn?: number;
+  /** Merchant purse: earned in enemy territory, spent on cards, range and promotions. */
+  coins?: number;
 }
 
 export interface DraftState {
@@ -182,6 +210,10 @@ export interface GameState {
     capturedId?: string;
     defId?: string;
     color?: Color;
+    /** Made under Cloak: hidden from the opponent even after the piece reappears. */
+    cloaked?: boolean;
+    /** Square where the move changed direction (e.g. a Skirmisher ricochet). */
+    via?: Coord;
   };
   pendingPrompt: PendingPrompt | null;
   rngSeed: number;
@@ -190,12 +222,54 @@ export interface GameState {
   turnTimer?: TurnTimerState;
   /** Recent ability triggers (newest last), used by clients to play ability sound effects. */
   abilityFx?: AbilityFxEvent[];
-  /** Attack Forme: after capturing, the Prototype takes a bonus Knight move. */
-  bonusMove?: { color: Color; pieceId: string };
+  /**
+   * A bonus move limited to one piece. Attack Forme: after capturing, the Prototype takes a Knight move.
+   * Encore: a Musician's song lets an ally move now, and the turn continues afterwards.
+   */
+  bonusMove?: {
+    color: Color;
+    pieceId: string;
+    kind?: 'encore';
+    /** Encore Crescendo: the move may capture (never the king). */
+    canCapture?: boolean;
+    resumeTurnPhase?: TurnPhase;
+  };
   /** President laws in force for both players until the next dawn. */
   laws?: ActiveLaw[];
   /** Presidents still to choose a law this dawn; opened one at a time as a prompt. */
   lawOffers?: LawOffer[];
+  /** Pieces banned in the ban phase; none of them may enter play by any means. */
+  bannedPieces?: string[];
+  /** Each player's most recent card cast, kept so Rally can fully undo it. */
+  castRecords?: Partial<Record<Color, CastRecord>>;
+  /** Board-wide row effects from spells (neutral territory, Lava Tsunami). */
+  zones?: BoardZone[];
+}
+
+export interface BoardZone {
+  id: string;
+  /** `lava_warning` heats up for a few cycles, then turns into `lava`. */
+  kind: 'neutral' | 'lava_warning' | 'lava';
+  rows: number[];
+  owner: Color;
+  /** Ticks down when the owner ends a turn (not on the turn it appeared). */
+  turnsRemaining: number;
+  total: number;
+  createdTurn: number;
+  castId?: string;
+  /** Pieces the lava destroyed, so Rally can bring them back. */
+  victims?: PieceState[];
+}
+
+export type CastFrame = Pick<GameState, 'pieces' | 'tokens' | 'players' | 'deck' | 'discardPile'>;
+
+export interface CastRecord {
+  castId: string;
+  defId: string;
+  instanceId: string;
+  before: CastFrame;
+  /** Missing while the cast is still resolving (Gambler prompts). */
+  after?: CastFrame;
 }
 
 export interface ActiveLaw {
@@ -216,6 +290,10 @@ export interface GameRules {
   anonymous?: boolean;
   /** Chess but Fast: seconds per turn, or absent for no timer. */
   turnTimerSeconds?: TurnTimerSeconds;
+  /** No spell cards: no deck, no hands, no spell phase. */
+  cardsDisabled?: boolean;
+  /** A piece drafted by one player cannot be drafted by the other (spells can still create copies). */
+  noDupes?: boolean;
 }
 
 export const TURN_TIMER_OPTIONS = [60, 45, 30, 15] as const;
@@ -244,6 +322,8 @@ export type PendingPrompt =
       color: Color;
       pieceId: string;
       options: string[];
+      /** Pawn reached the far edge without moving there (spell, revive, push) — promoting does not use the turn. */
+      free?: boolean;
     }
   | {
       type: 'card_target';

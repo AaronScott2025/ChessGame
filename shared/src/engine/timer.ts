@@ -1,9 +1,11 @@
 import type { Color, Coord, GameState } from '../types.js';
+import { BOARD_SIZE } from '../types.js';
 import type { MoveOption } from '../pieces/helpers.js';
-import { cloneState, log, mulberry32, opposite } from '../utils.js';
+import { cloneState, isAlliedTerritory, log, mulberry32, opposite, pieceAt } from '../utils.js';
 import {
   applyMove,
   cancelPrompt,
+  declareCheckmateIfStuck,
   endTurn,
   listMoves,
   openQueuedLawPrompt,
@@ -78,7 +80,7 @@ function firstSuccess(attempts: Array<() => GameState>): GameState | null {
 }
 
 /** Answer (or abandon) a prompt the timed-out player left open. */
-function autoResolvePrompt(state: GameState, color: Color, rng: () => number): GameState {
+export function autoResolvePrompt(state: GameState, color: Color, rng: () => number): GameState {
   const prompt = state.pendingPrompt;
   if (!prompt) return state;
   const attempts: Array<() => GameState> = [];
@@ -120,6 +122,16 @@ function autoResolvePrompt(state: GameState, color: Color, rng: () => number): G
       }
       break;
     case 'gambler_choice':
+      if (prompt.cardDefId === 'gamblers_high' && prompt.roll === 8) {
+        const tiles: Coord[] = [];
+        for (let row = 0; row < BOARD_SIZE; row++) {
+          for (let col = 0; col < BOARD_SIZE; col++) {
+            const pos = { row, col };
+            if (isAlliedTerritory(prompt.color, pos) && !pieceAt(state, pos)) tiles.push(pos);
+          }
+        }
+        for (const pos of shuffled(tiles, rng)) attempts.push(() => resolvePrompt(state, prompt.color, pos));
+      }
       for (const who of [color, opposite(color)]) {
         for (const payload of [null, 0, { idx: 0 }]) attempts.push(() => resolvePrompt(state, who, payload));
       }
@@ -157,6 +169,7 @@ export function forceTimeoutMove(state: GameState): GameState {
   if (s.phase !== 'playing' || turnTimerKey(s) !== key || s.pendingPrompt) {
     openQueuedLawPrompt(s);
     refreshCheckState(s);
+    declareCheckmateIfStuck(s);
     return s;
   }
 
@@ -188,5 +201,6 @@ export function forceTimeoutMove(state: GameState): GameState {
   s = settleOwnPrompts(s, color, rng);
   openQueuedLawPrompt(s);
   refreshCheckState(s);
+  declareCheckmateIfStuck(s);
   return s;
 }

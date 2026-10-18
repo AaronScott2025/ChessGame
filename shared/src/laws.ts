@@ -109,13 +109,24 @@ export const LAWS: Record<string, LawDef> = {
 export const LAW_IDS = Object.keys(LAWS);
 export const LAW_OFFER_SIZE = 3;
 
+/** Laws that only do something when spell cards are in the game. */
+const CARD_LAWS = new Set(['stimulus', 'arcane_subsidy']);
+
 export function lawActive(state: Pick<GameState, 'laws'>, id: string): boolean {
   return Boolean(state.laws?.some((l) => l.id === id));
 }
 
 /** Distinct law ids for one President's dawn session. */
-export function rollLawOptions(rng: () => number, count = LAW_OFFER_SIZE): string[] {
-  const pool = [...LAW_IDS];
+export function rollLawOptions(
+  rng: () => number,
+  count = LAW_OFFER_SIZE,
+  opts: { bannedPieces?: string[]; cardsDisabled?: boolean } = {},
+): string[] {
+  const pool = LAW_IDS.filter((id) => {
+    if (opts.cardsDisabled && CARD_LAWS.has(id)) return false;
+    const mandate = LAWS[id].mandate;
+    return !mandate || !opts.bannedPieces?.includes(mandate.defId);
+  });
   const out: string[] = [];
   while (out.length < count && pool.length) {
     out.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]!);

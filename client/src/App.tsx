@@ -8,7 +8,9 @@ import {
   ultimateSuckLandings,
   draftBanBlockReason,
   draftBannedIds,
+  draftTakenIds,
   BANS_PER_COLOR,
+  ANGEL_MAX_REVIVES,
 } from '@shared/engine/game.ts';
 import {
   applyClientAction,
@@ -25,9 +27,12 @@ import {
   PIECES,
   TURN_TIMER_OPTIONS,
 } from '@shared/index.ts';
-import { DRAFT_ORDER, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
+import { seatToAct, AI_DIFFICULTIES, type AiDifficulty } from '@shared/ai/index.ts';
+import { CPU_DIFFICULTY_INFO, CPU_SIDES, cpuName, runCpuStep, type CpuOpponent, type CpuSide } from './cpu';
+import { DRAFT_ORDER, MUSICIAN_BEATS, VARIANTS_BY_CLASS } from '@shared/pieces/index.ts';
 import { FORME_RADIUS, inTemporalField } from '@shared/pieces/prototype.ts';
 import { isPigLShape } from '@shared/pieces/helpers.ts';
+import { phaseFormFor } from './phaseForm';
 import {
   formeAbilityStyle,
   FormeToast,
@@ -37,15 +42,19 @@ import {
   type FormeToastData,
   type ProtoView,
 } from './PrototypeHud';
-import { spellsUnlocked, isMagicDisabled, reaperCapturesUntilRest, vampireNightRadius, opposite } from '@shared/utils.ts';
+import { spellsUnlocked, isMagicDisabled, reaperCapturesUntilRest, vampireNightRadius, VAMPIRE_RADIUS_MILESTONES, opposite } from '@shared/utils.ts';
 import { LobbyBrowser } from './LobbyBrowser';
+import { CpuSetup } from './CpuSetup';
 import { TurnClock, type TurnTimerView } from './TurnClock';
 import {
   CosmicBackdrop,
   FxToggle,
   KnowledgeToggle,
   useAnonymousRule,
+  useCardsRule,
+  useNoDupesRule,
   useBanPhaseRule,
+  useStoredChoice,
   useTurnTimerRule,
   useFxEnabled,
   useKnowledgeEnabled,
@@ -123,6 +132,7 @@ interface Piece {
   magicBegoneUsed?: number;
   timekeeperCycleUsed?: boolean;
   proto?: ProtoView;
+  music?: { beat: number; sang?: boolean; lastSong?: string };
 }
 
 interface AbilityInfo {
@@ -158,6 +168,7 @@ interface GameState {
       magicDisabledUntilCycle?: number;
       lastPlayedCardDefId?: string;
       formeSwapCooldown?: number;
+      coins?: number;
     }
   >;
   turn: Color;
@@ -177,6 +188,7 @@ interface GameState {
     capturedId?: string;
     defId?: string;
     color?: Color;
+    via?: Coord;
   };
   abilityFx?: Array<{ seq: number; id: string }>;
   pendingPrompt: null | {
@@ -197,9 +209,18 @@ interface GameState {
     skippable?: boolean;
     actorColor?: Color;
   };
-  bonusMove?: { color: Color; pieceId: string };
+  bonusMove?: { color: Color; pieceId: string; kind?: 'encore'; canCapture?: boolean };
   laws?: Array<{ id: string; by: Color }>;
-  rules?: { banPhase: boolean; anonymous?: boolean; turnTimerSeconds?: number };
+  zones?: Array<{
+    id: string;
+    kind: 'neutral' | 'lava_warning' | 'lava';
+    rows: number[];
+    owner: Color;
+    turnsRemaining: number;
+    total: number;
+  }>;
+  bannedPieces?: string[];
+  rules?: { banPhase: boolean; anonymous?: boolean; turnTimerSeconds?: number; cardsDisabled?: boolean; noDupes?: boolean };
   turnTimer?: TurnTimerView;
   draft: null | {
     pickingColor: Color;
@@ -338,6 +359,7 @@ function turnStripContent(
   state: GameState,
   you: Color | null,
   localMode = false,
+  waitingTitle?: string,
 ): { mode: 'yours' | 'waiting' | 'ended'; title: string; detail: string } {
   if (state.phase === 'ended') {
     return {
@@ -354,14 +376,16 @@ function turnStripContent(
         title: localMode ? `${you === 'white' ? 'White' : 'Black'} to play` : 'Your turn',
         detail: spellsUnlocked(state)
           ? `Cast a spell or move a piece (${state.turnPhase})`
-          : 'Move a piece — spell cards unlock at the first night',
+          : state.rules?.cardsDisabled
+            ? 'Move a piece'
+            : 'Move a piece — spell cards unlock at the first night',
       };
     }
     return { mode: 'yours', title: info.label, detail: info.detail ?? '' };
   }
   return {
     mode: 'waiting',
-    title: localMode ? 'Pass the device' : 'Waiting for opponent',
+    title: localMode ? 'Pass the device' : waitingTitle ?? 'Waiting for opponent',
     detail:
       state.phase === 'draft'
         ? state.draft?.stage === 'ban'
@@ -392,6 +416,8 @@ function useMediaQuery(query: string): boolean {
 }
 
 const CARD_CAST_FX_MS = 1900;
+const CAST_LINE_RE = /^(white|black) played (.+)$/;
+const stripLogTime = (line: string) => line.replace(/^\[[^\]]+\]\s*/, '');
 
 interface CardCastView {
   key: number;
@@ -426,6 +452,18 @@ function CardCastFx({ cast, image }: { cast: CardCastView; image?: string }) {
 
 function isAlliedTerritory(color: Color, pos: Coord): boolean {
   return color === 'white' ? pos.row >= 5 : pos.row < 5;
+}
+
+function zoneTitle(zone: NonNullable<GameState['zones']>[number]): string {
+  const left = `${zone.turnsRemaining} ${zone.owner} turn${zone.turnsRemaining === 1 ? '' : 's'} left`;
+  if (zone.kind === 'neutral') return `Neutral territory — no captures or spells here (${left})`;
+  if (zone.kind === 'lava') return `Lava — destroys any non-king piece that enters or crosses it (${left})`;
+  return `Lava Tsunami heating up — erupts in ${left}`;
+}
+
+/** Cloaked moves are logged as ⟪owner:square⟫; the server redacts them, local games just show the square. */
+function displayLogLine(line: string): string {
+  return line.replace(/⟪(?:white|black):([^⟫]*)⟫/g, '$1');
 }
 
 function chebyshev(a: Coord, b: Coord): number {
@@ -501,11 +539,15 @@ export default function App() {
   const [name, setName] = useState('');
   const { banPhaseRule, setBanPhaseRule } = useBanPhaseRule();
   const { anonymousRule, setAnonymousRule } = useAnonymousRule();
+  const { cardsRule, setCardsRule } = useCardsRule();
+  const { noDupesRule, setNoDupesRule } = useNoDupesRule();
   const { turnTimerRule, setTurnTimerRule } = useTurnTimerRule();
   const turnTimerSeconds = (TURN_TIMER_OPTIONS as readonly number[]).includes(turnTimerRule) ? turnTimerRule : 0;
   const lobbyRules = {
     banPhase: banPhaseRule,
     anonymous: anonymousRule,
+    ...(cardsRule ? {} : { cardsDisabled: true }),
+    ...(noDupesRule ? { noDupes: true } : {}),
     ...(turnTimerSeconds ? { turnTimerSeconds } : {}),
   };
   const serverClockOffsetRef = useRef(0);
@@ -516,6 +558,15 @@ export default function App() {
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [localMode, setLocalMode] = useState(false);
   const localModeRef = useRef(false);
+  const [cpu, setCpu] = useState<CpuOpponent | null>(null);
+  const cpuRef = useRef<CpuOpponent | null>(null);
+  /** Pass-and-play on one device (local mode without a computer opponent). */
+  const hotseat = localMode && !cpu;
+  const [cpuSetupOpen, setCpuSetupOpen] = useState(false);
+  const [cpuDifficulty, setCpuDifficulty] = useStoredChoice<AiDifficulty>('cpuDifficulty', AI_DIFFICULTIES, 'medium');
+  const [cpuSide, setCpuSide] = useStoredChoice<CpuSide>('cpuSide', CPU_SIDES, 'white');
+  const [cpuThinking, setCpuThinking] = useState(false);
+  const cpuJobRef = useRef(0);
   const [you, setYou] = useState<Color | null>(null);
   const [state, setState] = useState<GameState | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
@@ -524,6 +575,17 @@ export default function App() {
   const [inspectedId, setInspectedId] = useState<string | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [moves, setMoves] = useState<MoveOption[]>([]);
+  const [enemyPreviewId, setEnemyPreviewId] = useState<string | null>(null);
+  const enemyPreviewMoves = useMemo(() => {
+    if (!state || !enemyPreviewId || state.phase !== 'playing') return [];
+    const piece = state.pieces.find((p) => p.id === enemyPreviewId);
+    if (!piece || piece.color === you) return [];
+    try {
+      return movesForBoard(sanitizeMoves(piece, engineListMoves(state as never, piece.id) as MoveOption[]), null);
+    } catch {
+      return [];
+    }
+  }, [state, enemyPreviewId, you]);
   const [abilities, setAbilities] = useState<AbilityInfo[]>([]);
   const movesReqRef = useRef<string | null>(null);
   const [gadgetKind, setGadgetKind] = useState<string | null>(null);
@@ -552,6 +614,7 @@ export default function App() {
   const skipGameSfxRef = useRef(true);
   const lastDayNightSfxRef = useRef<string | null>(null);
   const lastHistorySfxRef = useRef<string | null>(null);
+  const shownCastLinesRef = useRef<Set<string>>(new Set());
   const lastCaptureSfxKeyRef = useRef<string | null>(null);
   const lastAbilityFxSeqRef = useRef(0);
   const lastGraveCountsRef = useRef<{ white: number; black: number } | null>(null);
@@ -578,7 +641,9 @@ export default function App() {
     deltaRow: number;
     sqPx: number;
     durationMs: number;
-    phase: 'from' | 'to';
+    /** Bounce square for ricochets, as a delta from the destination plus per-leg timings. */
+    via?: { deltaCol: number; deltaRow: number; firstMs: number; secondMs: number };
+    phase: 'from' | 'via' | 'to';
   } | null>(null);
   const [draftPickFlash, setDraftPickFlash] = useState<{
     color: Color;
@@ -661,13 +726,23 @@ export default function App() {
     const deltaCol = visualToCol - visualFromCol;
     const deltaRow = visualToRow - visualFromRow;
 
+    let via: NonNullable<typeof moveAnim>['via'];
+    if (lm.via) {
+      const viaRow = flipBoard ? 9 - lm.via.row : lm.via.row;
+      const viaCol = flipBoard ? 9 - lm.via.col : lm.via.col;
+      const firstMs = moveAnimDuration(viaCol - visualFromCol, viaRow - visualFromRow);
+      const secondMs = moveAnimDuration(visualToCol - viaCol, visualToRow - viaRow);
+      via = { deltaCol: visualToCol - viaCol, deltaRow: visualToRow - viaRow, firstMs, secondMs };
+    }
+
     setMoveAnim({
       key,
       pieceId: lm.pieceId,
       deltaCol,
       deltaRow,
       sqPx,
-      durationMs: moveAnimDuration(deltaCol, deltaRow),
+      durationMs: via ? via.firstMs + via.secondMs : moveAnimDuration(deltaCol, deltaRow),
+      via,
       phase: 'from',
     });
     playMoveSfx(deltaCol, deltaRow);
@@ -678,7 +753,7 @@ export default function App() {
     let raf2 = 0;
     const raf1 = requestAnimationFrame(() => {
       raf2 = requestAnimationFrame(() => {
-        setMoveAnim((m) => (m?.phase === 'from' ? { ...m, phase: 'to' } : m));
+        setMoveAnim((m) => (m?.phase === 'from' ? { ...m, phase: m.via ? 'via' : 'to' } : m));
       });
     });
     return () => {
@@ -835,6 +910,7 @@ export default function App() {
       lastAbilityFxSeqRef.current = latestAbilitySeq;
       lastDayNightSfxRef.current = state.dayNight;
       lastHistorySfxRef.current = head;
+      shownCastLinesRef.current = new Set(state.history.filter((line) => CAST_LINE_RE.test(stripLogTime(line))));
       lastCaptureSfxKeyRef.current = captureKey;
       lastGraveCountsRef.current = graves;
       lastHandIdsRef.current = handIds;
@@ -891,18 +967,29 @@ export default function App() {
     if (head && head !== lastHistorySfxRef.current) {
       const prevHead = lastHistorySfxRef.current;
       lastHistorySfxRef.current = head;
-      const fresh: string[] = [];
+      const freshRaw: string[] = [];
+      let foundPrev = false;
       for (const line of state.history.slice(0, 40)) {
-        if (line === prevHead) break;
-        fresh.push(line.replace(/^\[[^\]]+\]\s*/, ''));
+        if (line === prevHead) {
+          foundPrev = true;
+          break;
+        }
+        freshRaw.push(line);
       }
-      const castMatch = fresh
-        .map((text) => /^(white|black) played (.+)$/.exec(text))
-        .find((m): m is RegExpExecArray => Boolean(m));
+      const fresh = freshRaw.map(stripLogTime);
+      const shownCasts = shownCastLinesRef.current;
+      const castLine = freshRaw.find((line) => !shownCasts.has(line) && CAST_LINE_RE.test(stripLogTime(line)));
+      for (const line of freshRaw) {
+        if (CAST_LINE_RE.test(stripLogTime(line))) shownCasts.add(line);
+      }
+      if (shownCasts.size > 200) {
+        shownCastLinesRef.current = new Set([...shownCasts].slice(-120));
+      }
+      const castMatch = castLine ? CAST_LINE_RE.exec(stripLogTime(castLine)) : null;
       if (castMatch) {
         const color = castMatch[1] as Color;
         const name = castMatch[2];
-        const isLocal = localModeRef.current;
+        const isLocal = localModeRef.current && !cpuRef.current;
         const mine = color === you;
         const defId =
           state.players[color].lastPlayedCardDefId ?? catalog?.cards.find((c) => c.name === name)?.id ?? null;
@@ -917,6 +1004,7 @@ export default function App() {
           label: isLocal ? `${color === 'white' ? 'White' : 'Black'} cast` : mine ? 'You cast' : `${casterName} cast`,
         });
       } else if (
+        foundPrev &&
         fresh.some(
           (text) =>
             text.includes('discarded to make room') ||
@@ -1079,7 +1167,7 @@ export default function App() {
 
   const pushGameState = (
     next: GameState,
-    options: { actingAs?: Color; localPassDevice?: boolean; viewer?: Color | null } = {},
+    options: { actingAs?: Color; localPassDevice?: boolean; viewer?: Color | null; fullView?: boolean } = {},
   ) => {
     const viewer = options.viewer ?? you;
     const seat = options.localPassDevice ? localActiveSeat(next) : viewer;
@@ -1089,7 +1177,9 @@ export default function App() {
     }
     prevTurnRef.current = turnKey;
     const view =
-      viewer && !options.localPassDevice ? (publicState(next as never, viewer) as GameState) : next;
+      viewer && !options.localPassDevice && !options.fullView
+        ? (publicState(next as never, viewer) as GameState)
+        : next;
     setState(view);
     if (options.localPassDevice) setYou(seat);
     setDraftOptions(getDraftOptions(next as never));
@@ -1110,8 +1200,10 @@ export default function App() {
 
   const commitLocalState = (next: GameState, actingAs: Color) => {
     syncTurnTimer(next as never, Date.now());
+    const vsCpu = cpuRef.current;
+    const human = vsCpu ? opposite(vsCpu.color) : null;
     if (next.phase === 'ended' && next.winner) {
-      const seat = localActiveSeat(next);
+      const seat = human ?? localActiveSeat(next);
       const kind = next.winner === seat ? 'victory' : 'loss';
       const winnerName =
         next.players[next.winner]?.name || (next.winner === 'white' ? 'White' : 'Black');
@@ -1119,7 +1211,9 @@ export default function App() {
       setResultShow({ kind, winnerName, reason: next.winReason ?? '' });
       playResultTrack(kind);
     }
-    applyLocalState(next, actingAs);
+    // The full state stays in memory for the engine; the UI only ever shows the human's own hand.
+    if (human) pushGameState(next, { actingAs, viewer: human, fullView: true });
+    else applyLocalState(next, actingAs);
   };
 
   useEffect(() => {
@@ -1141,6 +1235,45 @@ export default function App() {
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [localMode, state]);
+
+  // Versus Computer: whenever the computer's seat must act, think off-thread and commit one decision.
+  useEffect(() => {
+    if (!cpu || !localMode || !state || ceremony) return;
+    if (seatToAct(state as never) !== cpu.color) return;
+    const job = ++cpuJobRef.current;
+    const snapshot = state;
+    const started = Date.now();
+    const minThinkMs = snapshot.phase === 'playing' ? 650 : 450;
+    setCpuThinking(true);
+    const kickoff = window.setTimeout(() => {
+      runCpuStep(snapshot as never, cpu)
+        .catch((e: Error) => {
+          if (snapshot.phase === 'playing' && snapshot.turn === cpu.color && !snapshot.pendingPrompt) {
+            return forceTimeoutMove(snapshot as never) as GameState;
+          }
+          throw e;
+        })
+        .then((next) => {
+          const wait = Math.max(0, minThinkMs - (Date.now() - started));
+          window.setTimeout(() => {
+            if (job !== cpuJobRef.current) return;
+            setCpuThinking(false);
+            commitLocalState(next as GameState, cpu.color);
+          }, wait);
+        })
+        .catch((e: Error) => {
+          if (job !== cpuJobRef.current) return;
+          setCpuThinking(false);
+          setError(`Computer error: ${e.message}`);
+        });
+    }, 120);
+    return () => {
+      window.clearTimeout(kickoff);
+      if (cpuJobRef.current === job) cpuJobRef.current += 1;
+      setCpuThinking(false);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cpu, localMode, state, ceremony]);
 
   const lastTimeoutLineRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
@@ -1214,6 +1347,8 @@ export default function App() {
         setStatus('Death Stare ready — click an enemy in range, then Confirm');
       } else if (specials.has('archer_shot')) {
         setStatus('Archer volley ready — click an enemy on an L, then Confirm');
+      } else if (specials.has('spirit_strike')) {
+        setStatus('In-Spirit — click an enemy in range to capture it without moving, then Confirm');
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1234,6 +1369,26 @@ export default function App() {
       // keep the previous options
     }
   }, [state]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Encore hands one ally a move right now: select it so its squares light up straight away.
+  const encoreSelectRef = useRef<string | null>(null);
+  useEffect(() => {
+    const bonus = state?.bonusMove;
+    if (!state || bonus?.kind !== 'encore' || bonus.color !== you) {
+      encoreSelectRef.current = null;
+      return;
+    }
+    const key = `${state.turnCount ?? 0}:${bonus.pieceId}`;
+    if (encoreSelectRef.current === key) return;
+    encoreSelectRef.current = key;
+    setSelectedPiece(bonus.pieceId);
+    requestMoves(bonus.pieceId);
+    setStatus(
+      bonus.canCapture
+        ? 'Encore (Crescendo): move this piece now — it may capture. Or Skip Encore Move.'
+        : 'Encore: move this piece now (no capture), or Skip Encore Move.',
+    );
+  }, [state, you]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const requestMoves = (pieceId: string) => {
     if (!state) return;
@@ -1256,9 +1411,46 @@ export default function App() {
     );
   };
 
+  const startCpuGame = () => {
+    const human: Color = cpuSide === 'random' ? (Math.random() < 0.5 ? 'white' : 'black') : cpuSide;
+    const opponent: CpuOpponent = { color: opposite(human), difficulty: cpuDifficulty };
+    localModeRef.current = true;
+    setLocalMode(true);
+    cpuRef.current = opponent;
+    setCpu(opponent);
+    setCpuSetupOpen(false);
+    skipGameSfxRef.current = true;
+    skipMoveAnimRef.current = true;
+    clearTransientUi();
+    setError(null);
+
+    let next = createLobbyState('LOCAL', Date.now(), { ...lobbyRules, anonymous: false });
+    serverClockOffsetRef.current = 0;
+    next.players.white.connected = true;
+    next.players.black.connected = true;
+    next.players[human].name = seatDisplayName(next as never, human, name);
+    next.players[opponent.color].name = cpuName(opponent.difficulty);
+    next = startDraft(next);
+
+    setCatalog(buildLocalCatalog());
+    setDraftOptions(getDraftOptions(next));
+    setRoomCode('LOCAL');
+    setState(next as GameState);
+    setYou(human);
+    prevTurnRef.current = `${next.turn}:${next.phase}: :${human}`;
+    setStatus(`Versus ${cpuName(opponent.difficulty)} — you play ${human === 'white' ? 'White' : 'Black'}.`);
+    setCeremony({
+      kind: 'vs',
+      white: next.players.white.name,
+      black: next.players.black.name,
+    });
+  };
+
   const startLocalGame = () => {
     localModeRef.current = true;
     setLocalMode(true);
+    cpuRef.current = null;
+    setCpu(null);
     skipGameSfxRef.current = true;
     skipMoveAnimRef.current = true;
     clearTransientUi();
@@ -1293,6 +1485,10 @@ export default function App() {
     setHostedLocked(false);
     localModeRef.current = false;
     setLocalMode(false);
+    cpuRef.current = null;
+    setCpu(null);
+    cpuJobRef.current += 1;
+    setCpuThinking(false);
     setRoomCode(null);
     setState(null);
     setYou(null);
@@ -1342,6 +1538,7 @@ export default function App() {
   }, []);
 
   const closeLobbyBrowser = useCallback(() => setLobbyBrowserOpen(false), []);
+  const closeCpuSetup = useCallback(() => setCpuSetupOpen(false), []);
 
   const board = useMemo(() => {
     const grid: Array<Array<Piece | null>> = Array.from({ length: 10 }, () => Array(10).fill(null));
@@ -1502,6 +1699,22 @@ export default function App() {
     return targets;
   }, [state, you]);
 
+  /** Gamblers High roll 8: empty allied tiles the Gambler can be summoned onto. */
+  const gamblerSummonTiles = useMemo(() => {
+    const tiles = new Set<string>();
+    const prompt = state?.pendingPrompt;
+    if (!state || !you || prompt?.type !== 'gambler_choice') return tiles;
+    if (prompt.cardDefId !== 'gamblers_high' || prompt.roll !== 8 || prompt.color !== you) return tiles;
+    for (let row = 0; row < 10; row++) {
+      for (let col = 0; col < 10; col++) {
+        if (!isAlliedTerritory(you, { row, col }) || board[row][col]) continue;
+        if (state.tokens.some((t) => t.kind === 'barrier' && t.pos.row === row && t.pos.col === col)) continue;
+        tiles.add(`${row},${col}`);
+      }
+    }
+    return tiles;
+  }, [state, you, board]);
+
   const targetNeeded = activeCardDef?.targeting && activeCardDef.targeting !== 'none';
   const magicSilenced = Boolean(state && you && isMagicDisabled(state, you));
   const canCastSpells = Boolean(state && spellsUnlocked(state) && !magicSilenced);
@@ -1559,6 +1772,7 @@ export default function App() {
       }
     }
     if (!parts.length) return `Cast ${cardName}?`;
+    if (activeCardDef?.id === 'enchant' && parts.length === 2) return `Enchant ${parts[0]} into ${parts[1]}?`;
     if (parts.length === 1) return `Cast ${cardName} on ${parts[0]}?`;
     return `Cast ${cardName} on ${parts.join(' & ')}?`;
   };
@@ -1627,7 +1841,18 @@ export default function App() {
     if (prompt?.type === 'gambler_choice') {
       const roll = prompt.roll ?? 0;
       const cardPlayer = prompt.color;
-      if (roll <= 4 && you !== cardPlayer) {
+      if (prompt.cardDefId === 'gamblers_high' && roll === 8 && you === cardPlayer) {
+        if (!gamblerSummonTiles.has(squareKey)) {
+          setStatus('Click a highlighted empty tile in your territory');
+          return;
+        }
+        const summary = `Summon the Gambler on ${FILE_LETTERS[col]}${10 - row}?`;
+        setSpellConfirm({ summary, mode: 'resolve_prompt', payload: { row, col } });
+        setStatus(summary);
+        clearBoardConfirm();
+        return;
+      }
+      if (roll <= 4 && you !== cardPlayer && prompt.cardDefId !== 'gamblers_high') {
         const piece = board[row][col];
         if (!piece || piece.color !== cardPlayer || !gamblerChoiceHighlights.has(squareKey)) {
           setStatus('Click one of the highlighted enemy pieces');
@@ -1674,7 +1899,13 @@ export default function App() {
           const summary =
             prompt.abilityId === 'bless' && target
               ? `Bless ${pieceMeta(catalog, target.defId)?.name ?? target.defId}?`
-              : `Choose: ${FILE_LETTERS[col]}${10 - row}?`;
+              : prompt.abilityId === 'song_encore' && target
+                ? `Encore: move the ${pieceMeta(catalog, target.defId)?.name ?? target.defId} now?`
+                : prompt.abilityId === 'merchant_range' && target
+                  ? `Pay 5 coins for +1 range on the ${pieceMeta(catalog, target.defId)?.name ?? target.defId}?`
+                  : prompt.abilityId === 'merchant_promote' && target
+                    ? `Pay 8 coins to promote the ${pieceMeta(catalog, target.defId)?.name ?? target.defId}?`
+                    : `Choose: ${FILE_LETTERS[col]}${10 - row}?`;
           setSpellConfirm({ summary, mode: 'resolve_prompt', payload: { row, col } });
           setStatus(summary);
           clearBoardConfirm();
@@ -1852,6 +2083,8 @@ export default function App() {
                   ? 'Death Stare'
                   : move.special === 'archer_shot'
                     ? 'Archer volley'
+                    : move.special === 'spirit_strike'
+                    ? 'Spirit strike'
                     : move.special === 'giga_stomp'
                       ? 'Giga Stomp'
                     : move.special === 'castle_swap'
@@ -1929,6 +2162,29 @@ export default function App() {
           setStatus('Teleport: now pick an empty destination exactly 2 spaces away');
           return;
         }
+        if (activeCardDef!.id === 'coordinated_shuffle') {
+          const first = pendingTargets.length === 1 ? (pendingTargets[0] as string) : null;
+          if (!first) {
+            setPendingTargets([piece.id]);
+            clearBoardConfirm();
+            setSpellConfirm(null);
+            setStatus('Coordinated Shuffle: now pick the piece to swap it with');
+            return;
+          }
+          if (first === piece.id) {
+            setStatus('Coordinated Shuffle: pick a different piece');
+            return;
+          }
+          offerSpellConfirm([first, piece.id]);
+          return;
+        }
+        if (activeCardDef!.id === 'enchant') {
+          setPendingTargets([piece.id]);
+          clearBoardConfirm();
+          setSpellConfirm(null);
+          setStatus('Enchant: choose the Queen variant it will become from the buttons below');
+          return;
+        }
         if (activeCardDef!.id === 'swap') {
           setPendingTargets([piece.id]);
           clearBoardConfirm();
@@ -1943,6 +2199,25 @@ export default function App() {
 
     // Selection clicks — not confirms
     clearBoardConfirm();
+    const buddyPig =
+      piece && piece.color === you
+        ? state.pieces.find((p) => p.defId === 'pig' && p.color === you && p.coOccupantId === piece.id)
+        : undefined;
+    if (piece && buddyPig) {
+      const pickPig = selectedPiece === piece.id;
+      const target = pickPig ? buddyPig : piece;
+      const hostName = pieceMeta(catalog, piece.defId)?.name ?? piece.defId;
+      setEnemyPreviewId(null);
+      setInspectedId(target.id);
+      setSelectedPiece(target.id);
+      requestMoves(target.id);
+      setStatus(
+        pickPig
+          ? `Pig selected — move it to leave ${hostName}, or click again for ${hostName}`
+          : `${hostName} selected — click again to move the Pig instead`,
+      );
+      return;
+    }
     if (piece && piece.color === you) {
       const selected = selectedPiece ? state.pieces.find((p) => p.id === selectedPiece) : null;
       if (
@@ -1957,16 +2232,19 @@ export default function App() {
           return;
         }
       }
+      setEnemyPreviewId(null);
       setInspectedId(piece.id);
       setSelectedPiece(piece.id);
       requestMoves(piece.id);
     } else if (piece) {
+      setEnemyPreviewId((id) => (id === piece.id ? null : piece.id));
       setInspectedId(piece.id);
       setSelectedPiece(null);
       setMoves([]);
       setAbilities([]);
     } else {
       const token = state.tokens.find((t) => t.pos.row === row && t.pos.col === col);
+      setEnemyPreviewId(null);
       setSelectedPiece(null);
       setMoves([]);
       setAbilities([]);
@@ -2013,6 +2291,10 @@ export default function App() {
     }
     setPendingTargets([]);
     setSpellConfirm(null);
+    if (activeCardDef.id === 'coordinated_shuffle') {
+      setStatus('Coordinated Shuffle: pick the first piece (allied or enemy, not a king)');
+      return;
+    }
     setStatus(`Select target for ${activeCardDef.name} (${activeCardDef.targeting})`);
   };
 
@@ -2102,75 +2384,35 @@ export default function App() {
             Draft strange armies, weave spell cards, and fight across a 10×10 realm of day and night.
           </p>
           <div className="home-panel">
-            <label className="home-label">
-              Display name
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Player" />
-            </label>
-            <fieldset className="home-rules-options">
-              <legend>Lobby rules</legend>
-              <label className="home-rule-toggle">
-                <input
-                  type="checkbox"
-                  checked={banPhaseRule}
-                  onChange={(e) => setBanPhaseRule(e.target.checked)}
-                />
-                <span className="home-rule-switch" aria-hidden />
-                <span className="home-rule-text">
-                  <strong>Ban phase</strong>
-                  <em>Each player bans 2 pieces (max 1 per class) before drafting.</em>
-                </span>
+            <section className="home-play" aria-label="Play">
+              <label className="home-label">
+                Display name
+                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Player" />
               </label>
-              <label className="home-rule-toggle">
-                <input
-                  type="checkbox"
-                  checked={anonymousRule}
-                  onChange={(e) => setAnonymousRule(e.target.checked)}
-                />
-                <span className="home-rule-switch" aria-hidden />
-                <span className="home-rule-text">
-                  <strong>Anonymous</strong>
-                  <em>Display names are hidden — players show as “White” and “Black”.</em>
-                </span>
-              </label>
-              <div className="home-rule-group">
-                <label className="home-rule-toggle">
-                  <input
-                    type="checkbox"
-                    checked={turnTimerSeconds > 0}
-                    onChange={(e) => setTurnTimerRule(e.target.checked ? 30 : 0)}
-                  />
-                  <span className="home-rule-switch" aria-hidden />
-                  <span className="home-rule-text">
-                    <strong>Chess but Fast ⏱</strong>
-                    <em>Each turn is timed. Run out and a random piece moves for you. No limit while in check.</em>
+              <div className="home-online">
+                <div className="home-online-head">
+                  <p className="home-section-title">Play online</p>
+                  <span className="home-online-live">
+                    <i aria-hidden /> Live
                   </span>
-                </label>
-                {turnTimerSeconds > 0 && (
-                  <div className="home-access-seg home-timer-seg" role="radiogroup" aria-label="Seconds per turn">
-                    {TURN_TIMER_OPTIONS.map((secs) => (
-                      <button
-                        key={secs}
-                        type="button"
-                        role="radio"
-                        aria-checked={turnTimerSeconds === secs}
-                        className={turnTimerSeconds === secs ? 'is-active' : ''}
-                        onClick={() => setTurnTimerRule(secs)}
-                      >
-                        {secs === 60 ? '1 min' : `${secs}s`}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <div className="home-access">
-                <span className="home-access-label">
-                  <strong>Online room access</strong>
-                  <em>
-                    {roomAccess === 'open'
-                      ? 'Anyone in the lobby list can join.'
-                      : 'Players need the password to join.'}
-                  </em>
-                </span>
+                </div>
+                <div className="home-online-actions">
+                  <button type="button" className="primary home-cta home-cta-main" onClick={createRoom}>
+                    Create room{roomAccess === 'password' ? ' 🔒' : ''}
+                    <small>Host a match</small>
+                  </button>
+                  <button
+                    type="button"
+                    className="home-cta home-cta-main home-cta-join"
+                    onClick={() => {
+                      setError(null);
+                      setLobbyBrowserOpen(true);
+                    }}
+                  >
+                    Join lobby
+                    <small>Browse open rooms</small>
+                  </button>
+                </div>
                 <div className="home-access-seg" role="radiogroup" aria-label="Online room access">
                   {(['open', 'password'] as const).map((mode) => (
                     <button
@@ -2184,7 +2426,7 @@ export default function App() {
                         setError(null);
                       }}
                     >
-                      {mode === 'open' ? '🔓 Open' : '🔒 Password'}
+                      {mode === 'open' ? '🔓 Open room' : '🔒 Password'}
                     </button>
                   ))}
                 </div>
@@ -2201,26 +2443,134 @@ export default function App() {
                   />
                 )}
               </div>
-            </fieldset>
-            <div className="home-actions">
-              <button type="button" className="primary home-cta" onClick={startLocalGame}>
-                Local play
-              </button>
-              <button type="button" className="home-cta home-cta-secondary" onClick={createRoom}>
-                Create online room{roomAccess === 'password' ? ' 🔒' : ''}
-              </button>
-              <button
-                type="button"
-                className="home-cta home-cta-secondary"
-                onClick={() => {
-                  setError(null);
-                  setLobbyBrowserOpen(true);
-                }}
-              >
-                Join lobby
-              </button>
-            </div>
-            {error && <p className="error">{error}</p>}
+              <div className="home-offline">
+                <p className="home-section-title">Offline</p>
+                <div className="home-offline-actions">
+                  <button type="button" className="home-cta home-cta-secondary home-cta-mode" onClick={startLocalGame}>
+                    Local play
+                    <small>Pass and play</small>
+                  </button>
+                  <button
+                    type="button"
+                    className="home-cta home-cta-secondary home-cta-mode"
+                    onClick={() => {
+                      setError(null);
+                      setCpuSetupOpen(true);
+                    }}
+                  >
+                    Versus Computer
+                    <small>
+                      {CPU_DIFFICULTY_INFO[cpuDifficulty].label} ·{' '}
+                      {cpuSide === 'random' ? 'Random side' : cpuSide === 'white' ? 'You play White' : 'You play Black'}
+                    </small>
+                  </button>
+                </div>
+              </div>
+              {error && <p className="error">{error}</p>}
+            </section>
+
+            <section className="home-setup" aria-label="Match rules">
+              <header className="home-setup-head">
+                <p className="home-section-title">Match rules</p>
+                <span className="home-setup-count">
+                  {
+                    [banPhaseRule, anonymousRule, cardsRule, noDupesRule, turnTimerSeconds > 0].filter(Boolean)
+                      .length
+                  }{' '}
+                  active
+                </span>
+              </header>
+              <div className="home-rule-grid">
+                {(
+                  [
+                    {
+                      key: 'cards',
+                      glyph: '✦',
+                      title: 'Spell cards',
+                      desc: 'Decks, hands and a spell phase each turn.',
+                      full: 'Turn off for pure piece play — no deck, no hands, no spell phase.',
+                      checked: cardsRule,
+                      set: setCardsRule,
+                    },
+                    {
+                      key: 'ban',
+                      glyph: '⊘',
+                      title: 'Ban phase',
+                      desc: 'Each player bans 2 pieces before the draft.',
+                      full: 'Each player bans 2 pieces (max 1 per class) before drafting.',
+                      checked: banPhaseRule,
+                      set: setBanPhaseRule,
+                    },
+                    {
+                      key: 'dupes',
+                      glyph: '⧉',
+                      title: 'No Dupes',
+                      desc: 'A drafted piece is off-limits to your opponent.',
+                      full: 'Once a player drafts a piece, the other player can’t draft it. Spells can still create copies.',
+                      checked: noDupesRule,
+                      set: setNoDupesRule,
+                    },
+                    {
+                      key: 'anon',
+                      glyph: '◐',
+                      title: 'Anonymous',
+                      desc: 'Names hidden — players show as White and Black.',
+                      full: 'Display names are hidden — players show as “White” and “Black”.',
+                      checked: anonymousRule,
+                      set: setAnonymousRule,
+                    },
+                  ] as const
+                ).map((rule) => (
+                  <label key={rule.key} className={`home-rule-tile${rule.checked ? ' is-on' : ''}`} title={rule.full}>
+                    <input type="checkbox" checked={rule.checked} onChange={(e) => rule.set(e.target.checked)} />
+                    <span className="home-rule-glyph" aria-hidden>
+                      {rule.glyph}
+                    </span>
+                    <span className="home-rule-body">
+                      <strong>{rule.title}</strong>
+                      <em>{rule.desc}</em>
+                    </span>
+                    <span className="home-rule-check" aria-hidden />
+                  </label>
+                ))}
+                <div className={`home-rule-wide${turnTimerSeconds > 0 ? ' is-on' : ''}`}>
+                  <label
+                    className={`home-rule-tile${turnTimerSeconds > 0 ? ' is-on' : ''}`}
+                    title="Each turn is timed. Run out and a random piece moves for you. No limit while in check."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={turnTimerSeconds > 0}
+                      onChange={(e) => setTurnTimerRule(e.target.checked ? 30 : 0)}
+                    />
+                    <span className="home-rule-glyph" aria-hidden>
+                      ⏱
+                    </span>
+                    <span className="home-rule-body">
+                      <strong>Chess but Fast</strong>
+                      <em>Timed turns — run out and a random piece moves for you.</em>
+                    </span>
+                    <span className="home-rule-check" aria-hidden />
+                  </label>
+                  {turnTimerSeconds > 0 && (
+                    <div className="home-access-seg home-timer-seg" role="radiogroup" aria-label="Seconds per turn">
+                      {TURN_TIMER_OPTIONS.map((secs) => (
+                        <button
+                          key={secs}
+                          type="button"
+                          role="radio"
+                          aria-checked={turnTimerSeconds === secs}
+                          className={turnTimerSeconds === secs ? 'is-active' : ''}
+                          onClick={() => setTurnTimerRule(secs)}
+                        >
+                          {secs === 60 ? '1 min' : `${secs}s`}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
           </div>
           <button type="button" className="home-rules" onClick={() => setRulesOpen(true)}>
             Rules
@@ -2233,6 +2583,15 @@ export default function App() {
           socket={socket}
           name={name}
           onJoined={onLobbyJoined}
+        />
+        <CpuSetup
+          open={cpuSetupOpen}
+          difficulty={cpuDifficulty}
+          side={cpuSide}
+          onDifficulty={setCpuDifficulty}
+          onSide={setCpuSide}
+          onStart={startCpuGame}
+          onClose={closeCpuSetup}
         />
         {audioFxStack}
       </div>
@@ -2248,6 +2607,10 @@ export default function App() {
       : null;
   const draftBanning = state.phase === 'draft' && state.draft?.stage === 'ban';
   const draftBanned = state.phase === 'draft' ? draftBannedIds(state as never) : [];
+  const draftTaken =
+    state.phase === 'draft' && state.draft && !draftBanning
+      ? draftTakenIds(state as never, state.draft.pickingColor)
+      : [];
   const draftMyTurn =
     state.phase === 'draft' &&
     state.draft?.blackChoseFirstPicker != null &&
@@ -2255,7 +2618,9 @@ export default function App() {
   const draftRandomChoices = draftMyTurn
     ? draftOptions.filter(
         (id) =>
-          !draftBanned.includes(id) && (!draftBanning || !draftBanBlockReason(state as never, you!, id)),
+          !draftBanned.includes(id) &&
+          !draftTaken.includes(id) &&
+          (!draftBanning || !draftBanBlockReason(state as never, you!, id)),
       )
     : [];
 
@@ -2403,7 +2768,8 @@ export default function App() {
       <TurnStrip
         state={state}
         you={you}
-        localMode={localMode}
+        localMode={hotseat}
+        waitingTitle={cpu ? `${cpuName(cpu.difficulty)} is thinking…` : undefined}
         clockOffsetMs={localMode ? 0 : serverClockOffsetRef.current}
       />
       {resultShow && (
@@ -2488,7 +2854,11 @@ export default function App() {
           </p>
           <div className="game-status-bar" role="status" aria-live="polite">
             <span className="status-chip chip-room">
-              {localMode ? (
+              {cpu ? (
+                <>
+                  Mode <strong>Vs Computer</strong>
+                </>
+              ) : localMode ? (
                 <>
                   Mode <strong>Local</strong>
                 </>
@@ -2499,7 +2869,7 @@ export default function App() {
               )}
             </span>
             <span className={`status-chip chip-you chip-you-${you}`}>
-              {localMode ? 'Controlling' : 'You'} · <strong>{you}</strong>
+              {hotseat ? 'Controlling' : 'You'} · <strong>{you}</strong>
             </span>
             <span className={`status-chip chip-cycle chip-${state.dayNight}`}>
               <span className="chip-cycle-mark" aria-hidden />
@@ -2530,7 +2900,7 @@ export default function App() {
             </span>
           )}
           <button type="button" className="exit-game-btn" onClick={exitToHome}>
-            {localMode ? 'Exit local' : 'Leave'}
+            {hotseat ? 'Exit local' : 'Leave'}
           </button>
         </div>
       </header>
@@ -2562,6 +2932,14 @@ export default function App() {
             Ban phase: <strong>{state.rules?.banPhase === false ? 'Off' : 'On'}</strong>
             {' · '}
             Access: <strong>{hostedLocked ? '🔒 Password' : '🔓 Open'}</strong>
+            {' · '}
+            Cards: <strong>{state.rules?.cardsDisabled ? 'Off' : 'On'}</strong>
+            {state.rules?.noDupes && (
+              <>
+                {' · '}
+                <strong>No Dupes</strong>
+              </>
+            )}
             {state.rules?.anonymous && (
               <>
                 {' · '}
@@ -2597,6 +2975,9 @@ export default function App() {
               !draftBanned.includes(draftInspectDefId) &&
               (() => {
                 const name = pieceMeta(catalog, draftInspectDefId)?.name ?? draftInspectDefId;
+                if (draftTaken.includes(draftInspectDefId)) {
+                  return <p className="draft-info-wait muted">No Dupes — your opponent already drafted {name}.</p>;
+                }
                 if (!draftBanning) {
                   return (
                     <button
@@ -2726,20 +3107,28 @@ export default function App() {
                           const selected = draftInspectDefId === id;
                           const canPick = state.draft?.pickingColor === you;
                           const banned = draftBanned.includes(id);
+                          const taken = !banned && draftTaken.includes(id);
                           const shaking = draftShake?.id === id;
                           return (
                             <button
                               key={shaking ? `${id}-${draftShake!.n}` : id}
                               type="button"
                               data-draft-id={id}
-                              aria-disabled={banned || undefined}
-                              title={banned ? `${displayName} is banned` : undefined}
+                              aria-disabled={banned || taken || undefined}
+                              title={
+                                banned
+                                  ? `${displayName} is banned`
+                                  : taken
+                                    ? `${displayName} was drafted by the opponent (No Dupes)`
+                                    : undefined
+                              }
                               className={[
                                 'draft-tile',
                                 selected && !banned ? 'selected' : '',
                                 selected && draftRolling ? 'is-rolling' : '',
                                 !canPick ? 'muted-pick' : '',
                                 banned ? 'is-banned' : '',
+                                taken ? 'is-taken' : '',
                                 shaking ? 'is-shaking' : '',
                               ]
                                 .filter(Boolean)
@@ -2766,6 +3155,7 @@ export default function App() {
                                 />
                               </span>
                               <span className="draft-tile-name">{displayName}</span>
+                              {taken && <span className="draft-tile-taken">Taken</span>}
                             </button>
                           );
                         })}
@@ -2798,7 +3188,10 @@ export default function App() {
                   <header className="player-card-head">
                     <span className="player-card-dot" aria-hidden />
                     <span className="player-card-name">{player.name || fallback}</span>
-                    {!localMode && color === you && <span className="player-card-tag">You</span>}
+                    {!hotseat && color === you && <span className="player-card-tag">You</span>}
+                    {cpu?.color === color && cpuThinking && (
+                      <span className="player-card-tag is-thinking">Thinking…</span>
+                    )}
                     {!localMode && !player.connected && <span className="player-card-tag is-offline">Offline</span>}
                     {active && (
                       <span className={`player-card-turn${inCheck ? ' is-check' : ''}`}>
@@ -2807,12 +3200,19 @@ export default function App() {
                     )}
                   </header>
                   <p className="player-card-meta">
-                    <span>
-                      <strong>{player.hand.length}</strong> in hand
-                    </span>
+                    {!state.rules?.cardsDisabled && (
+                      <span>
+                        <strong>{player.hand.length}</strong> in hand
+                      </span>
+                    )}
                     <span>
                       <strong>{player.graveyard.length}</strong> fallen
                     </span>
+                    {((player.coins ?? 0) > 0 || state.pieces.some((p) => p.defId === 'merchant' && p.color === color)) && (
+                      <span className="player-card-coins" title="Merchant purse: 3 buys a card, 5 buys +1 range, 8 buys a promotion">
+                        <strong>{player.coins ?? 0}</strong> {player.coins === 1 ? 'coin' : 'coins'}
+                      </span>
+                    )}
                   </p>
                   {player.graveyard.length > 0 && (
                     <Graveyard items={player.graveyard} catalog={catalog} color={color} />
@@ -2836,7 +3236,7 @@ export default function App() {
               {state.history.slice(0, 40).map((h, i) => {
                 const match = h.match(/^\[([^\]]+)\]\s*(.*)$/);
                 const time = match?.[1];
-                const text = match?.[2] ?? h;
+                const text = displayLogLine(match?.[2] ?? h);
                 return (
                   <li key={`${h}-${i}`}>
                     {time ? <span className="log-time">{time}</span> : null}
@@ -2886,11 +3286,15 @@ export default function App() {
                   const viewer = you ?? 'white';
                   const alliedHere = isAlliedTerritory(viewer, { row, col });
                   const territoryFront = viewer === 'white' ? row === 5 : row === 4;
-                  const selected = piece && piece.id === selectedPiece;
                   const moveOpts = selectableMoves.filter((m) => m.to.row === row && m.to.col === col);
                   const moveHere = moveOpts.length > 0;
                   const specialHere = moveOpts.some((m) => Boolean(m.special));
                   const captureHere = moveOpts.some((m) => m.capture || Boolean(m.special));
+                  const enemyOpts = moveHere
+                    ? []
+                    : enemyPreviewMoves.filter((m) => m.to.row === row && m.to.col === col);
+                  const enemyMoveHere = enemyOpts.length > 0;
+                  const enemyCaptureHere = enemyOpts.some((m) => m.capture || Boolean(m.special));
                   const key = `${row},${col}`;
                   const barrierPick = barrierShiftHighlights.barriers.has(key);
                   const barrierFrom = barrierShiftHighlights.fromKey === key;
@@ -2900,6 +3304,7 @@ export default function App() {
                   const suckLanding = ultimateSuckHighlights.landings.has(key);
                   const suckCroc = ultimateSuckHighlights.crocKey === key;
                   const gamblerTarget = gamblerChoiceHighlights.has(key);
+                  const zoneHere = (state.zones ?? []).find((z) => z.rows.includes(row));
                   const toks = state.tokens.filter((t) => t.pos.row === row && t.pos.col === col);
                   const meta = piece ? pieceMeta(catalog, piece.defId) : null;
                   const pigOnSquare = state.pieces.find(
@@ -2910,6 +3315,9 @@ export default function App() {
                       p.pos.col === col,
                   );
                   const hasPigBuddy = Boolean(pigOnSquare) || Boolean(piece && pigHostIds.has(piece.id));
+                  const selected =
+                    Boolean(piece && piece.id === selectedPiece) ||
+                    Boolean(pigOnSquare && pigOnSquare.id === selectedPiece);
                   const kingInCheck =
                     Boolean(piece && piece.class === 'king' && state.check === piece.color);
                   const lastFrom =
@@ -2923,15 +3331,23 @@ export default function App() {
                   const lastPiece = !!(piece && state.lastMove?.pieceId === piece.id);
                   const sliding =
                     piece && moveAnim?.pieceId === piece.id
-                      ? {
-                          dx: -moveAnim.deltaCol * moveAnim.sqPx,
-                          dy: -moveAnim.deltaRow * moveAnim.sqPx,
-                          durationMs: moveAnim.durationMs,
-                          phase: moveAnim.phase,
-                        }
+                      ? moveAnim.phase === 'via' && moveAnim.via
+                        ? {
+                            dx: -moveAnim.via.deltaCol * moveAnim.sqPx,
+                            dy: -moveAnim.via.deltaRow * moveAnim.sqPx,
+                            durationMs: moveAnim.via.firstMs,
+                            phase: moveAnim.phase,
+                          }
+                        : {
+                            dx: -moveAnim.deltaCol * moveAnim.sqPx,
+                            dy: -moveAnim.deltaRow * moveAnim.sqPx,
+                            durationMs: moveAnim.via ? moveAnim.via.secondMs : moveAnim.durationMs,
+                            phase: moveAnim.phase,
+                          }
                       : null;
                   const vampRadius =
                     piece?.defId === 'vampire' ? vampireNightRadius(piece.charges ?? 0) : 0;
+                  const phaseForm = piece ? phaseFormFor(piece, state) : null;
                   const inField = (f: { forme: string; row: number; col: number }, r: number, c: number) =>
                     f.forme === 'temporal'
                       ? inTemporalField(f, { row: r, col: c })
@@ -2967,6 +3383,8 @@ export default function App() {
                         moveHere ? 'move' : '',
                         moveHere && captureHere ? 'move-capture' : '',
                         moveHere && specialHere ? 'move-special' : '',
+                        enemyMoveHere ? 'enemy-move' : '',
+                        enemyMoveHere && enemyCaptureHere ? 'enemy-move-capture' : '',
                         confirmKey === key || confirmKey === (piece ? `piece:${piece.id}` : '')
                           ? 'confirm-pending'
                           : '',
@@ -2976,6 +3394,8 @@ export default function App() {
                         suckFrom ? 'suck-from' : suckTarget ? 'suck-target' : '',
                         suckLanding ? (piece ? 'suck-landing suck-capture' : 'suck-landing') : '',
                         gamblerTarget ? 'gambler-target' : '',
+                        gamblerSummonTiles.has(key) ? 'gambler-summon' : '',
+                        piece && selectedCard && pendingTargets.includes(piece.id) ? 'spell-picked' : '',
                         promptSquareOptions.has(key)
                           ? blessPrompt
                             ? 'bless-option'
@@ -3028,6 +3448,20 @@ export default function App() {
                           {FILE_LETTERS[col]}
                         </span>
                       )}
+                      {zoneHere && (
+                        <span
+                          aria-hidden
+                          className={`zone-tint zone-${zoneHere.kind}`}
+                          style={
+                            zoneHere.kind === 'lava_warning'
+                              ? ({
+                                  '--lava-heat': (zoneHere.total - zoneHere.turnsRemaining + 1) / zoneHere.total,
+                                } as React.CSSProperties)
+                              : undefined
+                          }
+                          title={zoneTitle(zoneHere)}
+                        />
+                      )}
                       {fieldsHere.map((f) => (
                         <span
                           key={`field-${f.id}`}
@@ -3048,7 +3482,15 @@ export default function App() {
                       {piece && (
                         <span
                           className={`piece ${lastPiece ? 'last-moved' : ''}${
-                            sliding ? ` piece-move-slide${sliding.phase === 'to' ? ' is-sliding' : ' is-pre-slide'}` : ''
+                            sliding
+                              ? ` piece-move-slide${
+                                  sliding.phase === 'to'
+                                    ? ' is-sliding'
+                                    : sliding.phase === 'via'
+                                    ? ' is-ricochet-leg'
+                                    : ' is-pre-slide'
+                                }`
+                              : ''
                           }${
                             piece.defId === 'reaper' && (piece.charges ?? 0) > 0
                               ? ` reaper-charged reaper-charged-${Math.min(piece.charges ?? 0, 5)}`
@@ -3057,6 +3499,8 @@ export default function App() {
                             piece.defId === 'reaper' && (piece.disabledTurns ?? 0) > 0 ? ' reaper-disabled' : ''
                           }${
                             vampRadius > 0 ? ` vampire-blood vampire-blood-${vampRadius}` : ''
+                          }${phaseForm ? ` phase-${phaseForm.phase}` : ''}${
+                            (piece.effects ?? []).some((e) => e.kind === 'cloaked') ? ' is-cloaked' : ''
                           }${
                             (piece.effects ?? []).some((e) => effectTone(e.kind) === 'debuff')
                               ? ' has-debuff'
@@ -3088,22 +3532,20 @@ export default function App() {
                               : undefined
                           }
                           onTransitionEnd={(e) => {
-                            if (
-                              sliding?.phase === 'to' &&
-                              e.propertyName === 'transform' &&
-                              moveAnim?.pieceId === piece.id
-                            ) {
+                            if (e.propertyName !== 'transform' || moveAnim?.pieceId !== piece.id) return;
+                            if (sliding?.phase === 'via') {
+                              setMoveAnim((m) => (m?.phase === 'via' ? { ...m, phase: 'to' } : m));
+                            } else if (sliding?.phase === 'to') {
                               clearMoveAnim();
                             }
                           }}
                           title={[
                             meta?.name ?? piece.defId,
-                            piece.defId === 'gambler'
-                              ? state.dayNight === 'night'
-                                ? 'Night: 1 diagonal'
-                                : piece.gamblerStyleDefId
-                                  ? `Moves as ${PIECES[piece.gamblerStyleDefId]?.name ?? piece.gamblerStyleDefId}`
-                                  : 'Waiting on a roll'
+                            phaseForm?.label ?? null,
+                            piece.defId === 'gambler' && state.dayNight !== 'night'
+                              ? piece.gamblerStyleDefId
+                                ? `Moves as ${PIECES[piece.gamblerStyleDefId]?.name ?? piece.gamblerStyleDefId}`
+                                : 'Waiting on a roll'
                               : null,
                             piece.defId === 'reaper' && (piece.disabledTurns ?? 0) > 0
                               ? `Resting — ${piece.disabledTurns} turn${piece.disabledTurns === 1 ? '' : 's'} left`
@@ -3113,6 +3555,7 @@ export default function App() {
                             piece.defId === 'vampire' && vampRadius > 0
                               ? `Blood aura ${vampRadius}×${vampRadius}`
                               : null,
+                            piece.defId === 'musician' ? musicianBeatLabel(piece.music?.beat) : null,
                             hasPigBuddy ? 'Pig Best Buddy sharing this tile' : null,
                             ...visibleBoardEffects(piece.effects ?? []).map(formatEffectTitle),
                           ]
@@ -3126,6 +3569,7 @@ export default function App() {
                             forme={piece.proto?.form}
                           />
                           {piece.defId === 'prototype' && <PrototypeBoardBadges proto={piece.proto} />}
+                          {phaseForm && <PhaseBadge phase={phaseForm.phase} label={phaseForm.label} />}
                           {piece.defId === 'gambler' && (
                             <span
                               className={`gambler-style ${state.dayNight === 'night' ? 'is-night' : 'is-day'}`}
@@ -3176,6 +3620,8 @@ export default function App() {
                           {piece.ritualTurns != null && piece.ritualTurns > 0 && (
                             <i className="ritual" title="Revive ritual">{piece.ritualTurns}</i>
                           )}
+                          {piece.defId === 'angel' && <AngelRevivePips used={piece.reviveCount ?? 0} />}
+                          {piece.defId === 'musician' && <MusicianBeatPips beat={piece.music?.beat} />}
                           {(() => {
                             const statuses = visibleBoardEffects(piece.effects ?? []);
                             if ((piece.bloodlustTurnsRemaining ?? 0) > 0) {
@@ -3263,10 +3709,11 @@ export default function App() {
               ) : null}
             </div>
 
+            {!state.rules?.cardsDisabled && (
             <section className="hand-tray" aria-label="Your hand">
               <div className="hand-fan-row">
                 <span className="hand-you-label">
-                  {localMode ? (you === 'white' ? 'White' : 'Black') : 'You'}
+                  {hotseat ? (you === 'white' ? 'White' : 'Black') : 'You'}
                 </span>
                 <div
                   className={`hand hand-fan ${
@@ -3388,7 +3835,14 @@ export default function App() {
                   {catalog?.pieces
                     .filter((p) => {
                       const target = state.pieces.find((x) => x.id === pendingTargets[0]);
-                      return target && p.class === target.class && p.id !== target.defId && p.class !== 'king' && p.class !== 'queen';
+                      return (
+                        target &&
+                        p.class === target.class &&
+                        p.id !== target.defId &&
+                        p.class !== 'king' &&
+                        p.class !== 'queen' &&
+                        !state.bannedPieces?.includes(p.id)
+                      );
                     })
                     .map((p) => (
                       <button
@@ -3400,6 +3854,27 @@ export default function App() {
                         {p.name}
                       </button>
                     ))}
+                </div>
+              )}
+
+              {activeCardDef?.id === 'enchant' && pendingTargets.length >= 1 && canCastSpells && (
+                <div className="variant-grid">
+                  {VARIANTS_BY_CLASS.queen
+                    .filter((id) => !state.bannedPieces?.includes(id))
+                    .map((id) => {
+                      const target = state.pieces.find((x) => x.id === pendingTargets[0]);
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          className={pendingTargets[1] === id ? 'is-active' : ''}
+                          onClick={() => offerSpellConfirm([pendingTargets[0], id])}
+                        >
+                          <PieceIcon defId={id} color={target?.color ?? you ?? 'white'} className="sm" />
+                          {PIECES[id]?.name ?? id}
+                        </button>
+                      );
+                    })}
                 </div>
               )}
 
@@ -3418,7 +3893,7 @@ export default function App() {
                       )}
                     </p>
                     {catalog?.pieces
-                      .filter((p) => p.class === 'pawn')
+                      .filter((p) => p.class === 'pawn' && !state.bannedPieces?.includes(p.id))
                       .map((p) => (
                         <button
                           key={p.id}
@@ -3491,6 +3966,7 @@ export default function App() {
                 Flow: spell (optional) → move one piece. Putting the opponent in check ends your turn immediately.
               </p>
             </section>
+            )}
           </main>
 
           <aside className="play-dock" aria-live="polite">
@@ -3553,6 +4029,7 @@ export default function App() {
                     disabledTurns: inspectedPiece.disabledTurns,
                     gamblerStyleDefId: inspectedPiece.gamblerStyleDefId,
                     ritualTurns: inspectedPiece.ritualTurns,
+                    reviveCount: inspectedPiece.reviveCount,
                     gadgetUsed: inspectedPiece.gadgetUsed,
                     gigaStompUsed: inspectedPiece.gigaStompUsed,
                     abilityCooldown: inspectedPiece.abilityCooldown,
@@ -3564,6 +4041,7 @@ export default function App() {
                     coOccupantId: inspectedPiece.coOccupantId,
                     hasPigBuddy: pigHostIds.has(inspectedPiece.id),
                     proto: inspectedPiece.proto,
+                    music: inspectedPiece.music,
                     formeSwapCooldown: state.players[inspectedPiece.color].formeSwapCooldown,
                     effects: inspectedPiece.effects,
                   }}
@@ -3617,7 +4095,7 @@ export default function App() {
                 </button>
               </div>
               <p className="mobile-more-meta">
-                {localMode ? 'Local play' : `Room ${roomCode}`}
+                {cpu ? `Vs ${cpuName(cpu.difficulty)}` : localMode ? 'Local play' : `Room ${roomCode}`}
                 {you ? ` · You are ${you}` : ''}
                 {` · ${state.dayNight === 'day' ? 'Day' : 'Night'} · cycle ${state.cycleCount}`}
               </p>
@@ -3659,7 +4137,7 @@ export default function App() {
                   Rules
                 </button>
                 <button type="button" className="danger" onClick={exitToHome}>
-                  {localMode ? 'Exit local' : 'Leave game'}
+                  {hotseat ? 'Exit local' : 'Leave game'}
                 </button>
               </div>
             </section>
@@ -3806,15 +4284,17 @@ function TurnStrip({
   state,
   you,
   localMode = false,
+  waitingTitle,
   clockOffsetMs = 0,
 }: {
   state: GameState;
   you: Color | null;
   localMode?: boolean;
+  waitingTitle?: string;
   clockOffsetMs?: number;
 }) {
   const showClock = Boolean(state.turnTimer && state.phase === 'playing');
-  const { mode, title, detail } = turnStripContent(state, you, localMode);
+  const { mode, title, detail } = turnStripContent(state, you, localMode, waitingTitle);
   const youInCheck = Boolean(you && state.phase === 'playing' && state.check === you);
   const check =
     state.phase === 'playing' && state.check
@@ -3856,7 +4336,7 @@ function TurnStrip({
       >
         <span className="turn-strip-title">
           <span className="waiting-opponent-dot" aria-hidden />
-          Waiting for opponent
+          {mode === 'waiting' ? title : 'Waiting for opponent'}
         </span>
         <span className="turn-strip-detail">{mode === 'waiting' ? detail || '\u00a0' : '\u00a0'}</span>
       </div>
@@ -3915,6 +4395,28 @@ function VampireBloodChargeFx({ tokens }: { tokens: number }) {
   );
 }
 
+function PhaseBadge({ phase, label }: { phase: 'day' | 'night'; label: string }) {
+  return (
+    <span className={`phase-badge is-${phase}`} title={label} aria-label={label}>
+      {phase === 'night' ? (
+        <svg viewBox="0 0 20 20" aria-hidden>
+          <path d="M13.6 2.4a7.8 7.8 0 1 0 4 12.9A6.6 6.6 0 0 1 13.6 2.4Z" />
+          <circle cx="15.6" cy="5.2" r="0.9" className="phase-star" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 20 20" aria-hidden>
+          <circle cx="10" cy="10" r="4.1" />
+          <g className="phase-rays">
+            {[0, 45, 90, 135, 180, 225, 270, 315].map((a) => (
+              <rect key={a} x="9.1" y="1.2" width="1.8" height="3.2" rx="0.9" transform={`rotate(${a} 10 10)`} />
+            ))}
+          </g>
+        </svg>
+      )}
+    </span>
+  );
+}
+
 function ReaperDisabledFx({ turns }: { turns: number }) {
   const shown = Math.max(1, Math.min(12, turns));
   return (
@@ -3932,6 +4434,36 @@ function ReaperDisabledFx({ turns }: { turns: number }) {
         <path fill="rgba(12,8,20,0.55)" d="M8.2 5.8h3.6L10 7.8 8.2 5.8zm0 10.4h3.6L10 14.2l-1.8 2z" />
       </svg>
       <b className="reaper-disabled-n">{shown}</b>
+    </span>
+  );
+}
+
+function AngelRevivePips({ used, size = 'board' }: { used: number; size?: 'board' | 'info' }) {
+  const left = Math.max(0, ANGEL_MAX_REVIVES - used);
+  const label = `${left} of ${ANGEL_MAX_REVIVES} revives left`;
+  return (
+    <span className={`angel-revive-pips angel-revive-pips-${size}${left === 1 ? ' is-last' : ''}`} title={label} aria-label={label}>
+      {Array.from({ length: ANGEL_MAX_REVIVES }, (_, i) => (
+        <i key={i} className={i < left ? 'is-left' : 'is-used'} />
+      ))}
+    </span>
+  );
+}
+
+function musicianBeatLabel(beat: number | undefined): string {
+  const b = beat && beat >= 1 && beat <= 4 ? beat : 1;
+  const info = MUSICIAN_BEATS[b - 1];
+  return `Beat ${b} · ${info.name}: ${info.move}`;
+}
+
+function MusicianBeatPips({ beat, size = 'board' }: { beat?: number; size?: 'board' | 'info' }) {
+  const b = beat && beat >= 1 && beat <= 4 ? beat : 1;
+  const label = musicianBeatLabel(b);
+  return (
+    <span className={`musician-beat musician-beat-${size}${b === 4 ? ' is-rest' : ''}`} title={label} aria-label={label}>
+      {MUSICIAN_BEATS.map((info, i) => (
+        <i key={info.name} className={i + 1 === b ? 'is-now' : ''} />
+      ))}
     </span>
   );
 }
@@ -4065,6 +4597,7 @@ function PieceInfoBody({
     disabledTurns?: number;
     gamblerStyleDefId?: string;
     ritualTurns?: number;
+    reviveCount?: number;
     gadgetUsed?: boolean;
     gigaStompUsed?: boolean;
     abilityCooldown?: number;
@@ -4076,6 +4609,7 @@ function PieceInfoBody({
     coOccupantId?: string;
     hasPigBuddy?: boolean;
     proto?: Piece['proto'];
+    music?: Piece['music'];
     formeSwapCooldown?: number;
     effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
@@ -4117,6 +4651,18 @@ function PieceInfoBody({
               Black
             </button>
           </div>
+          {live && defId === 'angel' && (
+            <p className="angel-revive-live">
+              Revives {Math.max(0, ANGEL_MAX_REVIVES - (live.reviveCount ?? 0))}/{ANGEL_MAX_REVIVES}
+              <AngelRevivePips used={live.reviveCount ?? 0} size="info" />
+            </p>
+          )}
+          {live && defId === 'musician' && (
+            <p className="musician-beat-live">
+              {musicianBeatLabel(live.music?.beat).split(':')[0]}
+              <MusicianBeatPips beat={live.music?.beat} size="info" />
+            </p>
+          )}
         </div>
       </div>
 
@@ -4162,6 +4708,10 @@ function PieceInfoBody({
             <span>
               Blood Tokens: {live.charges ?? 0}
               {` · Night ${vampireNightRadius(live.charges ?? 0)}×${vampireNightRadius(live.charges ?? 0)}`}
+              {(() => {
+                const next = VAMPIRE_RADIUS_MILESTONES.find((m) => (live.charges ?? 0) < m);
+                return next != null ? ` · next at ${next}` : ' · max';
+              })()}
             </span>
           )}
           {defId === 'gambler' && (
@@ -4231,6 +4781,7 @@ function PieceInfoTile({
     disabledTurns?: number;
     gamblerStyleDefId?: string;
     ritualTurns?: number;
+    reviveCount?: number;
     gadgetUsed?: boolean;
     gigaStompUsed?: boolean;
     abilityCooldown?: number;
@@ -4242,6 +4793,7 @@ function PieceInfoTile({
     coOccupantId?: string;
     hasPigBuddy?: boolean;
     proto?: Piece['proto'];
+    music?: Piece['music'];
     formeSwapCooldown?: number;
     effects?: Array<{ id?: string; kind: string; turnsRemaining?: number; data?: Record<string, unknown> }>;
   };
@@ -4848,6 +5400,23 @@ function GamblerPrompt({
   const roll = prompt.roll ?? 0;
   const cardPlayer = prompt.color ?? you;
   const classes = ['pawn', 'rook', 'knight', 'bishop', 'wildcard', 'queen'];
+
+  if (prompt.cardDefId === 'gamblers_high') {
+    if (cardPlayer !== you) return <div className="banner">Opponent's Gamblers High — {prompt.message}</div>;
+    if (roll === 8) {
+      return <div className="banner">{prompt.message} Then press Confirm.</div>;
+    }
+    return (
+      <div className="banner">
+        {prompt.message}
+        <span className="prompt-actions">
+          <button type="button" className="primary" onClick={() => onResolve(null)}>
+            Confirm
+          </button>
+        </span>
+      </div>
+    );
+  }
 
   const graveButtons = (color: Color) =>
     state.players[color].graveyard.map((g, idx) => (

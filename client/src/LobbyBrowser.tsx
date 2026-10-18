@@ -10,6 +10,8 @@ export interface RoomSummary {
   banPhase: boolean;
   anonymous?: boolean;
   turnTimerSeconds?: number | null;
+  cardsDisabled?: boolean;
+  noDupes?: boolean;
   phase: string;
   players: number;
   joinable: boolean;
@@ -193,6 +195,8 @@ export function LobbyBrowser({
                         <span className="lobby-room-tag is-fast">⏱ {room.turnTimerSeconds}s/turn</span>
                       ) : null}
                       {room.anonymous && <span className="lobby-room-tag">Anonymous</span>}
+                      {room.cardsDisabled && <span className="lobby-room-tag">No cards</span>}
+                      {room.noDupes && <span className="lobby-room-tag">No Dupes</span>}
                     </div>
                   </div>
                   {!prompting && (

@@ -1,3 +1,5 @@
+import { PIECES } from '@shared/pieces/index.ts';
+
 export type EffectTone = 'buff' | 'debuff' | 'neutral' | 'ritual';
 
 export interface EffectMeta {
@@ -12,6 +14,7 @@ export const EFFECT_META: Record<string, EffectMeta> = {
   blink: { label: 'Blk', name: 'Blink', tone: 'buff' },
   enchant_ritual: { label: 'Enc', name: 'Enchant ritual', tone: 'ritual' },
   kingsstead: { label: 'Kng', name: 'Kingstead', tone: 'buff' },
+  kingsstead_pending: { label: 'Kng…', name: 'Kingstead (pending)', tone: 'neutral' },
   speed_plus_pending: { label: 'Spd…', name: 'Speed Plus (pending)', tone: 'neutral' },
   speed_plus: { label: 'Spd', name: 'Speed Plus', tone: 'buff' },
   movement_plus_pending: { label: 'Mov…', name: 'Movement Plus (pending)', tone: 'neutral' },
@@ -24,6 +27,8 @@ export const EFFECT_META: Record<string, EffectMeta> = {
   doublecast_pending: { label: 'DC…', name: 'Doublecast (pending)', tone: 'neutral' },
   doublecast_ready: { label: 'DC', name: 'Doublecast ready', tone: 'buff' },
   echo_armed: { label: 'Eco', name: 'Echo', tone: 'buff' },
+  in_spirit: { label: 'Spr', name: 'In-Spirit (captures without moving)', tone: 'buff' },
+  cloaked: { label: 'Clk', name: 'Cloaked (invisible to the opponent)', tone: 'buff' },
   stunned: { label: 'Stn', name: 'Stunned', tone: 'debuff' },
   recall: { label: 'Rcl', name: 'Recall', tone: 'buff' },
   converted: { label: 'Cnv', name: 'Converted', tone: 'neutral' },
@@ -31,16 +36,19 @@ export const EFFECT_META: Record<string, EffectMeta> = {
   immobilized: { label: 'Imm', name: 'Immobilized', tone: 'debuff' },
   webbed: { label: 'Web', name: 'Webbed', tone: 'debuff' },
   wizard_enchant: { label: 'Wiz', name: 'Wizard enchant', tone: 'buff' },
+  merchant_range: { label: '+1', name: 'Bought +1 range (Merchant) — permanent', tone: 'buff' },
   magic_begone: { label: 'Mbg', name: 'Magic silenced', tone: 'debuff' },
   identity_loot: { label: 'ID', name: 'Identity stored', tone: 'neutral' },
   identity_stolen: { label: 'ID', name: 'Identity Theft', tone: 'buff' },
   ghost_unlocked: { label: 'Gst', name: 'Ghost unlocked', tone: 'buff' },
+  asleep: { label: 'Zzz', name: 'Asleep (Lullaby) — wakes if a piece next to it is captured', tone: 'debuff' },
 };
 
 export interface StatusEffectView {
   id?: string;
   kind: string;
   turnsRemaining?: number;
+  data?: Record<string, unknown>;
 }
 
 /** Collapse Pause's companion flags; hide permanent unlock clutter on the board. */
@@ -53,6 +61,8 @@ export function visibleBoardEffects(effects: StatusEffectView[]): StatusEffectVi
   }).map((e, i) => ({
     ...e,
     id: e.id ?? `${e.kind}-${i}`,
+    // Cloak counts the piece's own moves rather than turns.
+    ...(e.kind === 'cloaked' && e.data?.movesLeft != null ? { turnsRemaining: Number(e.data.movesLeft) } : {}),
   }));
 }
 
@@ -69,6 +79,7 @@ export function effectTone(kind: string): EffectTone {
 }
 
 export function formatEffectTitle(e: StatusEffectView): string {
-  const base = effectName(e.kind);
+  const into = e.kind === 'enchant_ritual' && e.data?.queenDefId ? PIECES[String(e.data.queenDefId)]?.name : null;
+  const base = into ? `${effectName(e.kind)} → ${into}` : effectName(e.kind);
   return e.turnsRemaining != null ? `${base} (${e.turnsRemaining})` : base;
 }

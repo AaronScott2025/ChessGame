@@ -9,3 +9,4 @@ export {
   registerCard,
 } from './registry.js';
 export type { CardDefinition, CardContext, TargetingMode } from './registry.js';
+export { castFrame, closeCast, openCast, recordCast, revertCast } from './castRecord.js';

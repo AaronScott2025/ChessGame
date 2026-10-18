@@ -1687,6 +1687,18 @@ const ABILITY_SFX: Record<string, FxLayer[]> = {
     tone('sine', 200, 0.06, { to: 90, at: 0.22, v: 0.14 }),
   ],
   steady_aim: [tone('sine', 1000, 0.15, { v: 0.06 }), tone('sine', 1500, 0.2, { at: 0.12, v: 0.07 })],
+  // In-Spirit — ghostly whoosh and a distant hit
+  spirit_strike: [
+    tone('sine', 1200, 0.25, { to: 300, v: 0.08, vib: [8, 30] }),
+    noise('bandpass', 2400, 0.25, { q: 2, v: 0.08 }),
+    tone('sine', 150, 0.12, { at: 0.24, to: 70, v: 0.16 }),
+  ],
+  // Lava Tsunami eruption — crack, boom, bubbling
+  lava_tsunami: [
+    noise('lowpass', 900, 0.15, { v: 0.22 }),
+    tone('sine', 70, 0.8, { to: 35, at: 0.05, v: 0.28 }),
+    ...[0.35, 0.5, 0.62, 0.8].map((at) => tone('sine', 180, 0.07, { at, to: 320, v: 0.07 })),
+  ],
   // Snake — hiss and growl
   bloodlust: [
     noise('highpass', 5000, 0.45, { a: 0.05, v: 0.12 }),
@@ -1700,6 +1712,26 @@ const ABILITY_SFX: Record<string, FxLayer[]> = {
     noise('lowpass', 450, 0.06, { at: 0.08, v: 0.16 }),
     noise('lowpass', 400, 0.08, { at: 0.16, v: 0.16 }),
     tone('sine', 130, 0.3, { to: 70, v: 0.1 }),
+  ],
+  // Skirmisher — whizz, ping off the edge, whizz away
+  ricochet: [
+    tone('triangle', 500, 0.12, { to: 1400, v: 0.08 }),
+    tone('square', 2400, 0.05, { at: 0.12, v: 0.05 }),
+    noise('highpass', 6000, 0.04, { at: 0.12, v: 0.08 }),
+    tone('triangle', 1600, 0.16, { to: 600, at: 0.15, v: 0.07 }),
+  ],
+  // Merchant — a coin drops into the purse
+  merchant_coin: [
+    tone('square', 1975, 0.06, { v: 0.05 }),
+    tone('square', 2637, 0.22, { at: 0.06, v: 0.05 }),
+    tone('sine', 5274, 0.18, { at: 0.06, v: 0.03 }),
+  ],
+  // Merchant — cash register "ka-ching"
+  merchant_buy: [
+    noise('bandpass', 2500, 0.05, { v: 0.12 }),
+    noise('bandpass', 1800, 0.05, { at: 0.06, v: 0.1 }),
+    tone('triangle', 2093, 0.3, { at: 0.12, v: 0.08 }),
+    tone('triangle', 2637, 0.4, { at: 0.18, v: 0.07 }),
   ],
   // Ghost — wavering "oooh"
   phase_walk: [
@@ -1811,6 +1843,38 @@ const ABILITY_SFX: Record<string, FxLayer[]> = {
     tone('sawtooth', 200, 0.6, { to: 600, at: 0.08, v: 0.06, vib: [60, 30] }),
     tone('square', 1200, 0.06, { at: 0.5, v: 0.05 }),
     tone('square', 1600, 0.1, { at: 0.58, v: 0.05 }),
+  ],
+  // Musician — a short motif per song
+  song_march: [
+    ...[0, 0.12, 0.24].map((at) => noise('bandpass', 1800, 0.05, { at, q: 1.5, v: 0.1 })),
+    tone('square', 392, 0.12, { v: 0.05 }),
+    tone('square', 523, 0.12, { at: 0.12, v: 0.05 }),
+    tone('square', 659, 0.12, { at: 0.24, v: 0.05 }),
+    tone('square', 784, 0.4, { at: 0.36, v: 0.06, vib: [5, 5] }),
+    tone('triangle', 196, 0.5, { at: 0.36, v: 0.07 }),
+  ],
+  song_encore: [
+    ...[523, 659, 784, 1047].map((f, i) => tone('triangle', f, 0.16, { at: i * 0.08, v: 0.07 })),
+    tone('sine', 1319, 0.45, { at: 0.32, v: 0.06, vib: [6, 10] }),
+    ...[0.3, 0.36, 0.41, 0.47, 0.52].map((at) => noise('bandpass', 3000, 0.03, { at, q: 2, v: 0.06 })),
+  ],
+  song_lullaby: [
+    ...[1319, 1047, 1175, 784].map((f, i) => tone('sine', f, 0.5, { at: i * 0.22, v: 0.06, vib: [5, 6] })),
+    tone('triangle', 262, 1.1, { a: 0.3, v: 0.05 }),
+  ],
+  song_discord: [
+    tone('sawtooth', 220, 0.6, { v: 0.05, vib: [9, 6] }),
+    tone('sawtooth', 233, 0.6, { v: 0.05 }),
+    tone('sawtooth', 311, 0.6, { v: 0.045 }),
+    noise('lowpass', 600, 0.25, { to: 2500, at: 0.05, v: 0.14 }),
+    tone('sine', 120, 0.35, { to: 50, at: 0.05, v: 0.16 }),
+  ],
+  crescendo: [
+    tone('sine', 262, 0.9, { a: 0.6, v: 0.07 }),
+    tone('sine', 330, 0.9, { a: 0.6, v: 0.06 }),
+    tone('sine', 392, 0.9, { a: 0.6, v: 0.06 }),
+    tone('triangle', 523, 0.6, { at: 0.55, v: 0.08, vib: [6, 8] }),
+    noise('highpass', 4000, 0.4, { to: 9000, at: 0.5, v: 0.06 }),
   ],
 };
 
@@ -1971,6 +2035,33 @@ const CARD_SFX: Record<string, FxLayer[]> = {
   gamblers_delight: [
     ...[0, 0.06, 0.12, 0.2].map((at) => noise('bandpass', 3800, 0.03, { at, q: 4, v: 0.12 })),
     ...[784, 988, 1175, 1568].map((f, i) => tone('triangle', f, 0.14, { at: 0.3 + i * 0.06, v: 0.07 })),
+  ],
+  // Long dice tumble and a jackpot slot-machine run
+  gamblers_high: [
+    ...[0, 0.04, 0.09, 0.13, 0.19, 0.24, 0.31, 0.37].map((at) => noise('bandpass', 3300, 0.03, { at, q: 4, v: 0.13 })),
+    ...[659, 784, 988, 1318, 1568].map((f, i) => tone('square', f, 0.09, { at: 0.46 + i * 0.05, v: 0.045 })),
+  ],
+  // Cloth swish fading into silence
+  cloak: [
+    noise('bandpass', 1800, 0.35, { to: 600, q: 1.5, a: 0.05, v: 0.12 }),
+    tone('sine', 880, 0.4, { to: 440, at: 0.15, v: 0.04 }),
+  ],
+  // Airy shimmer, like something leaving the body
+  in_spirit: [
+    tone('sine', 523, 0.6, { to: 1046, v: 0.06, vib: [6, 12] }),
+    tone('sine', 784, 0.6, { to: 1568, at: 0.1, v: 0.04, vib: [5, 10] }),
+    noise('highpass', 5000, 0.5, { a: 0.2, v: 0.04 }),
+  ],
+  // Two pieces whisked past each other
+  coordinated_shuffle: [
+    noise('highpass', 2500, 0.15, { to: 6000, v: 0.1 }),
+    noise('highpass', 6000, 0.15, { to: 2500, at: 0.16, v: 0.1 }),
+    tone('triangle', 659, 0.12, { at: 0.32, v: 0.07 }),
+  ],
+  // Low volcanic rumble building up
+  lava_tsunami: [
+    noise('lowpass', 220, 1.1, { a: 0.4, v: 0.22 }),
+    tone('sawtooth', 55, 1.1, { to: 70, v: 0.05, vib: [5, 4] }),
   ],
 };
 

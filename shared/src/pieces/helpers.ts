@@ -90,6 +90,59 @@ export function rayMoves(
   return moves;
 }
 
+/**
+ * Diagonal rays of up to `max` squares that may bounce once off a board edge (not a corner),
+ * turning 90° and carrying on for up to `after` squares. Bounced moves list every square they
+ * cross in `meta.path`, so lava and webs are checked along the real route.
+ */
+export function ricochetMoves(piece: PieceState, state: GameState, max: number, after: number): MoveOption[] {
+  const moves: MoveOption[] = [];
+  const seen = new Set<string>();
+  const add = (opt: MoveOption, path?: Coord[]) => {
+    const key = `${opt.to.row},${opt.to.col}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    moves.push(path ? { ...opt, meta: { ...(opt.meta ?? {}), path, ricochet: true } } : opt);
+  };
+  const bonus = movementBonus(piece);
+  const DIAGONALS = [
+    { row: -1, col: -1 },
+    { row: -1, col: 1 },
+    { row: 1, col: -1 },
+    { row: 1, col: 1 },
+  ];
+  for (const m of rayMoves(piece, state, DIAGONALS, max)) add(m);
+  for (const d of DIAGONALS) {
+    const path: Coord[] = [];
+    let pos = piece.pos;
+    for (let i = 1; i <= max + bonus; i++) {
+      const step = { row: pos.row + d.row, col: pos.col + d.col };
+      const opt = emptyOrEnemy(state, step, piece.color, piece);
+      if (!opt || opt.capture) break;
+      pos = step;
+      path.push(pos);
+      const rowOut = !inBounds({ row: pos.row + d.row, col: pos.col });
+      const colOut = !inBounds({ row: pos.row, col: pos.col + d.col });
+      if (!rowOut && !colOut) continue;
+      if (rowOut !== colOut) {
+        const b = rowOut ? { row: -d.row, col: d.col } : { row: d.row, col: -d.col };
+        const bounced = [...path];
+        let at = pos;
+        for (let j = 1; j <= after + bonus; j++) {
+          at = { row: at.row + b.row, col: at.col + b.col };
+          const hit = emptyOrEnemy(state, at, piece.color, piece);
+          if (!hit) break;
+          bounced.push(at);
+          add(hit, [...bounced]);
+          if (hit.capture) break;
+        }
+      }
+      break;
+    }
+  }
+  return moves;
+}
+
 export function areaMoves(
   piece: PieceState,
   state: GameState,
@@ -265,17 +318,12 @@ export function standardPawnMoves(piece: PieceState, state: GameState, diagonalM
     if (inBounds(forward) && !pieceAt(state, forward) && !state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, forward))) {
       moves.push({ to: forward });
       if (!piece.hasMoved) {
-        const two = { row: piece.pos.row + dir * (2 + bonus), col: piece.pos.col };
-        // allow 2 (or bonus) if path clear
-        let clear = true;
-        for (let i = 1; i <= 1 + bonus; i++) {
-          const p = { row: piece.pos.row + dir * i, col: piece.pos.col };
-          if (pieceAt(state, p) || state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, p))) {
-            clear = false;
-            break;
-          }
-        }
-        if (clear && inBounds(two)) moves.push({ to: { row: piece.pos.row + dir * 2, col: piece.pos.col } });
+        const two = { row: piece.pos.row + dir * 2, col: piece.pos.col };
+        const clear =
+          inBounds(two) &&
+          !pieceAt(state, two) &&
+          !state.tokens.some((t) => t.kind === 'barrier' && sameCoord(t.pos, two));
+        if (clear) moves.push({ to: two });
       } else if (bonus > 0) {
         const extra = { row: piece.pos.row + dir * (1 + bonus), col: piece.pos.col };
         let clear = true;

@@ -10,6 +10,7 @@ import {
   forceTimeoutMove,
   getDraftOptions,
   listMoves,
+  movesForViewer,
   publicState,
   seatDisplayName,
   startDraft,
@@ -55,6 +56,8 @@ interface RoomSummary {
   banPhase: boolean;
   anonymous: boolean;
   turnTimerSeconds: number | null;
+  cardsDisabled: boolean;
+  noDupes: boolean;
   phase: GameState['phase'];
   players: number;
   joinable: boolean;
@@ -63,7 +66,13 @@ interface RoomSummary {
 
 interface CreateRoomPayload {
   name?: string;
-  rules?: { banPhase?: unknown; anonymous?: unknown; turnTimerSeconds?: unknown };
+  rules?: {
+    banPhase?: unknown;
+    anonymous?: unknown;
+    turnTimerSeconds?: unknown;
+    cardsDisabled?: unknown;
+    noDupes?: unknown;
+  };
   password?: unknown;
 }
 
@@ -88,6 +97,8 @@ function roomSummary(room: Room): RoomSummary {
     banPhase: room.state.rules?.banPhase !== false,
     anonymous: Boolean(room.state.rules?.anonymous),
     turnTimerSeconds: room.state.rules?.turnTimerSeconds ?? null,
+    cardsDisabled: Boolean(room.state.rules?.cardsDisabled),
+    noDupes: Boolean(room.state.rules?.noDupes),
     phase: room.state.phase,
     players,
     joinable: players < 2 && room.state.phase !== 'ended',
@@ -308,7 +319,7 @@ io.on('connection', (socket) => {
       if (room.state.phase === 'playing' && room.state.turn === you) {
         const moves: Record<string, ReturnType<typeof listMoves>> = {};
         for (const p of room.state.pieces.filter((x) => x.color === you)) {
-          moves[p.id] = listMoves(room.state, p.id);
+          moves[p.id] = movesForViewer(room.state, you, listMoves(room.state, p.id));
         }
         socket.emit('legal_moves', moves);
       }
@@ -327,7 +338,7 @@ io.on('connection', (socket) => {
       if (!piece || piece.color !== color) throw new Error('Not your piece');
       ack?.({
         ok: true,
-        moves: listMoves(room.state, payload.pieceId),
+        moves: movesForViewer(room.state, color, listMoves(room.state, payload.pieceId)),
         abilities: availableAbilities(room.state, payload.pieceId),
       });
     } catch (e) {

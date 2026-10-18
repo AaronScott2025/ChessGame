@@ -6,9 +6,9 @@ const CLASS_SECTIONS: Array<{ title: string; ids: string[] }> = [
   { title: 'Pawns', ids: ['pawn', 'nwap', 'rogue', 'enchanted_pawn', 'leapfrog', 'spider'] },
   { title: 'Rooks', ids: ['rook', 'stoneman', 'gnome', 'yeti', 'crocodile'] },
   { title: 'Knights', ids: ['horse', 'snake', 'pig', 'archer'] },
-  { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard', 'worm'] },
-  { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president'] },
-  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype', 'snail'] },
+  { title: 'Bishops', ids: ['bishop', 'scamman', 'wizard', 'worm', 'skirmisher'] },
+  { title: 'Queens', ids: ['queen', 'angel', 'ghost', 'reaper', 'vampire', 'spider_queen', 'president', 'merchant'] },
+  { title: 'Wildcards', ids: ['prince_princess', 'demon', 'mimic', 'gambler', 'timekeeper', 'prototype', 'snail', 'musician'] },
   { title: 'King', ids: ['king'] },
 ];
 
@@ -217,6 +217,10 @@ export function RulesModal({ open, onClose }: { open: boolean; onClose: () => vo
               <li>
                 <strong>Anonymous</strong> — display names are hidden; the players are shown only as{' '}
                 <strong>White</strong> and <strong>Black</strong>.
+              </li>
+              <li>
+                <strong>No Dupes</strong> — once a player drafts a piece variant, the other player can’t draft it.
+                Spells and abilities that create or transform pieces can still make copies.
               </li>
               <li>
                 <strong>Chess but Fast ⏱</strong> — every turn has a clock of <strong>1 min, 45s, 30s, or 15s</strong>.

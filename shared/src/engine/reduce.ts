@@ -4,6 +4,7 @@ import {
   applyMove,
   cancelPrompt,
   chooseFirstPicker,
+  declareCheckmateIfStuck,
   draftBan,
   draftPick,
   openingKeep,
@@ -72,5 +73,6 @@ export function applyClientAction(state: GameState, color: Color, action: Client
   }
   openQueuedLawPrompt(next);
   refreshCheckState(next);
+  declareCheckmateIfStuck(next);
   return next;
 }
