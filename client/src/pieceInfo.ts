@@ -19,13 +19,15 @@ export interface PieceInfo {
 const FAR_EDGE_PROMOTION =
   'Also promotes if it lands on the far edge any other way (spell, revive, push) — that promotion does not use your turn.';
 
+const promote = (options: string) => [`Promote - Promote into ${options} at the far edge.`, FAR_EDGE_PROMOTION];
+
 export const PIECE_INFO: Record<string, PieceInfo> = {
   pawn: {
     id: 'pawn',
     name: 'Pawn',
     classLabel: 'Pawn',
     movement: ['Moves 1 square forward.', 'First move may go up to 2 squares forward.'],
-    abilities: ['Promote into a Queen or Queen variant at the far edge.', FAR_EDGE_PROMOTION],
+    abilities: promote('a Queen or Queen variant'),
     notes: ['Captures diagonally forward only.'],
   },
   nwap: {
@@ -33,7 +35,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     name: 'nwaP',
     classLabel: 'Pawn',
     movement: ['Moves 1 square diagonally forward.', 'First move may go up to 2 squares diagonally forward.'],
-    abilities: ['Promote into Horse, Bishop, Wildcard, or Rook variants at the far edge.', FAR_EDGE_PROMOTION],
+    abilities: promote('a Horse, Bishop, or Rook variant, or a Demon or Mimic,'),
     notes: ['Captures straight forward only (not diagonally).'],
   },
   rogue: {
@@ -44,7 +46,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
       'Moves 1 square forward, or 1 square diagonally backward.',
       'First move may go up to 2 squares forward.',
     ],
-    abilities: ['Promote into Bishop or Rook variants at the far edge.', FAR_EDGE_PROMOTION],
+    abilities: promote('a Bishop or Rook variant'),
     notes: ['Captures diagonally forward, diagonally backward, or straight backward.'],
   },
   leapfrog: {
@@ -54,8 +56,7 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     movement: ['Moves 1 square forward (cannot capture that way).'],
     abilities: [
       'Leap: jump over one adjacent allied piece in any direction, landing on the square beyond if it is a legal destination.',
-      'Promote into a Queen or Queen variant at the far edge.',
-      FAR_EDGE_PROMOTION,
+      ...promote('a Queen or Queen variant'),
     ],
     notes: [
       'Captures one square horizontally.',
@@ -220,11 +221,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'skirmisher',
     name: 'Skirmisher',
     classLabel: 'Bishop',
-    movement: [
-      'Moves up to 4 squares diagonally.',
+    movement: ['Moves up to 4 squares diagonally.'],
+    abilities: [
       'Ricochet: if its diagonal reaches a board edge within those 4 squares, it may bounce off that edge at a 90° angle and carry on for up to 3 more squares.',
     ],
-    abilities: [],
     notes: [
       'Only one ricochet per move, and never off a corner.',
       'It can capture at the end of either leg, but pieces block the path before and after the bounce.',
@@ -242,11 +242,9 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     id: 'spider_queen',
     name: 'Spider Queen',
     classLabel: 'Queen',
-    movement: [
-      'Moves up to 3 squares in any direction (orthogonal or diagonal).',
-      'While standing on any web, moves up to 4 squares instead.',
-    ],
+    movement: ['Moves up to 3 squares in any direction (orthogonal or diagonal).'],
     abilities: [
+      'Spiders Domain: while standing on any web, moves up to 4 squares instead.',
       'Trail of Webs: after she leaves a square, a web is placed on that square and the tiles to her left and right of travel (horizontal move → above, origin, below).',
       'Any piece that moves onto or through a web is stopped there and stuck for 3 turns, or until that web disappears.',
       'She may have 2 web rows at once; placing a third removes the oldest row.',
@@ -304,12 +302,10 @@ export const PIECE_INFO: Record<string, PieceInfo> = {
     classLabel: 'Queen',
     movement: [
       'Day: moves 1 tile in any direction.',
-      'Night: the move area grows at Blood Token milestones.',
-      '1 Blood Token → 1×1 area · 2 → 2×2 · 5 → 3×3 · 10 → 4×4 (max).',
+      'Night: moves anywhere within its Sip Of Life area.',
     ],
     abilities: [
-      'Starts with 1 Blood Token.',
-      'Blood Token: gains 1 Blood Token each time it captures a piece (day or night).',
+      'Sip Of Life: starts with 1 Blood Token and gains 1 more each time it captures a piece (day or night). At night its move area grows with its Blood Tokens: 1 → 1×1 · 2 → 2×2 · 5 → 3×3 · 10 → 4×4 (max).',
     ],
   },
   president: {

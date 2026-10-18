@@ -1713,6 +1713,16 @@ const ABILITY_SFX: Record<string, FxLayer[]> = {
     noise('lowpass', 400, 0.08, { at: 0.16, v: 0.16 }),
     tone('sine', 130, 0.3, { to: 70, v: 0.1 }),
   ],
+  // Horse — hoof clop, whoosh over the piece, clop on landing
+  horse_jump: [
+    noise('lowpass', 900, 0.05, { v: 0.18 }),
+    tone('sine', 180, 0.06, { to: 120, v: 0.1 }),
+    noise('bandpass', 1200, 0.22, { to: 3200, at: 0.06, q: 0.8, v: 0.08 }),
+    tone('triangle', 260, 0.2, { to: 620, at: 0.06, v: 0.06 }),
+    noise('lowpass', 800, 0.05, { at: 0.3, v: 0.2 }),
+    tone('sine', 150, 0.08, { to: 90, at: 0.3, v: 0.12 }),
+    noise('lowpass', 700, 0.05, { at: 0.38, v: 0.14 }),
+  ],
   // Skirmisher — whizz, ping off the edge, whizz away
   ricochet: [
     tone('triangle', 500, 0.12, { to: 1400, v: 0.08 }),

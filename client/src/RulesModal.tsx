@@ -21,6 +21,14 @@ function formatNamedLine(line: string) {
       </>
     );
   }
+  const dashNamed = line.match(/^([A-Z][A-Za-z' ]{1,24}) - (.+)$/);
+  if (dashNamed) {
+    return (
+      <>
+        <strong>{dashNamed[1]} -</strong> {dashNamed[2]}
+      </>
+    );
+  }
   const colon = line.indexOf(': ');
   if (colon > 0) {
     return (

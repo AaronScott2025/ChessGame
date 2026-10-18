@@ -3553,7 +3553,7 @@ export default function App() {
                               ? `${piece.charges} charge${piece.charges === 1 ? '' : 's'}`
                               : null,
                             piece.defId === 'vampire' && vampRadius > 0
-                              ? `Blood aura ${vampRadius}×${vampRadius}`
+                              ? `Sip Of Life — night area ${vampRadius}×${vampRadius}`
                               : null,
                             piece.defId === 'musician' ? musicianBeatLabel(piece.music?.beat) : null,
                             hasPigBuddy ? 'Pig Best Buddy sharing this tile' : null,
@@ -3681,7 +3681,12 @@ export default function App() {
                       title={a.hint}
                       onClick={() => {
                         if (a.passive) {
-                          if (a.id === 'bloodlust' || a.id === 'identity_theft' || a.id === 'forme_status') {
+                          if (
+                            a.id === 'bloodlust' ||
+                            a.id === 'sip_of_life' ||
+                            a.id === 'identity_theft' ||
+                            a.id === 'forme_status'
+                          ) {
                             setFocusSpecial(null);
                             setStatus(a.hint ?? a.name);
                             return;
@@ -4180,6 +4185,14 @@ function formatNamedLine(line: string) {
       </>
     );
   }
+  const dashNamed = line.match(/^([A-Z][A-Za-z' ]{1,24}) - (.+)$/);
+  if (dashNamed) {
+    return (
+      <>
+        <strong>{dashNamed[1]} -</strong> {dashNamed[2]}
+      </>
+    );
+  }
   const colon = line.indexOf(': ');
   if (colon > 0) {
     return (
@@ -4368,7 +4381,7 @@ function VampireBloodChargeFx({ tokens }: { tokens: number }) {
   return (
     <span
       className={`vampire-charge-fx${n <= 0 ? ' is-empty' : ''}${n >= 10 ? ' is-wide' : ''}`}
-      title={`${n} Blood Token${n === 1 ? '' : 's'}`}
+      title={`Sip Of Life: ${n} Blood Token${n === 1 ? '' : 's'}`}
     >
       <svg className="vampire-drop" viewBox="0 0 16 18" aria-hidden>
         <defs>
@@ -4706,7 +4719,7 @@ function PieceInfoBody({
           {live.charges != null && defId !== 'vampire' && <span>Charges: {live.charges}</span>}
           {defId === 'vampire' && (
             <span>
-              Blood Tokens: {live.charges ?? 0}
+              Sip Of Life: {live.charges ?? 0} Blood Token{(live.charges ?? 0) === 1 ? '' : 's'}
               {` · Night ${vampireNightRadius(live.charges ?? 0)}×${vampireNightRadius(live.charges ?? 0)}`}
               {(() => {
                 const next = VAMPIRE_RADIUS_MILESTONES.find((m) => (live.charges ?? 0) < m);

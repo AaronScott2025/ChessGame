@@ -618,6 +618,16 @@ function assertOwnKingSafe(state: GameState, color: Color, action: string): void
   }
 }
 
+/**
+ * For actions that keep your move (spells, songs, Enchant): still legal while checked if a move
+ * can then save the king — unless the action checks the opponent, which passes the turn.
+ */
+function assertKingSavable(state: GameState, color: Color, action: string): void {
+  if (!kingExposedAtHandover(state, color)) return;
+  if (!isInCheck(state, opposite(color)) && hasLegalBoardMoves(state, color)) return;
+  throw new Error(`${action} is illegal — you are in check and no move afterwards would save your king`);
+}
+
 /** Abilities spend the turn. Illegal if you remain in check (e.g. Wizard Enchant while checked). */
 function concludeAbilityTurn(state: GameState, color: Color): GameState {
   assertOwnKingSafe(state, color, 'That ability');
@@ -1297,6 +1307,17 @@ export function availableAbilities(state: GameState, pieceId: string): Array<{ i
           : 'Grab any non-king piece within 2 tiles and launch it exactly 3 tiles in a clear straight line. Landing on an enemy captures it. 5-turn cooldown.',
     });
   }
+  if (piece.defId === 'vampire') {
+    const tokens = piece.charges ?? 0;
+    const radius = vampireNightRadius(tokens);
+    out.push({
+      id: 'sip_of_life',
+      name: `Sip Of Life (${tokens})`,
+      ready: false,
+      passive: true,
+      hint: `${tokens} Blood Token${tokens === 1 ? '' : 's'} — night move area ${radius}×${radius}. Gains 1 Blood Token per capture; the night area grows at 1 / 2 / 5 / 10 tokens.`,
+    });
+  }
   if (piece.defId === 'snake') {
     const active = hasBloodlust(piece);
     out.push({
@@ -1730,7 +1751,7 @@ function playSong(
   recordSong(musician, song);
   state.pendingPrompt = null;
   abilityFx(state, crescendo ? 'crescendo' : `song_${song}`);
-  assertOwnKingSafe(state, color, 'That song');
+  assertKingSavable(state, color, 'That song');
   state.turnPhase = resumeTurnPhase;
   if (state.phase !== 'playing') return state;
   refreshCheckState(state);
@@ -2056,7 +2077,7 @@ function finishWizardEnchant(
   state.pendingPrompt = null;
   log(state, `Wizard enchanted ${target.defId} (+1 move, 1 turn)`);
   abilityFx(state, 'enchant');
-  assertOwnKingSafe(state, color, 'That ability');
+  assertKingSavable(state, color, 'That ability');
   if (resumeTurnPhase === 'spell' || resumeTurnPhase === 'move') state.turnPhase = resumeTurnPhase;
   refreshCheckState(state);
   if (state.check === opposite(color)) {
@@ -2642,6 +2663,24 @@ const SPECIAL_MOVE_FX = new Set([
   'giga_stomp',
 ]);
 
+/** True if an L-shaped move passes over an occupied square between its start and landing columns/rows. */
+function lJumpsOverPiece(state: GameState, from: Coord, to: Coord): boolean {
+  const dr = to.row - from.row;
+  const dc = to.col - from.col;
+  const rowsLong = Math.abs(dr) > Math.abs(dc);
+  const long = rowsLong ? dr : dc;
+  const step = Math.sign(long);
+  for (let i = 1; i < Math.abs(long); i++) {
+    for (const side of [0, rowsLong ? dc : dr]) {
+      const sq = rowsLong
+        ? { row: from.row + step * i, col: from.col + side }
+        : { row: from.row + side, col: from.col + step * i };
+      if (pieceAt(state, sq)) return true;
+    }
+  }
+  return false;
+}
+
 function moveAbilityFxId(
   state: GameState,
   piece: PieceState,
@@ -2656,6 +2695,7 @@ function moveAbilityFxId(
   if (piece.defId === 'leapfrog' && dist === 2) return 'leap';
   if (piece.defId === 'worm' && !straightTwo) return 'burrow';
   if (piece.defId === 'reaper' && dist === 2) return 'shadow_step';
+  if (piece.defId === 'horse' && lJumpsOverPiece(state, from, to)) return 'horse_jump';
   if (piece.defId === 'ghost' && state.dayNight === 'night' && chebyshevPathBlocked(from, to, state)) {
     return 'phase_walk';
   }
@@ -3056,7 +3096,7 @@ export function applyMove(
     if (piece.defId === 'vampire' && captured) {
       const before = vampireNightRadius(piece.charges ?? 0);
       piece.charges = (piece.charges ?? 0) + 1;
-      log(next, `Vampire gains a Blood Token (${piece.charges})`);
+      log(next, `Sip Of Life: Vampire gains a Blood Token (${piece.charges})`);
       const after = vampireNightRadius(piece.charges);
       if (after > before) log(next, `Vampire night hunt grows to ${after}×${after}`);
       abilityFx(next, 'blood_token');
@@ -3509,7 +3549,7 @@ export function playCard(state: GameState, color: Color, instanceId: string, tar
   recordCast(out, color, def.id, instanceId, before);
 
   if (!isOppTurn) {
-    assertOwnKingSafe(out, color, 'That spell');
+    assertKingSavable(out, color, 'That spell');
   }
 
   // One spell per turn: leave spell phase when spent (interrupt cards on your turn still count)
